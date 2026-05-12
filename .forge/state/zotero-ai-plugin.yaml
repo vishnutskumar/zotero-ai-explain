@@ -1,6 +1,6 @@
 feature: zotero-ai-plugin
-phase: P1a-complete
-plan: null
+phase: P2-spec-written
+plan: docs/superpowers/specs/2026-05-12-zotero-ai-explain-design.md
 interfaces: null
 acs_completed: []
-updated: 2026-05-12T06:12:11Z
+updated: 2026-05-12T06:25:00Z
