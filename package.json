@@ -1,0 +1,28 @@
+{
+  "name": "zotero-ai-explain",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Zotero plugin for selected-text AI explanations and sidebar follow-up chat.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "format": "prettier --check .",
+    "format:write": "prettier --write .",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run typecheck && npm run lint && npm run format && npm run test"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.26.0",
+    "@types/node": "^22.15.17",
+    "eslint": "^9.26.0",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.32.0",
+    "vitest": "^3.1.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

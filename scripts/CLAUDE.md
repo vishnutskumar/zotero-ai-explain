@@ -1,0 +1,15 @@
+# Scripts
+
+This directory contains build and packaging automation.
+
+## Structure
+
+```text
+scripts/
+```
+
+## Extending
+
+1. Prefer TypeScript scripts when they share project types.
+2. Keep packaging scripts deterministic and safe to run repeatedly.
+3. Add npm scripts in `package.json` for commands maintainers should run directly.

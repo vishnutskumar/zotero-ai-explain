@@ -1,0 +1,38 @@
+repos:
+  - repo: local
+    hooks:
+      - id: detect-secrets
+        name: detect-secrets
+        entry: detect-secrets-hook --baseline .secrets.baseline
+        language: system
+        exclude: '(\.md$|\.json$)'
+      - id: universal-checks
+        name: universal repository checks
+        entry: node scripts/precommit-universal.mjs
+        language: system
+        pass_filenames: false
+      - id: prettier
+        name: prettier
+        entry: npm run format:write
+        language: system
+        files: \.(js|mjs|cjs|ts|tsx|json|css|md|yaml|yml)$
+        pass_filenames: false
+      - id: eslint
+        name: eslint
+        entry: npm run lint
+        language: system
+        files: \.(js|mjs|cjs|ts|tsx)$
+        pass_filenames: false
+      - id: typecheck
+        name: typescript typecheck
+        entry: npm run typecheck
+        language: system
+        files: \.(ts|tsx)$
+        pass_filenames: false
+      - id: test
+        name: vitest
+        entry: npm run test
+        language: system
+        files: \.(ts|tsx)$
+        pass_filenames: false
+        stages: [pre-push]

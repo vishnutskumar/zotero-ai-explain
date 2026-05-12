@@ -1,0 +1,57 @@
+# Zotero AI Explain
+
+Zotero AI Explain is a Zotero plugin for selected-text explanations and sidebar follow-up chat with
+configurable model providers.
+
+## Structure
+
+```text
+zotero_ai/
+  addon/                 # Zotero extension assets and browser-facing files
+  docs/                  # Specs, plans, and human-facing documentation
+  scripts/               # Build and packaging automation
+  src/                   # TypeScript source
+  tests/                 # Vitest test suite
+  .forge/                # Forge phase state and learnings
+```
+
+## Build & Test
+
+```bash
+npm install
+npm run typecheck
+npm run lint
+npm run format
+npm run test
+npm run verify
+pre-commit run --all-files
+```
+
+## Lint & Format
+
+| Tool       | Command                      | Config                    |
+| ---------- | ---------------------------- | ------------------------- |
+| TypeScript | `npm run typecheck`          | `tsconfig.json`           |
+| ESLint     | `npm run lint`               | `eslint.config.js`        |
+| Prettier   | `npm run format`             | `.prettierrc`             |
+| Vitest     | `npm run test`               | `package.json`            |
+| Pre-commit | `pre-commit run --all-files` | `.pre-commit-config.yaml` |
+
+Pre-commit hooks must run before commits. Fix hook failures at the root cause.
+
+## Key Files
+
+| File                      | Purpose                                             |
+| ------------------------- | --------------------------------------------------- |
+| `package.json`            | Node scripts and TypeScript test/lint dependencies. |
+| `tsconfig.json`           | Strict TypeScript compiler settings.                |
+| `.pre-commit-config.yaml` | Universal and TypeScript project hooks.             |
+| `README.md`               | Human-facing project overview.                      |
+
+## Navigation
+
+- [addon/](addon/CLAUDE.md) -- Zotero extension assets.
+- [src/](src/CLAUDE.md) -- TypeScript source.
+- [tests/](tests/CLAUDE.md) -- Test suite.
+- [docs/](docs/CLAUDE.md) -- Specs and documentation.
+- [scripts/](scripts/CLAUDE.md) -- Build and packaging automation.

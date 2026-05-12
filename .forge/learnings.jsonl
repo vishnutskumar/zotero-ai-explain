@@ -1,0 +1,1 @@
+{"date":"2026-05-12","feature":"zotero-ai-plugin","phase":"P1a","learning":"Homebrew Python 3.14 pyexpat can break pre-commit remote Python hook environment creation before repo hooks run; local language: system hooks avoided that failing layer while preserving checks.","type":"failure"}
