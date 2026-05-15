@@ -524,7 +524,7 @@ git commit -m "feat: add provider registry and secret resolution"
 
 **Files:**
 
-- Create: `src/selection/selection-context.ts`
+- Modify: `src/selection/selection-context.ts`
 - Create: `src/selection/normalize-selection.ts`
 - Create: `tests/selection/normalize-selection.test.ts`
 
@@ -597,7 +597,8 @@ Expected: fail because modules do not exist.
 
 - [ ] **Step 3: Implement selection normalization**
 
-Create `src/selection/selection-context.ts` using the interface contract in this plan.
+Confirm `src/selection/selection-context.ts` matches the interface contract in this plan. This file
+may already exist because Task 2 provider types need `SelectionContext` for full typecheck.
 
 Create `src/selection/normalize-selection.ts`:
 
