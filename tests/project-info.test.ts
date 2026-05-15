@@ -7,7 +7,13 @@ describe("projectInfo", () => {
     expect(projectInfo).toEqual({
       displayName: "Zotero AI Explain",
       packageName: "zotero-ai-explain",
-      zoteroMinimumVersion: "7.0"
+      zoteroMinimumVersion: "8.0",
+      supportedZoteroMajor: 8
     });
+  });
+
+  it("targets Zotero 8 only", () => {
+    expect(projectInfo.zoteroMinimumVersion).toBe("8.0");
+    expect(projectInfo.supportedZoteroMajor).toBe(8);
   });
 });
