@@ -13,7 +13,7 @@ const profile = (kind: ProviderProfile["kind"], id = kind): ProviderProfile => (
       : "http://localhost:11434",
   model: "test-model",
   secret: { kind: "none" },
-  sendMode: kind === "openai-compatible" ? "local" : "remote",
+  sendMode: kind === "openai-compatible" || kind === "ollama" ? "local" : "remote",
   enabled: true
 });
 
@@ -30,6 +30,7 @@ const provider = (id: string): ModelProvider => ({
 describe("createProviderRegistry", () => {
   it("resolves every required provider family", () => {
     const registry = createProviderRegistry([
+      provider("ollama"),
       provider("openai-responses"),
       provider("openai-compatible"),
       provider("anthropic"),
@@ -39,6 +40,7 @@ describe("createProviderRegistry", () => {
     ]);
 
     for (const kind of [
+      "ollama",
       "openai-responses",
       "openai-compatible",
       "anthropic",

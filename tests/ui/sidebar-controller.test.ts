@@ -15,6 +15,17 @@ const profile: ProviderProfile = {
   enabled: true
 };
 
+const ollamaProfile: ProviderProfile = {
+  id: "ollama",
+  displayName: "Ollama",
+  kind: "ollama",
+  baseUrl: "http://localhost:11434",
+  model: "llama3.1",
+  secret: { kind: "none" },
+  sendMode: "local",
+  enabled: true
+};
+
 describe("createSidebarController", () => {
   it("adds follow-up messages to the existing conversation", async () => {
     const provider: ModelProvider = {
@@ -51,6 +62,44 @@ describe("createSidebarController", () => {
     expect(store.get(conversation.id)?.messages).toEqual([
       { role: "user", content: "Why does it matter?" },
       { role: "assistant", content: "Follow-up answer" }
+    ]);
+  });
+
+  it("appends follow-up deltas from an ollama provider", async () => {
+    const provider: ModelProvider = {
+      id: "ollama",
+      displayName: "Ollama",
+      async *streamChat() {
+        await Promise.resolve();
+        yield { type: "delta", text: "Ollama follow-up" };
+        yield { type: "message_end" };
+      }
+    };
+    const store = createConversationStore();
+    const conversation = store.createFromSelection(
+      {
+        quote: "Dense text.",
+        source: {
+          itemKey: "I",
+          itemTitle: "Paper",
+          attachmentKey: "A",
+          pageLabel: "1",
+          location: "page=1"
+        },
+        anchor: null
+      },
+      ollamaProfile
+    );
+    store.moveToSidebar(conversation.id);
+
+    await createSidebarController({ store, provider }).sendFollowUp(
+      conversation.id,
+      "Why does it matter?"
+    );
+
+    expect(store.get(conversation.id)?.messages).toEqual([
+      { role: "user", content: "Why does it matter?" },
+      { role: "assistant", content: "Ollama follow-up" }
     ]);
   });
 });
