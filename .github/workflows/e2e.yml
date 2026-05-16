@@ -33,15 +33,19 @@ jobs:
       - name: Download Zotero
         env:
           ZOTERO_DIR: "${{ runner.temp }}/zotero-install"
-          ZOTERO_TARBALL: "${{ runner.temp }}/zotero.tar.bz2"
+          ZOTERO_TARBALL: "${{ runner.temp }}/zotero-tarball"
         run: |
           set -euxo pipefail
+          # Zotero 9+ ships as .tar.xz, older releases as .tar.bz2.
+          # Don't hardcode the extension; let `file` identify the archive
+          # so the workflow keeps working across release-format changes.
           curl -L "https://www.zotero.org/download/client/dl?platform=linux-x86_64&channel=release" \
             -o "$ZOTERO_TARBALL"
+          file "$ZOTERO_TARBALL"
           mkdir -p "$ZOTERO_DIR"
           # Inspect first to figure out --strip-components needed.
-          tar -tjf "$ZOTERO_TARBALL" | head -5
-          tar -xjf "$ZOTERO_TARBALL" -C "$ZOTERO_DIR" --strip-components=1
+          tar -tf "$ZOTERO_TARBALL" | head -5
+          tar -xf "$ZOTERO_TARBALL" -C "$ZOTERO_DIR" --strip-components=1
           ls -la "$ZOTERO_DIR"
           "$ZOTERO_DIR/zotero" --version || "$ZOTERO_DIR/zotero" -v || true
           echo "ZOTERO_BINARY=$ZOTERO_DIR/zotero" >> "$GITHUB_ENV"
