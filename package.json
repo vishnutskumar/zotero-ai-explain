@@ -5,11 +5,16 @@
   "description": "Zotero plugin for selected-text AI explanations and sidebar follow-up chat.",
   "type": "module",
   "scripts": {
-    "build": "esbuild src/bootstrap.ts --bundle --format=esm --platform=browser --target=firefox140 --outfile=addon/content/zotero-ai-explain.sys.mjs && tsc --noEmit",
+    "build": "esbuild src/bootstrap.ts --bundle --format=iife --global-name=ZoteroAiExplain --platform=browser --target=firefox115 --outfile=addon/content/zotero-ai-explain.js && tsc --noEmit",
     "format": "prettier --check .",
     "format:write": "prettier --write .",
     "lint": "eslint . --max-warnings=0",
+    "package": "node scripts/package-xpi.mjs v0.1.0",
     "test": "vitest run",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "test:e2e:harness": "node scripts/zotero-e2e/spawn.mjs",
+    "test:e2e:smoke": "node scripts/zotero-e2e/marionette-smoke.mjs",
+    "test:e2e:cleanup": "node scripts/zotero-e2e/cleanup.mjs",
     "typecheck": "tsc --noEmit",
     "verify": "npm run typecheck && npm run lint && npm run format && npm run test"
   },

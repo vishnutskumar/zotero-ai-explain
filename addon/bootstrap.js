@@ -1,28 +1,46 @@
 "use strict";
 
-var { Services } = ChromeUtils.importESModule("resource://gre/modules/Services.sys.mjs");
-var moduleUrl;
+// Loaded by Zotero via Services.scriptloader.loadSubScript. The plugin
+// loader scope already exposes `Zotero` and `Services` globals.
+
+var loadedScope;
 
 async function startup(data, reason) {
   await Zotero.initializationPromise;
   if (Zotero.uiReadyPromise) {
     await Zotero.uiReadyPromise;
   }
-  moduleUrl = `${data.rootURI}content/zotero-ai-explain.sys.mjs`;
-  const module = ChromeUtils.importESModule(moduleUrl);
-  await module.startup({ Zotero, pluginId: data.id, reason });
+
+  const scope = { Zotero };
+  // Synchronously evaluate our bundle (built as an IIFE that assigns to
+  // `ZoteroAiExplain` on the scope global). loadSubScript executes the
+  // script in the given scope, so the IIFE writes its export onto `scope`.
+  Services.scriptloader.loadSubScript(`${data.rootURI}content/zotero-ai-explain.js`, scope);
+  loadedScope = scope;
+
+  if (!scope.ZoteroAiExplain || typeof scope.ZoteroAiExplain.startup !== "function") {
+    Zotero.debug(
+      "Zotero AI Explain: bundle did not expose startup function; aborting initialization"
+    );
+    return;
+  }
+
+  await scope.ZoteroAiExplain.startup({ Zotero, pluginId: data.id, reason });
 }
 
 async function shutdown(_data, reason) {
   if (typeof APP_SHUTDOWN !== "undefined" && reason === APP_SHUTDOWN) {
     return;
   }
-
-  if (moduleUrl === undefined) {
+  if (!loadedScope?.ZoteroAiExplain?.shutdown) {
     return;
   }
-
-  const module = ChromeUtils.importESModule(moduleUrl);
-  await module.shutdown({ Zotero, reason });
-  Services.obs.notifyObservers(null, "startupcache-invalidate");
+  try {
+    await loadedScope.ZoteroAiExplain.shutdown({ Zotero, reason });
+  } finally {
+    loadedScope = null;
+  }
 }
+
+function install() {}
+function uninstall() {}

@@ -29,6 +29,7 @@ export default tseslint.config(
         ChromeUtils: "readonly",
         console: "readonly",
         process: "readonly",
+        Services: "readonly",
         Zotero: "readonly"
       }
     }
@@ -37,6 +38,19 @@ export default tseslint.config(
     files: ["addon/bootstrap.js"],
     rules: {
       "no-unused-vars": "off"
+    }
+  },
+  {
+    files: ["scripts/**/*.mjs", "scripts/**/*.js"],
+    languageOptions: {
+      globals: {
+        Buffer: "readonly",
+        clearInterval: "readonly",
+        clearTimeout: "readonly",
+        setImmediate: "readonly",
+        setInterval: "readonly",
+        setTimeout: "readonly"
+      }
     }
   }
 );

@@ -23,6 +23,9 @@ const latestArtifactPath = "zotero-ai-explain.xpi";
 mkdirSync(distDirectory, { recursive: true });
 rmSync(artifactPath, { force: true });
 rmSync(latestArtifactPath, { force: true });
+// Clean up legacy ESM bundle if present from previous builds; the active
+// distribution is the IIFE bundle at content/zotero-ai-explain.js.
+rmSync("addon/content/zotero-ai-explain.sys.mjs", { force: true });
 execFileSync(
   "zip",
   ["-X", "-r", `../${artifactPath}`, "manifest.json", "bootstrap.js", "content"],
