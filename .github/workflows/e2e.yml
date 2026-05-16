@@ -55,7 +55,13 @@ jobs:
         run: |
           set -euxo pipefail
           npm run build
-          node scripts/package-xpi.mjs v0.1.0
+          # package-xpi.mjs prefers $GITHUB_REF_NAME for the version tag.
+          # On push (not on a tag) that's "main", which fails the semver
+          # check. Override with the manifest version for this build only;
+          # the script then cross-validates the tag against package.json
+          # and manifest.json (must all match).
+          MANIFEST_VERSION="$(node -p "require('./addon/manifest.json').version")"
+          GITHUB_REF_NAME="v${MANIFEST_VERSION}" node scripts/package-xpi.mjs
           ls -la dist/
           # package-xpi writes both dist/zotero-ai-explain-vX.Y.Z.xpi and
           # the latest-symlink copy at the repo root. The e2e harness reads
