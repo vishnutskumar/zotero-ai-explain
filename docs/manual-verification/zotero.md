@@ -28,6 +28,22 @@
 - Sidebar container element:
 - Any Zotero console warnings:
 
+## Ollama Smoke Test
+
+- [ ] Start Ollama locally: `ollama serve`
+- [ ] Pull the chat model: `ollama pull gemma4:e4b`
+- [ ] Pull the embedding model: `ollama pull embeddinggemma`
+- [ ] Open Zotero.
+- [ ] Confirm the `Zotero AI Explain Settings` menu item is visible under Tools.
+- [ ] Open the settings dialog and confirm `http://localhost:11434`, `gemma4:e4b`, and
+      `embeddinggemma` are pre-filled.
+- [ ] Select text in a PDF reader tab and trigger `Explain with AI`.
+- [ ] Confirm the popup shows a streaming Ollama response or an actionable connection/model error.
+- [ ] Click `Open in sidebar` and confirm the sidebar opens with the same conversation.
+- [ ] Send one follow-up message via the sidebar form and confirm the reply renders.
+- [ ] Confirm index controls are visible in settings but whole-library indexing is not started
+      automatically.
+
 ## Compatibility Troubleshooting
 
 If Zotero reports that the add-on is incompatible after rebuilding:

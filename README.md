@@ -47,6 +47,19 @@ The build emits the Zotero bootstrap bundle at `addon/content/zotero-ai-explain.
 Use `docs/manual-verification/zotero.md` for the manual acceptance pass after building and packaging
 the `addon/` directory.
 
+### Test With Ollama
+
+```bash
+ollama serve
+ollama pull gemma4:e4b
+ollama pull embeddinggemma
+npm run build
+node scripts/package-xpi.mjs v0.1.0
+```
+
+Install `zotero-ai-explain.xpi` in Zotero, open the plugin settings, and keep local-only mode
+enabled for the first smoke test.
+
 ## Architecture
 
 ```mermaid
