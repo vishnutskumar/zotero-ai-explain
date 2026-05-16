@@ -5,17 +5,26 @@ responses, and sidebar follow-up chat with configurable model providers.
 
 ## Status
 
-This repository is in greenfield setup. Product behavior will be specified in
-`docs/superpowers/specs/` before implementation begins.
+This repository is in active greenfield implementation. The current target is Zotero 8, with
+selected-text explanations, anchored popup responses, sidebar follow-up chat, and configurable
+remote or local model providers.
 
 ## Development
 
 ```bash
 npm install
 pre-commit install
+npm run build
 npm run verify
 pre-commit run --all-files
 ```
+
+The build emits the Zotero bootstrap bundle at `addon/content/zotero-ai-explain.sys.mjs`.
+
+## Zotero 8 Manual Verification
+
+Use `docs/manual-verification/zotero-8.md` for the manual acceptance pass after building and
+packaging the `addon/` directory. The plugin manifest requires Zotero `8.0` or newer.
 
 ## Architecture
 

@@ -25,9 +25,18 @@ export default tseslint.config(
     extends: [tseslint.configs.disableTypeChecked],
     languageOptions: {
       globals: {
+        APP_SHUTDOWN: "readonly",
+        ChromeUtils: "readonly",
         console: "readonly",
-        process: "readonly"
+        process: "readonly",
+        Zotero: "readonly"
       }
+    }
+  },
+  {
+    files: ["addon/bootstrap.js"],
+    rules: {
+      "no-unused-vars": "off"
     }
   }
 );
