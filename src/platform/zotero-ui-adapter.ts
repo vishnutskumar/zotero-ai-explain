@@ -8,6 +8,8 @@ type ReaderEvent = {
 };
 
 export type ZoteroGlobal = {
+  readonly initializationPromise?: Promise<void>;
+  readonly uiReadyPromise?: Promise<void>;
   readonly MenuManager?: {
     unregisterMenu(id: string): void;
   };
@@ -52,6 +54,7 @@ export function createZoteroUiAdapter(input: {
       item.setAttribute("label", label);
       item.addEventListener("command", action);
       toolsPopup.append(item);
+      input.Zotero.debug(`Zotero AI Explain registered menu: ${label}`);
 
       return () => {
         item.remove();
@@ -80,13 +83,18 @@ export function createZoteroUiAdapter(input: {
         event.append(button);
       };
 
-      input.Zotero.Reader?.registerEventListener(
-        "renderTextSelectionPopup",
-        handler,
-        input.pluginId
-      );
-      return () =>
-        input.Zotero.Reader?.unregisterEventListener("renderTextSelectionPopup", handler);
+      if (!input.Zotero.Reader) {
+        input.Zotero.debug(
+          "Zotero AI Explain: Zotero.Reader unavailable, skipping reader command registration"
+        );
+        return noOp;
+      }
+      const reader = input.Zotero.Reader;
+      reader.registerEventListener("renderTextSelectionPopup", handler, input.pluginId);
+      input.Zotero.debug(`Zotero AI Explain registered reader command: ${label}`);
+      return () => {
+        reader.unregisterEventListener("renderTextSelectionPopup", handler);
+      };
     },
     openDialog(title, content): void {
       const mainWindow = input.Zotero.getMainWindow?.();

@@ -365,6 +365,7 @@ function createZoteroUiAdapter(input2) {
       item.setAttribute("label", label);
       item.addEventListener("command", action);
       toolsPopup.append(item);
+      input2.Zotero.debug(`Zotero AI Explain registered menu: ${label}`);
       return () => {
         item.remove();
       };
@@ -391,12 +392,18 @@ function createZoteroUiAdapter(input2) {
         });
         event.append(button);
       };
-      input2.Zotero.Reader?.registerEventListener(
-        "renderTextSelectionPopup",
-        handler,
-        input2.pluginId
-      );
-      return () => input2.Zotero.Reader?.unregisterEventListener("renderTextSelectionPopup", handler);
+      if (!input2.Zotero.Reader) {
+        input2.Zotero.debug(
+          "Zotero AI Explain: Zotero.Reader unavailable, skipping reader command registration"
+        );
+        return noOp;
+      }
+      const reader = input2.Zotero.Reader;
+      reader.registerEventListener("renderTextSelectionPopup", handler, input2.pluginId);
+      input2.Zotero.debug(`Zotero AI Explain registered reader command: ${label}`);
+      return () => {
+        reader.unregisterEventListener("renderTextSelectionPopup", handler);
+      };
     },
     openDialog(title, content) {
       const mainWindow = input2.Zotero.getMainWindow?.();
