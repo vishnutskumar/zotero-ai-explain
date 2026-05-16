@@ -135,7 +135,12 @@ export function spawnZotero({
   const handleChunk = (chunk) => {
     const text = chunk.toString("utf8");
     logBuffer += text;
-    logStream.write(chunk);
+    // After child exit, the WriteStream is end()ed but late stdout chunks
+    // can still arrive (kernel buffer drainage). Writing to an ended
+    // stream throws ERR_STREAM_WRITE_AFTER_END — guard it.
+    if (!logStream.writableEnded && !logStream.destroyed) {
+      logStream.write(chunk);
+    }
     for (const consumer of consumers) {
       try {
         consumer(text);
