@@ -19,5 +19,7 @@ describe("renderSidebarConversation", () => {
     expect(view.textContent).toContain("Paper, p. 4");
     expect(view.textContent).toContain("Explain this.");
     expect(view.textContent).toContain("It means something specific.");
+    expect(view.querySelector<HTMLTextAreaElement>('[name="followUp"]')).not.toBeNull();
+    expect(view.querySelector('[data-action="send-follow-up"]')?.textContent).toBe("Send");
   });
 });

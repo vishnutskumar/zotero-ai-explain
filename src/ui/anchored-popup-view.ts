@@ -19,7 +19,21 @@ export function renderAnchoredPopup(input: {
   body.className = "zotero-ai-explain-popup__body";
   body.textContent = input.text;
 
-  element.append(disclosure, body);
+  const actions = document.createElement("div");
+  actions.className = "zotero-ai-explain-popup__actions";
+
+  const sidebar = document.createElement("button");
+  sidebar.type = "button";
+  sidebar.dataset.action = "continue-sidebar";
+  sidebar.textContent = "Open in sidebar";
+
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.dataset.action = "retry";
+  retry.textContent = "Retry";
+
+  actions.append(sidebar, retry);
+  element.append(disclosure, body, actions);
 
   return element;
 }

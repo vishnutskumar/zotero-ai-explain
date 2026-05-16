@@ -25,7 +25,19 @@ export function renderSidebarConversation(input: {
     messages.append(row);
   }
 
-  element.append(quote, source, messages);
+  const form = document.createElement("form");
+  form.className = "zotero-ai-explain-sidebar__form";
+
+  const followUp = document.createElement("textarea");
+  followUp.name = "followUp";
+
+  const send = document.createElement("button");
+  send.type = "submit";
+  send.dataset.action = "send-follow-up";
+  send.textContent = "Send";
+
+  form.append(followUp, send);
+  element.append(quote, source, messages, form);
 
   return element;
 }

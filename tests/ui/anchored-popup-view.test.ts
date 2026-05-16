@@ -16,5 +16,9 @@ describe("renderAnchoredPopup", () => {
     expect(view.style.top).toBe("20px");
     expect(view.textContent).toContain("Selected text will be sent to OpenAI using gpt-test.");
     expect(view.textContent).toContain("Explanation");
+    expect(view.querySelector('[data-action="continue-sidebar"]')?.textContent).toBe(
+      "Open in sidebar"
+    );
+    expect(view.querySelector('[data-action="retry"]')?.textContent).toBe("Retry");
   });
 });
