@@ -2,10 +2,10 @@ import type { ConversationStore } from "../conversation/conversation-store.js";
 import type { ModelProvider } from "../providers/provider-types.js";
 
 export type PopupController = {
-  explain(conversationId: string): Promise<void>;
-  cancel(conversationId: string): void;
-  retry(conversationId: string): Promise<void>;
-  continueInSidebar(conversationId: string): void;
+  readonly explain: (conversationId: string) => Promise<void>;
+  readonly cancel: (conversationId: string) => void;
+  readonly retry: (conversationId: string) => Promise<void>;
+  readonly continueInSidebar: (conversationId: string) => void;
 };
 
 export function createPopupController(deps: {

@@ -2,7 +2,7 @@ import type { ConversationStore } from "../conversation/conversation-store.js";
 import type { ModelProvider } from "../providers/provider-types.js";
 
 export type SidebarController = {
-  sendFollowUp(conversationId: string, message: string): Promise<void>;
+  readonly sendFollowUp: (conversationId: string, message: string) => Promise<void>;
 };
 
 export function createSidebarController(deps: {

@@ -60,4 +60,37 @@ describe("createConversationStore", () => {
       errorMessage: null
     });
   });
+
+  it("notifies subscribers of every mutation and stops after unsubscribe", () => {
+    const store = createConversationStore();
+    const created = store.createFromSelection(selection, profile);
+
+    const snapshots: { status: string; messages: number }[] = [];
+    const unsubscribe = store.subscribe(created.id, (conversation) => {
+      snapshots.push({
+        status: conversation.status,
+        messages: conversation.messages.length
+      });
+    });
+
+    store.appendUserMessage(created.id, "Explain this.");
+    store.markStreaming(created.id);
+    store.appendAssistantDelta(created.id, "It ");
+    store.appendAssistantDelta(created.id, "means");
+    store.complete(created.id);
+
+    expect(snapshots).toEqual([
+      { status: "idle", messages: 1 },
+      { status: "streaming", messages: 1 },
+      { status: "streaming", messages: 2 },
+      { status: "streaming", messages: 2 },
+      { status: "completed", messages: 2 }
+    ]);
+
+    unsubscribe();
+    store.moveToSidebar(created.id);
+    store.appendUserMessage(created.id, "Follow up?");
+
+    expect(snapshots).toHaveLength(5);
+  });
 });
