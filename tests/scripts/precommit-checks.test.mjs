@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { checkTextContents, containsLocalMachinePath } from "../../scripts/precommit-checks.mjs";
+import {
+  checkTextContents,
+  containsLocalMachinePath,
+  shouldCheckWorktreeFile
+} from "../../scripts/precommit-checks.mjs";
 
 const macUserPath = ["/Us", "ers/alice/project/file.ts"].join("");
 const linuxUserPath = ["file://", "/ho", "me/alice/project/file.ts"].join("");
@@ -29,5 +33,11 @@ describe("checkTextContents", () => {
     expect(checkTextContents("README.md", `Open ${macUserPath}`)).toEqual([
       "README.md: contains a local machine path; use a repo-relative path instead"
     ]);
+  });
+});
+
+describe("shouldCheckWorktreeFile", () => {
+  it("skips deleted tracked paths during renames", () => {
+    expect(shouldCheckWorktreeFile("path-that-does-not-exist.md")).toBe(false);
   });
 });

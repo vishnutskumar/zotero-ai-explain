@@ -5,8 +5,10 @@
   "description": "Selected-text explanations and sidebar follow-up chat for Zotero.",
   "applications": {
     "zotero": {
-      "id": "zotero-ai-explain@local",
-      "strict_min_version": "8.0"
+      "id": "zotero-ai-explain@vishnutskumar.github.io",
+      "update_url": "https://github.com/vishnutskumar/zotero-ai-explain/releases/latest/download/updates.json",
+      "strict_min_version": "8.0",
+      "strict_max_version": "9.99.99"
     }
   }
 }

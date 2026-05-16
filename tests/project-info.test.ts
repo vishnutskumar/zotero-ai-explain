@@ -12,7 +12,7 @@ describe("projectInfo", () => {
     });
   });
 
-  it("targets Zotero 8 only", () => {
+  it("records the minimum supported Zotero version", () => {
     expect(projectInfo.zoteroMinimumVersion).toBe("8.0");
     expect(projectInfo.supportedZoteroMajor).toBe(8);
   });

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { extname } from "node:path";
 
 const MAX_FILE_SIZE_BYTES = 500 * 1024;
@@ -35,6 +35,10 @@ export function runUniversalChecks() {
   const seenLowercasePaths = new Map();
 
   for (const file of files) {
+    if (!shouldCheckWorktreeFile(file)) {
+      continue;
+    }
+
     const stats = statSync(file);
     if (!stats.isFile()) {
       continue;
@@ -113,6 +117,10 @@ export function checkTextContents(file, contents) {
 
 export function containsLocalMachinePath(contents) {
   return LOCAL_PATH_PATTERNS.some((pattern) => pattern.test(contents));
+}
+
+export function shouldCheckWorktreeFile(file) {
+  return existsSync(file);
 }
 
 function validateYaml(file, errors) {

@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build XPI Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install pre-commit
+        run: pip install pre-commit
+
+      - name: Verify
+        run: npm run verify
+
+      - name: Security audit
+        run: npm audit --audit-level=high
+
+      - name: Build Zotero bundle
+        run: npm run build
+
+      - name: Package XPI
+        run: node scripts/package-xpi.mjs
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.xpi
+            dist/updates.json
+          body: |
+            Compatible with Zotero 8.0 through 9.99.99.
+          generate_release_notes: true

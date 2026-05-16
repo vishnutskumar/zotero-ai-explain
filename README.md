@@ -3,12 +3,12 @@
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178c6?logo=typescript&logoColor=white)
 ![JavaScript](https://img.shields.io/badge/JavaScript-ESM-f7df1e?logo=javascript&logoColor=222222)
 ![CSS](https://img.shields.io/badge/CSS-UI%20Surfaces-1572b6?logo=css3&logoColor=white)
-![Zotero](https://img.shields.io/badge/Zotero-8.0%2B-990000)
+![Zotero](https://img.shields.io/badge/Zotero-Plugin-990000)
 ![Tests](https://img.shields.io/badge/tests-vitest-6e9f18?logo=vitest&logoColor=white)
 
-Zotero AI Explain is a Zotero 8 plugin for explaining selected text in-place. Select a passage in
-the Zotero reader, ask for an explanation, review the answer in an anchored popup above the text,
-then move the conversation into a sidebar when you want to keep chatting.
+Zotero AI Explain is a Zotero plugin for explaining selected text in-place. Select a passage in the
+Zotero reader, ask for an explanation, review the answer in an anchored popup above the text, then
+move the conversation into a sidebar when you want to keep chatting.
 
 ![Animated preview of Zotero AI Explain inside Zotero](docs/assets/readme-zotero-ai-preview.svg)
 
@@ -19,7 +19,7 @@ then move the conversation into a sidebar when you want to keep chatting.
 ## Status
 
 This repository is in active greenfield implementation. The core architecture, provider boundary,
-conversation store, Zotero 8 bootstrap, and initial reader UI surfaces are being built with tests.
+conversation store, Zotero bootstrap, and initial reader UI surfaces are being built with tests.
 
 ## Features
 
@@ -28,7 +28,7 @@ conversation store, Zotero 8 bootstrap, and initial reader UI surfaces are being
 - Provider profiles for OpenAI Responses, OpenAI-compatible APIs, Anthropic, Gemini, custom HTTP,
   and local agent bridges.
 - Secret references instead of storing raw API keys in plugin preferences.
-- Zotero 8-only bootstrap bundle, with manual verification notes for reader integration.
+- Zotero bootstrap bundle, with manual verification notes for reader integration.
 
 ## Development
 
@@ -42,10 +42,10 @@ pre-commit run --all-files
 
 The build emits the Zotero bootstrap bundle at `addon/content/zotero-ai-explain.sys.mjs`.
 
-## Zotero 8 Manual Verification
+## Manual Verification
 
-Use `docs/manual-verification/zotero-8.md` for the manual acceptance pass after building and
-packaging the `addon/` directory. The plugin manifest requires Zotero `8.0` or newer.
+Use `docs/manual-verification/zotero.md` for the manual acceptance pass after building and packaging
+the `addon/` directory.
 
 ## Architecture
 
