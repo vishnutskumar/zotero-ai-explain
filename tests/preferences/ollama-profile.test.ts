@@ -11,8 +11,8 @@ describe("ollama profile defaults", () => {
 
     expect(settings).toEqual({
       baseUrl: "http://localhost:11434",
-      chatModel: "llama3.1",
-      embeddingModel: "nomic-embed-text",
+      chatModel: "gemma4:e4b",
+      embeddingModel: "embeddinggemma",
       localOnly: true
     });
 
@@ -21,7 +21,7 @@ describe("ollama profile defaults", () => {
       displayName: "Ollama",
       kind: "ollama",
       baseUrl: "http://localhost:11434",
-      model: "llama3.1",
+      model: "gemma4:e4b",
       secret: { kind: "none" },
       sendMode: "local",
       enabled: true

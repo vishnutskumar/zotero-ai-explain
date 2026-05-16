@@ -10,8 +10,8 @@ export type OllamaSettings = {
 export function createDefaultOllamaSettings(): OllamaSettings {
   return {
     baseUrl: "http://localhost:11434",
-    chatModel: "llama3.1",
-    embeddingModel: "nomic-embed-text",
+    chatModel: "gemma4:e4b",
+    embeddingModel: "embeddinggemma",
     localOnly: true
   };
 }
