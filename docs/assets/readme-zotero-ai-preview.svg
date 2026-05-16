@@ -1,0 +1,99 @@
+<svg width="1280" height="720" viewBox="0 0 1280 720" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Zotero AI Explain preview</title>
+  <desc id="desc">Animated mockup of a Zotero reader selection opening an AI explanation popup and sidebar chat.</desc>
+  <style>
+    .window { fill: #f7f7f4; stroke: #d7d5cc; stroke-width: 2; }
+    .chrome { fill: #ece9df; }
+    .nav { fill: #ffffff; stroke: #dedbd2; }
+    .paper { fill: #ffffff; stroke: #d9d5cb; }
+    .line { fill: #2d2d2d; opacity: 0.72; }
+    .muted { fill: #767268; }
+    .brand { fill: #9f2a2a; }
+    .accent { fill: #136f63; }
+    .popup { fill: #ffffff; stroke: #136f63; stroke-width: 2; filter: url(#shadow); animation: popupIn 5s ease-in-out infinite; transform-origin: 640px 346px; }
+    .sidebar { fill: #fbfbf8; stroke: #d7d5cc; stroke-width: 2; animation: sidebarIn 5s ease-in-out infinite; }
+    .selection { fill: #ffdf7e; animation: pulse 5s ease-in-out infinite; }
+    .token { fill: #dcefeb; }
+    .dot { animation: dotPulse 1.6s ease-in-out infinite; }
+    .dot2 { animation-delay: 0.2s; }
+    .dot3 { animation-delay: 0.4s; }
+    text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    @keyframes pulse {
+      0%, 14%, 100% { opacity: 0.35; }
+      24%, 68% { opacity: 0.92; }
+    }
+    @keyframes popupIn {
+      0%, 22%, 100% { opacity: 0; transform: translateY(10px) scale(0.98); }
+      32%, 72% { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    @keyframes sidebarIn {
+      0%, 54%, 100% { opacity: 0.25; transform: translateX(24px); }
+      68%, 92% { opacity: 1; transform: translateX(0); }
+    }
+    @keyframes dotPulse {
+      0%, 100% { opacity: 0.25; }
+      50% { opacity: 1; }
+    }
+  </style>
+  <defs>
+    <filter id="shadow" x="0" y="0" width="1280" height="720" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#1d2724" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <rect width="1280" height="720" rx="28" fill="#efeee8"/>
+  <rect x="74" y="58" width="1132" height="604" rx="16" class="window"/>
+  <rect x="74" y="58" width="1132" height="58" rx="16" class="chrome"/>
+  <circle cx="104" cy="87" r="7" fill="#d85d4a"/>
+  <circle cx="128" cy="87" r="7" fill="#e8bd4d"/>
+  <circle cx="152" cy="87" r="7" fill="#65b96f"/>
+  <text x="190" y="94" font-size="18" font-weight="700" class="brand">Zotero</text>
+  <rect x="326" y="75" width="384" height="24" rx="6" fill="#ffffff" opacity="0.72"/>
+  <text x="342" y="93" font-size="13" class="muted">Neural interfaces and scholarly reading.pdf</text>
+
+  <rect x="98" y="138" width="220" height="498" rx="10" class="nav"/>
+  <text x="122" y="178" font-size="16" font-weight="700" fill="#2f2f2f">Library</text>
+  <rect x="122" y="204" width="160" height="10" rx="5" class="muted" opacity="0.45"/>
+  <rect x="122" y="229" width="132" height="10" rx="5" class="muted" opacity="0.35"/>
+  <rect x="122" y="254" width="178" height="10" rx="5" class="muted" opacity="0.35"/>
+  <rect x="112" y="310" width="184" height="76" rx="8" fill="#f5e8e8" stroke="#d9c2c2"/>
+  <text x="130" y="340" font-size="13" font-weight="700" class="brand">Selected PDF</text>
+  <rect x="130" y="357" width="118" height="8" rx="4" class="brand" opacity="0.28"/>
+
+  <rect x="344" y="138" width="552" height="498" rx="10" class="paper"/>
+  <text x="386" y="190" font-size="28" font-weight="760" fill="#222222">Attention, Evidence, and Reading</text>
+  <rect x="386" y="224" width="416" height="9" rx="4.5" class="line"/>
+  <rect x="386" y="247" width="366" height="9" rx="4.5" class="line"/>
+  <rect x="386" y="292" width="438" height="9" rx="4.5" class="line"/>
+  <rect x="386" y="315" width="420" height="9" rx="4.5" class="line"/>
+  <rect x="386" y="338" width="196" height="9" rx="4.5" class="line"/>
+  <rect x="586" y="332" width="226" height="22" rx="5" class="selection"/>
+  <rect x="386" y="361" width="408" height="9" rx="4.5" class="line"/>
+  <rect x="386" y="384" width="458" height="9" rx="4.5" class="line"/>
+  <rect x="386" y="430" width="400" height="9" rx="4.5" class="line"/>
+  <rect x="386" y="453" width="430" height="9" rx="4.5" class="line"/>
+
+  <g class="popup">
+    <rect x="560" y="238" width="360" height="154" rx="10" class="popup"/>
+    <text x="584" y="272" font-size="14" font-weight="700" class="accent">Explain selection</text>
+    <text x="584" y="301" font-size="12" class="muted">Sent to OpenAI using gpt-test</text>
+    <rect x="584" y="326" width="272" height="9" rx="4.5" class="line"/>
+    <rect x="584" y="348" width="236" height="9" rx="4.5" class="line"/>
+    <circle cx="584" cy="374" r="4" class="accent dot"/>
+    <circle cx="600" cy="374" r="4" class="accent dot dot2"/>
+    <circle cx="616" cy="374" r="4" class="accent dot dot3"/>
+  </g>
+
+  <rect x="922" y="138" width="250" height="498" rx="10" class="sidebar"/>
+  <text x="950" y="178" font-size="16" font-weight="760" fill="#222222">AI Follow-up</text>
+  <rect x="950" y="206" width="174" height="42" rx="8" fill="#fff7df" stroke="#ead698"/>
+  <text x="966" y="232" font-size="12" class="muted">Pinned quote from p. 5</text>
+  <rect x="950" y="278" width="176" height="52" rx="8" class="token"/>
+  <text x="966" y="307" font-size="12" fill="#24534d">What does this imply?</text>
+  <rect x="950" y="352" width="194" height="86" rx="8" fill="#ffffff" stroke="#d7d5cc"/>
+  <rect x="968" y="374" width="136" height="8" rx="4" class="line"/>
+  <rect x="968" y="394" width="154" height="8" rx="4" class="line"/>
+  <rect x="968" y="414" width="112" height="8" rx="4" class="line"/>
+  <rect x="950" y="570" width="178" height="34" rx="8" fill="#ffffff" stroke="#d7d5cc"/>
+  <text x="966" y="592" font-size="12" class="muted">Ask a follow-up...</text>
+</svg>

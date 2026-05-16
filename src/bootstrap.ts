@@ -1,3 +1,4 @@
+import { createReaderIntegration } from "./platform/reader-integration.js";
 import { createPluginLifecycle } from "./platform/plugin-lifecycle.js";
 
 export type ZoteroBootstrapContext = {
@@ -7,6 +8,12 @@ export type ZoteroBootstrapContext = {
   readonly reason: number;
 };
 
+export const readerIntegration = createReaderIntegration({
+  onExplain(selection) {
+    void selection;
+  }
+});
+
 const lifecycle = createPluginLifecycle({
   startup: () => Promise.resolve(),
   shutdown: () => Promise.resolve()
@@ -14,6 +21,7 @@ const lifecycle = createPluginLifecycle({
 
 export async function startup(context: ZoteroBootstrapContext): Promise<void> {
   context.Zotero.debug("Zotero AI Explain startup");
+  context.Zotero.debug("Zotero AI Explain reader hooks ready");
   await lifecycle.startup();
 }
 

@@ -20,3 +20,10 @@
 - Save a provider profile and confirm only secret references are stored in preferences.
 - Restart Zotero and confirm the provider profile list reloads.
 - Disable or uninstall the plugin and confirm shutdown completes without console errors.
+
+## Reader API Notes
+
+- Reader selection event/API used:
+- Popup container element:
+- Sidebar container element:
+- Any Zotero 8 console warnings:

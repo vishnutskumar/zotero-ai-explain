@@ -1,0 +1,66 @@
+<svg width="1280" height="760" viewBox="0 0 1280 760" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Zotero AI Explain sidebar screenshot</title>
+  <desc id="desc">Static screenshot-style mockup showing Zotero with a selected passage, explanation popup, and follow-up chat sidebar.</desc>
+  <style>
+    text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .bg { fill: #f2f0e9; }
+    .panel { fill: #ffffff; stroke: #d8d4ca; stroke-width: 2; }
+    .muted { fill: #706c63; }
+    .ink { fill: #222222; }
+    .brand { fill: #a32626; }
+    .accent { fill: #136f63; }
+    .line { fill: #282828; opacity: 0.68; }
+    .paper-line { fill: #343434; opacity: 0.72; }
+    .selection { fill: #ffe08a; }
+    .soft { fill: #f7f6f1; }
+  </style>
+  <rect width="1280" height="760" rx="28" class="bg"/>
+  <rect x="62" y="54" width="1156" height="652" rx="18" class="panel"/>
+  <rect x="62" y="54" width="1156" height="60" rx="18" fill="#e9e5da"/>
+  <circle cx="96" cy="84" r="7" fill="#d85d4a"/>
+  <circle cx="120" cy="84" r="7" fill="#e8bd4d"/>
+  <circle cx="144" cy="84" r="7" fill="#65b96f"/>
+  <text x="184" y="92" font-size="18" font-weight="760" class="brand">Zotero AI Explain</text>
+  <text x="1042" y="91" font-size="13" class="muted">Zotero 8</text>
+
+  <rect x="92" y="140" width="238" height="528" rx="10" class="soft" stroke="#dedbd2"/>
+  <text x="118" y="178" font-size="16" font-weight="760" class="ink">Collections</text>
+  <rect x="118" y="210" width="160" height="10" rx="5" class="line"/>
+  <rect x="118" y="238" width="126" height="10" rx="5" class="line" opacity="0.45"/>
+  <rect x="118" y="266" width="178" height="10" rx="5" class="line" opacity="0.45"/>
+  <rect x="110" y="326" width="190" height="92" rx="8" fill="#f8e8e8" stroke="#d5baba"/>
+  <text x="128" y="358" font-size="13" font-weight="700" class="brand">Active Article</text>
+  <rect x="128" y="380" width="132" height="8" rx="4" class="brand" opacity="0.32"/>
+
+  <rect x="360" y="140" width="526" height="528" rx="10" class="panel"/>
+  <text x="402" y="196" font-size="28" font-weight="800" class="ink">Reading With Context</text>
+  <rect x="402" y="238" width="392" height="9" rx="4.5" class="paper-line"/>
+  <rect x="402" y="264" width="344" height="9" rx="4.5" class="paper-line"/>
+  <rect x="402" y="314" width="430" height="9" rx="4.5" class="paper-line"/>
+  <rect x="402" y="340" width="410" height="9" rx="4.5" class="paper-line"/>
+  <rect x="584" y="361" width="232" height="26" rx="5" class="selection"/>
+  <rect x="402" y="366" width="412" height="9" rx="4.5" class="paper-line"/>
+  <rect x="402" y="392" width="454" height="9" rx="4.5" class="paper-line"/>
+  <rect x="402" y="444" width="378" height="9" rx="4.5" class="paper-line"/>
+  <rect x="402" y="470" width="418" height="9" rx="4.5" class="paper-line"/>
+
+  <rect x="538" y="224" width="338" height="164" rx="12" fill="#ffffff" stroke="#136f63" stroke-width="2"/>
+  <text x="566" y="262" font-size="15" font-weight="760" class="accent">Explain this passage</text>
+  <text x="566" y="294" font-size="12" class="muted">OpenAI · gpt-test · remote</text>
+  <rect x="566" y="322" width="248" height="9" rx="4.5" class="line"/>
+  <rect x="566" y="346" width="214" height="9" rx="4.5" class="line"/>
+  <rect x="566" y="370" width="142" height="9" rx="4.5" class="line"/>
+
+  <rect x="916" y="140" width="270" height="528" rx="10" class="soft" stroke="#d8d4ca"/>
+  <text x="946" y="180" font-size="16" font-weight="800" class="ink">Follow-up Chat</text>
+  <rect x="946" y="208" width="196" height="54" rx="8" fill="#fff8df" stroke="#ebd58c"/>
+  <text x="962" y="240" font-size="12" class="muted">Pinned quote · page 5</text>
+  <rect x="946" y="294" width="196" height="62" rx="8" fill="#dcefeb"/>
+  <text x="962" y="329" font-size="12" class="accent">Explain the implication.</text>
+  <rect x="946" y="382" width="210" height="112" rx="8" fill="#ffffff" stroke="#d8d4ca"/>
+  <rect x="964" y="410" width="152" height="8" rx="4" class="line"/>
+  <rect x="964" y="434" width="172" height="8" rx="4" class="line"/>
+  <rect x="964" y="458" width="126" height="8" rx="4" class="line"/>
+  <rect x="946" y="590" width="198" height="42" rx="9" fill="#ffffff" stroke="#d8d4ca"/>
+  <text x="966" y="617" font-size="12" class="muted">Ask about this source...</text>
+</svg>
