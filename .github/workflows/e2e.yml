@@ -1,0 +1,88 @@
+name: Zotero E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  e2e:
+    name: Zotero E2E (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Xvfb and runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb \
+            libdbus-glib-1-2 \
+            libgtk-3-0 \
+            libasound2t64 \
+            libxt6 \
+            libx11-xcb1 \
+            libxtst6
+
+      - name: Download Zotero
+        env:
+          ZOTERO_DIR: "${{ runner.temp }}/zotero-install"
+          ZOTERO_TARBALL: "${{ runner.temp }}/zotero.tar.bz2"
+        run: |
+          set -euxo pipefail
+          curl -L "https://www.zotero.org/download/client/dl?platform=linux-x86_64&channel=release" \
+            -o "$ZOTERO_TARBALL"
+          mkdir -p "$ZOTERO_DIR"
+          # Inspect first to figure out --strip-components needed.
+          tar -tjf "$ZOTERO_TARBALL" | head -5
+          tar -xjf "$ZOTERO_TARBALL" -C "$ZOTERO_DIR" --strip-components=1
+          ls -la "$ZOTERO_DIR"
+          "$ZOTERO_DIR/zotero" --version || "$ZOTERO_DIR/zotero" -v || true
+          echo "ZOTERO_BINARY=$ZOTERO_DIR/zotero" >> "$GITHUB_ENV"
+
+      - name: Install Node deps
+        run: npm ci
+
+      - name: Build XPI
+        run: |
+          set -euxo pipefail
+          npm run build
+          node scripts/package-xpi.mjs v0.1.0
+          ls -la dist/
+          # package-xpi writes both dist/zotero-ai-explain-vX.Y.Z.xpi and
+          # the latest-symlink copy at the repo root. The e2e harness reads
+          # the repo-root copy by default.
+          ls -la zotero-ai-explain.xpi
+
+      - name: Run E2E under Xvfb
+        env:
+          ZOTERO_XPI: ${{ github.workspace }}/zotero-ai-explain.xpi
+        run: |
+          set -euxo pipefail
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1280x1024x24 &
+          XVFB_PID=$!
+          # Give Xvfb a moment to come up.
+          for i in 1 2 3 4 5; do
+            if xdpyinfo -display :99 >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          npm run test:e2e
+          kill "$XVFB_PID" || true
+
+      - name: Upload Zotero log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zotero-e2e-log
+          path: |
+            .zotero-e2e/last-run.log
+            .zotero-e2e/last-report.json
+            .zotero-e2e/smoke.log
+          if-no-files-found: ignore
