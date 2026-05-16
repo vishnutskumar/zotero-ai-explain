@@ -10,6 +10,42 @@ coverage/
 .env
 .env.*
 !.env.example
+.envrc
+.direnv/
+
+# Credential files
+secrets.json
+secrets.yaml
+secrets.yml
+credentials.json
+credentials.yaml
+credentials.yml
+.netrc
+.pgpass
+.npmrc.local
+
+# Key material
+*.pem
+*.key
+!**/keys/**/*.key.example
+*.p12
+*.pfx
+*.cer
+*.crt
+*.jks
+*.keystore
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+id_ecdsa
+id_ecdsa.*
+
+# Cloud provider credentials
+.aws/
+gcloud-key.json
+service-account*.json
+*-service-account.json
 
 .DS_Store
 .idea/

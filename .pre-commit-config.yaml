@@ -5,7 +5,10 @@ repos:
         name: detect-secrets
         entry: detect-secrets-hook --baseline .secrets.baseline
         language: system
-        exclude: '(\.md$|\.json$)'
+        # Narrow the skip list: only exclude noisy lockfiles + the baseline
+        # file itself. Source, JSON config, and Markdown are scanned so a
+        # credentials.json or .env.example with a real key cannot land.
+        exclude: '(package-lock\.json$|\.secrets\.baseline$)'
       - id: universal-checks
         name: universal repository checks
         entry: node scripts/precommit-universal.mjs
