@@ -11,6 +11,12 @@ repos:
         entry: node scripts/precommit-universal.mjs
         language: system
         pass_filenames: false
+      - id: sync-agents
+        name: sync AGENTS.md from CLAUDE.md
+        entry: node scripts/sync-agents-from-claude.mjs
+        language: system
+        files: (^|/)CLAUDE\.md$
+        pass_filenames: false
       - id: prettier
         name: prettier
         entry: npm run format:write
