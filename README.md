@@ -40,7 +40,10 @@ npm run verify
 pre-commit run --all-files
 ```
 
-The build emits the Zotero bootstrap bundle at `addon/content/zotero-ai-explain.sys.mjs`.
+The build emits the Zotero bootstrap bundle at `addon/content/zotero-ai-explain.js` as an IIFE that
+exposes `ZoteroAiExplain.startup` / `ZoteroAiExplain.shutdown`. The bundle is loaded into the
+plugin's bootstrap scope via `Services.scriptloader.loadSubScript`; Firefox 140 ESR refuses
+`ChromeUtils.importESModule` for non-trusted-scheme URLs, so the IIFE form is required.
 
 ## Manual Verification
 

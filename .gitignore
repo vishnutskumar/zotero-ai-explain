@@ -22,3 +22,9 @@ coverage/
 
 .worktrees/
 worktrees/
+
+docs/superpowers/plans/
+docs/superpowers/specs/
+
+.zotero-e2e/
+
