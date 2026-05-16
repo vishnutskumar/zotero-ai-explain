@@ -2,12 +2,24 @@ import type { SecretReference } from "../secrets/secret-types.js";
 import type { SelectionContext } from "../selection/selection-context.js";
 
 export type ProviderKind =
+  | "ollama"
   | "openai-responses"
   | "openai-compatible"
   | "anthropic"
   | "gemini"
   | "custom-http"
   | "local-agent-bridge";
+
+export type EmbeddingRequest = {
+  readonly baseUrl: string;
+  readonly model: string;
+  readonly texts: readonly string[];
+  readonly signal: AbortSignal;
+};
+
+export type EmbeddingProvider = {
+  embedTexts(request: EmbeddingRequest): Promise<readonly (readonly number[])[]>;
+};
 
 export type ProviderProfile = {
   readonly id: string;
