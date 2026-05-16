@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 
@@ -24,7 +25,7 @@ let updatedCount = 0;
 for (const claudeFile of claudeFiles) {
   const agentsFile = claudeFile.replace(/CLAUDE\.md$/u, "AGENTS.md");
   const claudeContents = readFileSync(claudeFile, "utf8");
-  const generatedContents = `${generatedHeader}${claudeContents}`;
+  const generatedContents = formatMarkdown(agentsFile, `${generatedHeader}${claudeContents}`);
   const existingContents = readOptionalFile(agentsFile);
 
   if (existingContents === generatedContents) {
@@ -71,4 +72,11 @@ function readOptionalFile(file) {
 
     throw error;
   }
+}
+
+function formatMarkdown(file, contents) {
+  return execFileSync("node_modules/.bin/prettier", ["--stdin-filepath", file], {
+    encoding: "utf8",
+    input: contents
+  });
 }

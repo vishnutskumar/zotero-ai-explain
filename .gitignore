@@ -15,5 +15,10 @@ coverage/
 .idea/
 .vscode/
 
+.forge/*
+!.forge/learnings.jsonl
+!.forge/learnings/
+!.forge/learnings/**
+
 .worktrees/
 worktrees/

@@ -39,6 +39,13 @@ repos:
         name: vitest
         entry: npm run test
         language: system
-        files: \.(ts|tsx)$
+        files: \.(ts|tsx|mjs)$
+        pass_filenames: false
+        stages: [pre-push]
+      - id: npm-audit
+        name: npm audit
+        entry: npm audit --audit-level=high
+        language: system
+        files: package(-lock)?\.json$
         pass_filenames: false
         stages: [pre-push]
