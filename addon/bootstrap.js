@@ -6,7 +6,7 @@ var moduleUrl;
 async function startup(data, reason) {
   moduleUrl = `${data.rootURI}content/zotero-ai-explain.sys.mjs`;
   const module = ChromeUtils.importESModule(moduleUrl);
-  await module.startup({ Zotero, reason });
+  await module.startup({ Zotero, pluginId: data.id, reason });
 }
 
 async function shutdown(_data, reason) {
