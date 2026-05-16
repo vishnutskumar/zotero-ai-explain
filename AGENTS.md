@@ -44,6 +44,10 @@ pre-commit run --all-files
 
 Pre-commit hooks must run before commits. Fix hook failures at the root cause.
 
+When widening a scanner's scope (e.g., narrowing `detect-secrets` excludes), refresh the scanner's
+baseline in the same commit. Otherwise CI surfaces legacy findings that local pre-commit on the
+staged diff would never see.
+
 ## Key Files
 
 | File                      | Purpose                                             |

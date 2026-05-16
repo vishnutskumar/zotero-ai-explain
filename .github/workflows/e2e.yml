@@ -43,8 +43,6 @@ jobs:
             -o "$ZOTERO_TARBALL"
           file "$ZOTERO_TARBALL"
           mkdir -p "$ZOTERO_DIR"
-          # Inspect first to figure out --strip-components needed.
-          tar -tf "$ZOTERO_TARBALL" | head -5
           tar -xf "$ZOTERO_TARBALL" -C "$ZOTERO_DIR" --strip-components=1
           ls -la "$ZOTERO_DIR"
           "$ZOTERO_DIR/zotero" --version || "$ZOTERO_DIR/zotero" -v || true
