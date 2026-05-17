@@ -33,8 +33,18 @@ export const DEFAULT_MARIONETTE_PORT = 2828;
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
-function buildPrefsJs(marionettePort) {
-  return [
+function formatPrefValue(value) {
+  if (typeof value === "boolean" || typeof value === "number") {
+    return String(value);
+  }
+  if (typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  throw new TypeError(`Unsupported pref value type: ${typeof value}`);
+}
+
+function buildPrefsJs(marionettePort, extraPrefs = {}) {
+  const base = [
     'user_pref("extensions.zotero.debug.log", true);',
     'user_pref("extensions.zotero.debug.store", true);',
     'user_pref("extensions.zotero.debug.level", 5);',
@@ -55,16 +65,24 @@ function buildPrefsJs(marionettePort) {
     'user_pref("extensions.enabledScopes", 15);',
     'user_pref("marionette.enabled", true);',
     `user_pref("marionette.port", ${marionettePort});`,
-    `user_pref("marionette.defaultPrefs.port", ${marionettePort});`,
-    ""
-  ].join("\n");
+    `user_pref("marionette.defaultPrefs.port", ${marionettePort});`
+  ];
+  for (const [name, value] of Object.entries(extraPrefs)) {
+    base.push(`user_pref(${JSON.stringify(name)}, ${formatPrefValue(value)});`);
+  }
+  base.push("");
+  return base.join("\n");
 }
 
-export function createProfile({ marionettePort = DEFAULT_MARIONETTE_PORT, profileDir } = {}) {
+export function createProfile({
+  marionettePort = DEFAULT_MARIONETTE_PORT,
+  profileDir,
+  extraPrefs = {}
+} = {}) {
   const dir = profileDir ? resolve(profileDir) : mkdtempSync(join(tmpdir(), "zotero-e2e-"));
   mkdirSync(dir, { recursive: true });
   mkdirSync(join(dir, "extensions"), { recursive: true });
-  writeFileSync(join(dir, "prefs.js"), buildPrefsJs(marionettePort), "utf8");
+  writeFileSync(join(dir, "prefs.js"), buildPrefsJs(marionettePort, extraPrefs), "utf8");
   return dir;
 }
 
@@ -241,7 +259,8 @@ export async function startZoteroWithPlugin({
   xpiPath = process.env.ZOTERO_XPI ?? join(REPO_ROOT, "zotero-ai-explain.xpi"),
   marionettePort = DEFAULT_MARIONETTE_PORT,
   startupTimeoutMs = 60000,
-  quiet = false
+  quiet = false,
+  extraPrefs = {}
 } = {}) {
   if (!existsSync(xpiPath)) {
     throw new Error(`XPI not found: ${xpiPath}`);
@@ -255,7 +274,7 @@ export async function startZoteroWithPlugin({
       );
     }
   }
-  const profileDir = createProfile({ marionettePort: effectivePort });
+  const profileDir = createProfile({ marionettePort: effectivePort, extraPrefs });
   installPlugin(profileDir, xpiPath, { unpack: true });
   const logPath = join(profileDir, "zotero.log");
   const handle = spawnZotero({
