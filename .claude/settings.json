@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run typecheck)",
+      "Bash(npm run lint)",
+      "Bash(npm run format)",
+      "Bash(npm run test)",
+      "Bash(npm run verify)",
+      "Bash(claude plugin list)",
+      "Bash(claude plugin marketplace list)"
+    ]
+  }
+}

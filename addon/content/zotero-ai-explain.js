@@ -5,16 +5,14 @@ var ZoteroAiExplain = (() => {
   var __getOwnPropNames = Object.getOwnPropertyNames;
   var __hasOwnProp = Object.prototype.hasOwnProperty;
   var __export = (target, all) => {
-    for (var name in all) __defProp(target, name, { get: all[name], enumerable: true });
+    for (var name in all)
+      __defProp(target, name, { get: all[name], enumerable: true });
   };
   var __copyProps = (to, from, except, desc) => {
-    if ((from && typeof from === "object") || typeof from === "function") {
+    if (from && typeof from === "object" || typeof from === "function") {
       for (let key of __getOwnPropNames(from))
         if (!__hasOwnProp.call(to, key) && key !== except)
-          __defProp(to, key, {
-            get: () => from[key],
-            enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable
-          });
+          __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
     }
     return to;
   };
@@ -93,32 +91,16 @@ var ZoteroAiExplain = (() => {
         });
       },
       markStreaming(id) {
-        update(id, (conversation) => ({
-          ...conversation,
-          status: "streaming",
-          errorMessage: null
-        }));
+        update(id, (conversation) => ({ ...conversation, status: "streaming", errorMessage: null }));
       },
       complete(id) {
-        update(id, (conversation) => ({
-          ...conversation,
-          status: "completed",
-          errorMessage: null
-        }));
+        update(id, (conversation) => ({ ...conversation, status: "completed", errorMessage: null }));
       },
       fail(id, message) {
-        update(id, (conversation) => ({
-          ...conversation,
-          status: "failed",
-          errorMessage: message
-        }));
+        update(id, (conversation) => ({ ...conversation, status: "failed", errorMessage: message }));
       },
       cancel(id) {
-        update(id, (conversation) => ({
-          ...conversation,
-          status: "cancelled",
-          errorMessage: null
-        }));
+        update(id, (conversation) => ({ ...conversation, status: "cancelled", errorMessage: null }));
       },
       moveToSidebar(id) {
         update(id, (conversation) => ({ ...conversation, visibleSurface: "sidebar" }));
@@ -227,9 +209,7 @@ var ZoteroAiExplain = (() => {
     const title = document.createElement("h2");
     title.textContent = "Zotero AI Explain";
     const privacy = document.createElement("p");
-    privacy.textContent = inputData.settings.localOnly
-      ? "Local only: document text stays on this machine."
-      : "Online embeddings are enabled.";
+    privacy.textContent = inputData.settings.localOnly ? "Local only: document text stays on this machine." : "Online embeddings are enabled.";
     element.append(
       title,
       input("baseUrl", "Ollama URL", inputData.settings.baseUrl),
@@ -289,9 +269,7 @@ var ZoteroAiExplain = (() => {
       return "Unknown source";
     }
     function lastAssistantContent(conversation) {
-      return (
-        conversation.messages.findLast((message) => message.role === "assistant")?.content ?? ""
-      );
+      return conversation.messages.findLast((message) => message.role === "assistant")?.content ?? "";
     }
     function startExplain(selection) {
       const conversation = deps.store.createFromSelection(selection, deps.profile);
@@ -320,7 +298,9 @@ var ZoteroAiExplain = (() => {
           sourceLabel: describeSource(selection),
           messages: current.messages
         });
-        sidebarMessages = view.querySelector(".zotero-ai-explain-sidebar__messages");
+        sidebarMessages = view.querySelector(
+          ".zotero-ai-explain-sidebar__messages"
+        );
         const form = view.querySelector(".zotero-ai-explain-sidebar__form");
         const textarea = view.querySelector('[name="followUp"]');
         form?.addEventListener("submit", (event) => {
@@ -346,7 +326,9 @@ var ZoteroAiExplain = (() => {
           list.replaceChildren(...rows);
         });
       };
-      const continueButton = popup.querySelector('[data-action="continue-sidebar"]');
+      const continueButton = popup.querySelector(
+        '[data-action="continue-sidebar"]'
+      );
       continueButton?.addEventListener("click", () => {
         popupUnsubscribe?.();
         popupUnsubscribe = null;
@@ -394,14 +376,27 @@ var ZoteroAiExplain = (() => {
   function noOp() {
     return void 0;
   }
+  var DIALOG_BACKDROP_STYLE = "position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 999998;";
+  var DIALOG_CONTENT_STYLE = "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 999999; max-width: 480px; min-width: 320px; padding: 24px; background: var(--material-background, white); color: var(--material-color, black); border-radius: 8px; max-height: 80vh; overflow: auto; box-shadow: 0 12px 36px rgba(0,0,0,0.3);";
+  var POPUP_WRAPPER_STYLE = "position: fixed; top: 80px; left: 50%; transform: translateX(-50%); z-index: 999999; max-width: 480px; min-width: 280px; padding: 16px; background: var(--material-background, white); color: inherit; border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); max-height: 60vh; overflow: auto;";
+  var SIDEBAR_WRAPPER_STYLE = "position: fixed; top: 0; right: 0; height: 100vh; width: 360px; max-width: 40vw; z-index: 999998; background: var(--material-background, white); color: inherit; box-shadow: -4px 0 12px rgba(0,0,0,0.2); padding: 16px; overflow: auto; display: flex; flex-direction: column; gap: 12px;";
+  function appendFloatingLayer(zotero, document2, element, label) {
+    const body = document2.body;
+    if (body !== null) {
+      body.append(element);
+      return;
+    }
+    zotero.debug(
+      `Zotero AI Explain: ${label} mounted on documentElement because body is unavailable`
+    );
+    document2.documentElement.append(element);
+  }
   function createZoteroUiAdapter(input2) {
     return {
       addMenuItem(label, action) {
         const mainWindow = input2.Zotero.getMainWindow?.();
         const document2 = mainWindow?.document;
-        const toolsPopup =
-          document2?.getElementById("menu_ToolsPopup") ??
-          document2?.getElementById("menuToolsPopup");
+        const toolsPopup = document2?.getElementById("menu_ToolsPopup") ?? document2?.getElementById("menuToolsPopup");
         if (!document2 || !toolsPopup) {
           input2.Zotero.debug("Zotero AI Explain could not find the Tools menu popup.");
           return noOp;
@@ -455,28 +450,75 @@ var ZoteroAiExplain = (() => {
       openDialog(title, content) {
         const mainWindow = input2.Zotero.getMainWindow?.();
         const document2 = mainWindow?.document;
-        if (!document2?.body) {
+        if (!document2) {
           input2.Zotero.debug(`Zotero AI Explain could not open dialog: ${title}`);
           return;
         }
+        const backdrop = document2.createElement("div");
+        backdrop.className = "zotero-ai-dialog-backdrop";
+        backdrop.setAttribute("style", DIALOG_BACKDROP_STYLE);
         const dialog = document2.createElement("section");
         dialog.className = "zotero-ai-dialog";
         dialog.setAttribute("aria-label", title);
-        dialog.append(content);
-        document2.body.append(dialog);
+        dialog.setAttribute("aria-modal", "true");
+        dialog.setAttribute("role", "dialog");
+        dialog.setAttribute("style", DIALOG_CONTENT_STYLE);
+        const closeButton = document2.createElement("button");
+        closeButton.type = "button";
+        closeButton.dataset.action = "close-dialog";
+        closeButton.textContent = "Close";
+        closeButton.setAttribute(
+          "style",
+          "position: absolute; top: 8px; right: 8px; padding: 4px 12px; cursor: pointer;"
+        );
+        const dispose = () => {
+          document2.removeEventListener("keydown", onKeydown);
+          backdrop.remove();
+          dialog.remove();
+        };
+        function onKeydown(event) {
+          if (event.key === "Escape") {
+            dispose();
+          }
+        }
+        backdrop.addEventListener("click", dispose);
+        closeButton.addEventListener("click", dispose);
+        document2.addEventListener("keydown", onKeydown);
+        dialog.append(closeButton, content);
+        appendFloatingLayer(input2.Zotero, document2, backdrop, "dialog backdrop");
+        appendFloatingLayer(input2.Zotero, document2, dialog, "dialog");
+        input2.Zotero.debug(`Zotero AI Explain opened dialog: ${title}`);
       },
       mountPopup(content) {
         const mainWindow = input2.Zotero.getMainWindow?.();
-        mainWindow?.document.body.append(content);
+        const document2 = mainWindow?.document;
+        if (!document2) {
+          input2.Zotero.debug("Zotero AI Explain could not mount popup: no document");
+          return noOp;
+        }
+        const wrapper = document2.createElement("div");
+        wrapper.className = "zotero-ai-popup-wrapper";
+        wrapper.setAttribute("style", POPUP_WRAPPER_STYLE);
+        wrapper.append(content);
+        appendFloatingLayer(input2.Zotero, document2, wrapper, "popup");
         return () => {
-          content.remove();
+          wrapper.remove();
         };
       },
       mountSidebar(content) {
         const mainWindow = input2.Zotero.getMainWindow?.();
-        mainWindow?.document.body.append(content);
+        const document2 = mainWindow?.document;
+        if (!document2) {
+          input2.Zotero.debug("Zotero AI Explain could not mount sidebar: no document");
+          return noOp;
+        }
+        const wrapper = document2.createElement("div");
+        wrapper.className = "zotero-ai-sidebar-wrapper";
+        wrapper.setAttribute("style", SIDEBAR_WRAPPER_STYLE);
+        wrapper.append(content);
+        appendFloatingLayer(input2.Zotero, document2, wrapper, "sidebar");
         return () => {
-          content.remove();
+          wrapper.remove();
         };
       }
     };
@@ -575,9 +617,7 @@ var ZoteroAiExplain = (() => {
               messages: request.messages
             })
           });
-          for (const line of (await response.text())
-            .split("\n")
-            .filter((entry) => entry.trim().length > 0)) {
+          for (const line of (await response.text()).split("\n").filter((entry) => entry.trim().length > 0)) {
             const payload = parseJsonPayload(line);
             const text = readString(payload, ["message", "content"]);
             if (text !== null) {

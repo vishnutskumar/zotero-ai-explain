@@ -11,7 +11,21 @@ async function startup(data, reason) {
     await Zotero.uiReadyPromise;
   }
 
-  const scope = { Zotero };
+  // The bundle uses bare `document` / `window` references in view-rendering
+  // functions (renderSettingsView, renderAnchoredPopup, etc). In Zotero's
+  // chrome ESM context, bare `document` does NOT resolve to a usable global,
+  // so view functions throw ReferenceError at first call and click handlers
+  // abort silently. Expose live getters so refs stay current.
+  const scope = {
+    Zotero,
+    get document() {
+      return Zotero.getMainWindow()?.document;
+    },
+    get window() {
+      return Zotero.getMainWindow();
+    }
+  };
+
   // Synchronously evaluate our bundle (built as an IIFE that assigns to
   // `ZoteroAiExplain` on the scope global). loadSubScript executes the
   // script in the given scope, so the IIFE writes its export onto `scope`.

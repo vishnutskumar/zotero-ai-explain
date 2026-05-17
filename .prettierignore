@@ -1,1 +1,2 @@
 addon/content/*.sys.mjs
+addon/content/zotero-ai-explain.js
