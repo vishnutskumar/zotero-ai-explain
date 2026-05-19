@@ -28,6 +28,7 @@
     "tests/**/*.ts",
     "scripts/**/*.ts",
     "vitest.config.ts",
-    "vitest.e2e.config.ts"
+    "vitest.e2e.config.ts",
+    "vitest.e2e-local.config.ts"
   ]
 }

@@ -25,9 +25,12 @@ export default tseslint.config(
     extends: [tseslint.configs.disableTypeChecked],
     languageOptions: {
       globals: {
+        AbortController: "readonly",
         APP_SHUTDOWN: "readonly",
         ChromeUtils: "readonly",
+        Components: "readonly",
         console: "readonly",
+        fetch: "readonly",
         process: "readonly",
         Services: "readonly",
         Zotero: "readonly"

@@ -23,9 +23,12 @@ export type ZoteroHandle = {
   getLog(): string;
 };
 
+export type PrefValue = string | number | boolean;
+
 export function createProfile(options?: {
   marionettePort?: number;
   profileDir?: string | null;
+  extraPrefs?: Record<string, PrefValue>;
 }): string;
 
 export function installPlugin(
@@ -50,6 +53,7 @@ export function startZoteroWithPlugin(options?: {
   marionettePort?: number;
   startupTimeoutMs?: number;
   quiet?: boolean;
+  extraPrefs?: Record<string, PrefValue>;
 }): Promise<ZoteroHandle>;
 
 export function cleanupProfile(profileDir: string): void;

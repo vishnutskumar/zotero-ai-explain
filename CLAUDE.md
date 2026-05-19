@@ -1,18 +1,39 @@
 # Zotero AI Explain
 
-Zotero AI Explain is a Zotero plugin for selected-text explanations and sidebar follow-up chat with
-configurable model providers.
+Zotero AI Explain is a Zotero plugin for selected-text explanations, sidebar follow-up chat, and
+NotebookLM-style "Ask your library" retrieval over per-provider on-disk indexes. Chat and embedding
+backends are configured independently; a bundled local LLM proxy lets the plugin route through the
+Codex or Claude Code CLIs (using the user's ChatGPT/Claude subscription) or pass through to a real
+Ollama daemon.
 
 ## Structure
 
 ```text
 zotero_ai/
-  addon/                 # Zotero extension assets and browser-facing files
-  docs/                  # Specs, plans, and human-facing documentation
-  scripts/               # Build and packaging automation
-  src/                   # TypeScript source
-  tests/                 # Vitest test suite
-  .forge/                # Forge phase state and learnings
+  addon/                 # Zotero extension assets and browser-facing files (staged into the XPI)
+    bootstrap.js         # Zotero bootstrap entrypoint; loads the IIFE bundle
+    content/             # Built bundle output
+    llm-proxy/           # (staged at build time from scripts/llm-proxy; ships in the XPI)
+  docs/
+    decisions/           # Architectural Decision Records (ADRs)
+    specs/               # Approved Forge specs
+    manual-verification/ # Human smoke-test checklists
+    superpowers/         # Brainstorming + planning artefacts
+  scripts/               # Build, packaging, and runtime automation
+    llm-proxy/           # Bundled Node HTTP service (codex / claude / ollama backends)
+    zotero-e2e/          # Real-Zotero spawn harness + fake-Ollama fixture
+  src/
+    bootstrap.ts         # Entrypoint; wires runtime, proxy lifecycle, onboarding
+    conversation/        # Conversation stores (per-selection popup + singleton library chat)
+    indexing/            # Library crawler, chunker, per-provider index storage, retrieval
+    platform/            # Zotero adapters, e2e driver, proxy lifecycle, subprocess wiring
+    preferences/         # Provider profiles, preset dropdown, model discovery, onboarding pref
+    providers/           # Chat + embed adapters (ollama, openai, claude-api, gemini)
+    secrets/             # Secret references (no raw API keys in pref storage)
+    selection/           # Selection context normalization
+    ui/                  # Anchored popup, sidebar, library chat, settings, onboarding, markdown
+  tests/                 # Vitest test suite (unit, integration, e2e, e2e-local)
+  .forge/                # Forge phase state and learnings (mostly gitignored)
 ```
 
 ## Build & Test
@@ -22,20 +43,27 @@ npm install
 npm run typecheck
 npm run lint
 npm run format
-npm run test
-npm run verify
+npm run test            # unit + integration suite
+npm run test:e2e        # real Zotero + fake Ollama; runs in CI
+npm run test:e2e:local  # real Zotero + real Ollama; auto-skips when Ollama is offline
+npm run build           # esbuild → addon/content/zotero-ai-explain.js
+npm run package         # zip addon/ + bundled llm-proxy/ into zotero-ai-explain.xpi
+npm run proxy:llm       # run scripts/llm-proxy/server.mjs out of the source tree
+npm run verify          # typecheck + lint + format + test
 pre-commit run --all-files
 ```
 
 ## Lint & Format
 
-| Tool       | Command                      | Config                    |
-| ---------- | ---------------------------- | ------------------------- |
-| TypeScript | `npm run typecheck`          | `tsconfig.json`           |
-| ESLint     | `npm run lint`               | `eslint.config.js`        |
-| Prettier   | `npm run format`             | `.prettierrc`             |
-| Vitest     | `npm run test`               | `package.json`            |
-| Pre-commit | `pre-commit run --all-files` | `.pre-commit-config.yaml` |
+| Tool             | Command                      | Config                             |
+| ---------------- | ---------------------------- | ---------------------------------- |
+| TypeScript       | `npm run typecheck`          | `tsconfig.json`                    |
+| ESLint           | `npm run lint`               | `eslint.config.js`                 |
+| Prettier         | `npm run format`             | `.prettierrc`                      |
+| Vitest           | `npm run test`               | `package.json`, `vitest.config.ts` |
+| Vitest e2e       | `npm run test:e2e`           | `vitest.e2e.config.ts`             |
+| Vitest e2e-local | `npm run test:e2e:local`     | `vitest.e2e-local.config.ts`       |
+| Pre-commit       | `pre-commit run --all-files` | `.pre-commit-config.yaml`          |
 
 Pre-commit hooks must run before commits. Fix hook failures at the root cause.
 
@@ -45,17 +73,32 @@ staged diff would never see.
 
 ## Key Files
 
-| File                      | Purpose                                             |
-| ------------------------- | --------------------------------------------------- |
-| `package.json`            | Node scripts and TypeScript test/lint dependencies. |
-| `tsconfig.json`           | Strict TypeScript compiler settings.                |
-| `.pre-commit-config.yaml` | Universal and TypeScript project hooks.             |
-| `README.md`               | Human-facing project overview.                      |
+| File                                       | Purpose                                                                              |
+| ------------------------------------------ | ------------------------------------------------------------------------------------ |
+| `package.json`                             | Node scripts and TypeScript test/lint dependencies.                                  |
+| `tsconfig.json`                            | Strict TypeScript compiler settings.                                                 |
+| `.pre-commit-config.yaml`                  | Universal and TypeScript project hooks.                                              |
+| `README.md`                                | Human-facing project overview.                                                       |
+| `addon/bootstrap.js`                       | Zotero bootstrap entrypoint; loads the IIFE bundle, threads rootURI.                 |
+| `src/bootstrap.ts`                         | Plugin entrypoint; wires runtime, proxy lifecycle, onboarding probe.                 |
+| `src/platform/zotero-runtime.ts`           | Runtime dependency graph and UI mounting.                                            |
+| `src/platform/proxy-lifecycle.ts`          | Headless lifecycle controller for the bundled llm-proxy subprocess.                  |
+| `src/platform/wire-proxy-lifecycle.ts`     | Wires Subprocess + settings prefs + Node-binary auto-detect.                         |
+| `src/preferences/preset-profiles.ts`       | Preset dropdown table (Local Ollama / Codex / Claude / OpenAI / Anthropic / Custom). |
+| `src/preferences/provider-profile.ts`      | Independent chat/embed provider selectors + per-provider API keys.                   |
+| `src/preferences/model-discovery.ts`       | Live model-list probe per backend (Ollama, proxy, OpenAI, Anthropic, Gemini).        |
+| `src/indexing/index-path.ts`               | Per-(provider, model) index filename rules + legacy back-compat.                     |
+| `src/indexing/index-search.ts`             | Cosine top-K retrieval; throws on dimension mismatch.                                |
+| `src/ui/library-chat-view.ts`              | NotebookLM-style "Ask your library" dialog with citation rendering.                  |
+| `scripts/llm-proxy/server.mjs`             | Node HTTP service (Ollama wire protocol; codex/claude/ollama backends).              |
+| `scripts/package-xpi.mjs`                  | Stages `scripts/llm-proxy/` into `addon/llm-proxy/`, zips the XPI.                   |
+| `.github/workflows/e2e-cross-platform.yml` | Three-OS release-gate matrix with real Ollama + real Zotero.                         |
+| `docs/decisions/`                          | Architectural Decision Records for the major Phase 4 decisions.                      |
 
 ## Navigation
 
 - [addon/](addon/CLAUDE.md) -- Zotero extension assets.
 - [src/](src/CLAUDE.md) -- TypeScript source.
 - [tests/](tests/CLAUDE.md) -- Test suite.
-- [docs/](docs/CLAUDE.md) -- Specs and documentation.
+- [docs/](docs/CLAUDE.md) -- Specs, ADRs, and documentation.
 - [scripts/](scripts/CLAUDE.md) -- Build and packaging automation.

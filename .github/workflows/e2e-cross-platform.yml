@@ -1,0 +1,385 @@
+name: E2E Cross-Platform
+
+# Validates the plugin against a real Zotero binary and (optionally) a real
+# Ollama daemon on macOS, Linux, and Windows. Runs in parallel via a matrix
+# so one OS failing does not mask the others.
+#
+# Each job:
+#   1. Installs Node 22 + project deps (npm ci).
+#   2. Downloads + installs a pinned Zotero release for the target OS.
+#   3. Downloads + installs a pinned Ollama release for the target OS.
+#   4. Caches the Ollama model blobs (~1.6 GB) keyed on OS + Ollama version
+#      + model names so subsequent runs skip the slow pull.
+#   5. Runs the same gate suite the macOS dev box runs:
+#         typecheck → lint → unit tests → build → package → fake-Ollama e2e
+#         → real-Ollama e2e (gemma3:1b + embeddinggemma).
+#   6. On failure, uploads the Zotero log (/tmp/zotero-e2e-latest.log from
+#      the test's afterAll dump), the built XPI, and the vitest reporter
+#      output so post-mortem does not require re-running the matrix.
+#
+# Expected wall-clock per OS: 10-15 min on a clean cache (model pull
+# dominates), ~3-5 min on a warm cache. Treat this workflow as a release
+# gate, not a per-PR fast gate; the existing `CI` and `Zotero E2E` workflows
+# remain the fast required checks.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Avoid stacking redundant runs on rapid pushes; the matrix is expensive.
+concurrency:
+  group: e2e-cross-platform-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pin a single Zotero release across all three OSes for reproducibility.
+  # Update this single value when bumping. 7.0.21 is the current stable
+  # release at time of authoring; the plugin manifest accepts 8.0–9.99.99
+  # but Zotero 7 shares the bootstrap/Marionette surface the harness uses,
+  # so this is the most stable target available today. Bump in lockstep
+  # when Zotero 8 ships and re-validate.
+  ZOTERO_VERSION: "7.0.21"
+  # Pin Ollama for cache stability — the model cache key includes this.
+  OLLAMA_VERSION: "0.5.7"
+  # Tiny models keep CI fast and fit comfortably in actions/cache.
+  OLLAMA_CHAT_MODEL: "gemma3:1b"
+  OLLAMA_EMBED_MODEL: "embeddinggemma"
+
+jobs:
+  cross-platform-e2e:
+    name: ${{ matrix.os }} (Zotero ${{ matrix.zotero-version || '7.0.21' }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      # ----------------------------------------------------------------
+      # Zotero install — one block per OS. Each branch sets ZOTERO_BINARY
+      # in $GITHUB_ENV so the harness (`scripts/zotero-e2e/launch.mjs`,
+      # which reads `process.env.ZOTERO_BINARY`) finds the binary without
+      # platform-specific logic in the test code.
+      # ----------------------------------------------------------------
+
+      - name: Install Zotero (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euxo pipefail
+          DMG="$RUNNER_TEMP/Zotero.dmg"
+          URL="https://download.zotero.org/client/release/${ZOTERO_VERSION}/Zotero-${ZOTERO_VERSION}.dmg"
+          echo "Downloading $URL"
+          curl -fsSL "$URL" -o "$DMG"
+          MOUNT_DIR="$(mktemp -d)"
+          hdiutil attach "$DMG" -mountpoint "$MOUNT_DIR" -nobrowse -quiet
+          # Trap to ensure detach happens even on copy failure.
+          trap 'hdiutil detach "$MOUNT_DIR" -quiet || true' EXIT
+          cp -R "$MOUNT_DIR/Zotero.app" /Applications/
+          hdiutil detach "$MOUNT_DIR" -quiet
+          trap - EXIT
+          # Remove the quarantine bit so Zotero launches headless without
+          # Gatekeeper prompts (the runner has no GUI to dismiss them).
+          xattr -dr com.apple.quarantine /Applications/Zotero.app || true
+          ZOTERO_BIN="/Applications/Zotero.app/Contents/MacOS/zotero"
+          test -x "$ZOTERO_BIN"
+          echo "ZOTERO_BINARY=$ZOTERO_BIN" >> "$GITHUB_ENV"
+
+      - name: Install Zotero (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb \
+            libdbus-glib-1-2 \
+            libgtk-3-0 \
+            libasound2t64 \
+            libxt6 \
+            libx11-xcb1 \
+            libxtst6
+          TARBALL="$RUNNER_TEMP/zotero.tar.bz2"
+          URL="https://download.zotero.org/client/release/${ZOTERO_VERSION}/Zotero-${ZOTERO_VERSION}_linux-x86_64.tar.bz2"
+          echo "Downloading $URL"
+          curl -fsSL "$URL" -o "$TARBALL"
+          sudo mkdir -p /opt/zotero
+          sudo tar -xf "$TARBALL" -C /opt/zotero --strip-components=1
+          sudo ln -sf /opt/zotero/zotero /usr/local/bin/zotero
+          ZOTERO_BIN="/opt/zotero/zotero"
+          test -x "$ZOTERO_BIN"
+          echo "ZOTERO_BINARY=$ZOTERO_BIN" >> "$GITHUB_ENV"
+
+      - name: Install Zotero (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:ZOTERO_VERSION
+          $installer = "$env:RUNNER_TEMP\Zotero-Setup.exe"
+          # Zotero ships a Windows installer at the same release URL slot.
+          # The "Setup" exe is an NSIS-style installer that accepts /S for
+          # silent install and /D=<path> (must be LAST arg, no quotes) for
+          # the install directory.
+          $url = "https://download.zotero.org/client/release/$version/Zotero-${version}_setup.exe"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+          $installDir = "C:\Zotero"
+          # /S = silent; /D must be the final argument and unquoted per NSIS.
+          $proc = Start-Process -FilePath $installer -ArgumentList "/S","/D=$installDir" -PassThru -Wait
+          if ($proc.ExitCode -ne 0) {
+            throw "Zotero installer exited with $($proc.ExitCode)"
+          }
+          $zoteroExe = Join-Path $installDir "zotero.exe"
+          if (-not (Test-Path $zoteroExe)) {
+            throw "zotero.exe not found at $zoteroExe after install"
+          }
+          # GITHUB_ENV uses LF — write a single line, no quoting tricks.
+          "ZOTERO_BINARY=$zoteroExe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$installDir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # ----------------------------------------------------------------
+      # Ollama install — same per-OS pattern. We start the daemon in a
+      # background process and poll /api/tags before proceeding so the
+      # model-pull step does not race the listener.
+      # ----------------------------------------------------------------
+
+      - name: Install Ollama (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euxo pipefail
+          # Use the official .zip rather than Homebrew so the version is
+          # pinned via $OLLAMA_VERSION and matches the cache key.
+          ZIP="$RUNNER_TEMP/ollama.zip"
+          URL="https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/Ollama-darwin.zip"
+          curl -fsSL "$URL" -o "$ZIP"
+          mkdir -p "$RUNNER_TEMP/ollama-app"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/ollama-app"
+          # The zip ships an Ollama.app; the CLI lives inside it.
+          OLLAMA_BIN="$RUNNER_TEMP/ollama-app/Ollama.app/Contents/Resources/ollama"
+          test -x "$OLLAMA_BIN"
+          sudo ln -sf "$OLLAMA_BIN" /usr/local/bin/ollama
+          ollama --version
+
+      - name: Install Ollama (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          # Pin via direct binary download — `install.sh` floats @latest.
+          BIN_URL="https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-amd64.tgz"
+          TGZ="$RUNNER_TEMP/ollama.tgz"
+          curl -fsSL "$BIN_URL" -o "$TGZ"
+          sudo mkdir -p /usr/local/ollama
+          sudo tar -xzf "$TGZ" -C /usr/local/ollama
+          sudo ln -sf /usr/local/ollama/bin/ollama /usr/local/bin/ollama
+          ollama --version
+
+      - name: Install Ollama (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:OLLAMA_VERSION
+          $installer = "$env:RUNNER_TEMP\OllamaSetup.exe"
+          $url = "https://github.com/ollama/ollama/releases/download/v$version/OllamaSetup.exe"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+          # OllamaSetup.exe is an InnoSetup installer — /VERYSILENT installs
+          # without UI and without restart prompts. /NORESTART is defensive.
+          $proc = Start-Process -FilePath $installer -ArgumentList "/VERYSILENT","/NORESTART" -PassThru -Wait
+          if ($proc.ExitCode -ne 0) {
+            throw "Ollama installer exited with $($proc.ExitCode)"
+          }
+          # InnoSetup default install path for per-user installs.
+          $ollamaDir = "$env:LOCALAPPDATA\Programs\Ollama"
+          if (-not (Test-Path (Join-Path $ollamaDir "ollama.exe"))) {
+            # Fall back to per-machine install path.
+            $ollamaDir = "C:\Program Files\Ollama"
+          }
+          if (-not (Test-Path (Join-Path $ollamaDir "ollama.exe"))) {
+            throw "ollama.exe not found in known install paths"
+          }
+          "$ollamaDir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # ----------------------------------------------------------------
+      # Cache Ollama model blobs (~1.6 GB total for gemma3:1b +
+      # embeddinggemma). Cache keys include OS + Ollama version + model
+      # names so a bump to any of those forces a re-pull.
+      # ----------------------------------------------------------------
+
+      - name: Resolve Ollama models cache path
+        id: ollama-cache-path
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Default per-platform model storage locations per the Ollama docs.
+          case "$RUNNER_OS" in
+            Linux)   MODELS_DIR="$HOME/.ollama" ;;
+            macOS)   MODELS_DIR="$HOME/.ollama" ;;
+            Windows) MODELS_DIR="$USERPROFILE/.ollama" ;;
+            *) echo "Unknown OS $RUNNER_OS" >&2; exit 1 ;;
+          esac
+          echo "path=$MODELS_DIR" >> "$GITHUB_OUTPUT"
+          echo "Resolved Ollama models dir: $MODELS_DIR"
+
+      - name: Cache Ollama models
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.ollama-cache-path.outputs.path }}
+          key:
+            ollama-models-${{ runner.os }}-v${{ env.OLLAMA_VERSION }}-${{ env.OLLAMA_CHAT_MODEL
+            }}-${{ env.OLLAMA_EMBED_MODEL }}
+          restore-keys: |
+            ollama-models-${{ runner.os }}-v${{ env.OLLAMA_VERSION }}-
+
+      # ----------------------------------------------------------------
+      # Start the daemon, then pull models (no-op on cache hit). We poll
+      # /api/tags rather than `sleep` so faster machines don't waste time
+      # and slower machines don't race.
+      # ----------------------------------------------------------------
+
+      - name: Start Ollama daemon (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/ollama-logs"
+          # nohup + & detaches; we poll the HTTP endpoint to confirm.
+          nohup ollama serve > "$RUNNER_TEMP/ollama-logs/serve.log" 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+              echo "Ollama is up after $i attempt(s)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Ollama failed to start within 30s; serve.log follows:" >&2
+          cat "$RUNNER_TEMP/ollama-logs/serve.log" >&2 || true
+          exit 1
+
+      - name: Start Ollama daemon (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $logDir = "$env:RUNNER_TEMP\ollama-logs"
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+          $logFile = Join-Path $logDir "serve.log"
+          # Start-Process -PassThru keeps a handle but does not block; the
+          # next steps will use the HTTP endpoint to confirm readiness.
+          Start-Process -FilePath "ollama" -ArgumentList "serve" `
+            -RedirectStandardOutput $logFile `
+            -RedirectStandardError (Join-Path $logDir "serve.err.log") `
+            -WindowStyle Hidden
+          $up = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:11434/api/tags" -UseBasicParsing -TimeoutSec 2
+              if ($resp.StatusCode -eq 200) { $up = $true; break }
+            } catch { Start-Sleep -Seconds 1 }
+          }
+          if (-not $up) {
+            Write-Host "Ollama failed to start within 30s; log follows:"
+            if (Test-Path $logFile) { Get-Content $logFile }
+            throw "Ollama did not become ready"
+          }
+          Write-Host "Ollama is up"
+
+      - name: Pull Ollama models
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # `ollama pull` is a no-op when the blob already exists in the
+          # cached models dir, so the cache restore step above is what
+          # saves the ~1.6 GB download on warm runs.
+          ollama pull "$OLLAMA_CHAT_MODEL"
+          ollama pull "$OLLAMA_EMBED_MODEL"
+          ollama list
+
+      # ----------------------------------------------------------------
+      # Project gate suite. Identical commands across OSes; the Linux job
+      # additionally wraps the e2e steps in Xvfb. Windows + macOS Zotero
+      # binaries can launch headless without an X server.
+      # ----------------------------------------------------------------
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm run test
+
+      - name: Build bundle
+        run: npm run build
+
+      - name: Package XPI (v0.1.3)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # package-xpi.mjs requires a semver tag in $GITHUB_REF_NAME OR as
+          # argv[2]. On push to main `$GITHUB_REF_NAME=main` fails the
+          # semver guard; cross-validate against the manifest version.
+          MANIFEST_VERSION="$(node -p "require('./addon/manifest.json').version")"
+          node scripts/package-xpi.mjs "v${MANIFEST_VERSION}"
+          ls -la dist/
+          test -f zotero-ai-explain.xpi
+
+      - name: Start Xvfb (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          Xvfb :99 -screen 0 1280x1024x24 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          for i in 1 2 3 4 5; do
+            if DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+      - name: Fake-Ollama E2E (test:e2e)
+        env:
+          ZOTERO_XPI: ${{ github.workspace }}/zotero-ai-explain.xpi
+        run: npm run test:e2e
+
+      - name: Real-Ollama E2E (test:e2e:local)
+        env:
+          ZOTERO_XPI: ${{ github.workspace }}/zotero-ai-explain.xpi
+          OLLAMA_BASE_URL: http://127.0.0.1:11434
+          OLLAMA_CHAT_MODEL: ${{ env.OLLAMA_CHAT_MODEL }}
+          OLLAMA_EMBED_MODEL: ${{ env.OLLAMA_EMBED_MODEL }}
+        run: npm run test:e2e:local
+
+      # ----------------------------------------------------------------
+      # Failure artifacts — uploaded only when something in the gate
+      # failed. Keep retention short; these logs are large and useful
+      # mostly within the same day as the failure.
+      # ----------------------------------------------------------------
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cross-platform-${{ runner.os }}-failure
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            /tmp/zotero-e2e-latest.log
+            .zotero-e2e/**
+            zotero-ai-explain.xpi
+            dist/*.xpi
+            ${{ runner.temp }}/ollama-logs/**

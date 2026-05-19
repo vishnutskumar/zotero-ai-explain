@@ -6,13 +6,17 @@ export type SourceMetadata = {
   readonly location: string | null;
 };
 
+export type SelectionAnchor = {
+  readonly left: number;
+  readonly top: number;
+  readonly width: number;
+  readonly height: number;
+  readonly viewportWidth?: number;
+  readonly viewportHeight?: number;
+};
+
 export type SelectionContext = {
   readonly quote: string;
   readonly source: SourceMetadata;
-  readonly anchor: {
-    readonly left: number;
-    readonly top: number;
-    readonly width: number;
-    readonly height: number;
-  } | null;
+  readonly anchor: SelectionAnchor | null;
 };
