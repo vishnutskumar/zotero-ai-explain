@@ -11,7 +11,11 @@ import {
   validateReleaseVersions
 } from "./release-version.mjs";
 
-const tag = process.env.GITHUB_REF_NAME ?? process.argv[2] ?? "";
+// argv[2] is explicit and wins. CI workflows that aren't on a tag (e.g.
+// the cross-platform matrix on a feature branch or workflow_dispatch)
+// pass the manifest version as argv[2]; GITHUB_REF_NAME would otherwise
+// be the branch name like "forge/foo" and fail the semver guard.
+const tag = process.argv[2] ?? process.env.GITHUB_REF_NAME ?? "";
 const versions = readProjectVersions();
 const version = validateReleaseVersions(tag, versions);
 const distDirectory = "dist";
