@@ -42,6 +42,16 @@ export type IndexingStatus = {
    */
   readonly previouslyIndexed?: number;
   readonly skippedNoText?: number;
+  /**
+   * AC-14: true while an AC-5 index migration crawl is in flight.
+   * Read-only observability signal so the settings UI can disable the
+   * "Index library" button and explain why a click cannot start a run.
+   * It is NOT a run-lifecycle state — `state` is unaffected by a
+   * migration. Optional in the type for legacy-literal back-compat
+   * (mirrors `previouslyIndexed`); the reducer always emits a concrete
+   * boolean.
+   */
+  readonly migrationActive?: boolean;
 };
 
 export type IndexingAction =
@@ -90,7 +100,18 @@ export type IndexingAction =
   | { readonly type: "resumed" }
   | { readonly type: "completed" }
   | { readonly type: "failed"; readonly errorMessage?: string }
-  | { readonly type: "cleared" };
+  | { readonly type: "cleared" }
+  /**
+   * AC-14: bracket an in-flight AC-5 index migration. The controller
+   * emits `migration-started` right after it spawns the migration
+   * crawl and `migration-settled` when that crawl resolves. Both
+   * reducer cases touch ONLY `migrationActive` — no run-lifecycle
+   * field (`state` / `totalItems` / `indexedItems` / `failedItems`) is
+   * affected. This is a pure observability addition, not a logic
+   * change.
+   */
+  | { readonly type: "migration-started" }
+  | { readonly type: "migration-settled" };
 
 export function createInitialIndexingStatus(): IndexingStatus {
   return {
@@ -99,7 +120,8 @@ export function createInitialIndexingStatus(): IndexingStatus {
     indexedItems: 0,
     failedItems: 0,
     previouslyIndexed: 0,
-    skippedNoText: 0
+    skippedNoText: 0,
+    migrationActive: false
   };
 }
 
@@ -154,5 +176,12 @@ export function reduceIndexingStatus(
       // Returning the initial status drops `errorMessage` because the
       // initial value never carries one (FINDING-20).
       return createInitialIndexingStatus();
+    case "migration-started":
+      // AC-14: read-only observability. Touch ONLY `migrationActive` —
+      // the run-lifecycle fields are spread through unchanged so the
+      // migration bracket can never smuggle in a counter mutation.
+      return { ...status, migrationActive: true };
+    case "migration-settled":
+      return { ...status, migrationActive: false };
   }
 }

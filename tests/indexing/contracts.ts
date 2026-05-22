@@ -39,4 +39,9 @@ export type IndexStorageIoLike = {
   writeString(path: string, contents: string): Promise<void>;
   remove(path: string): Promise<void>;
   exists(path: string): Promise<boolean>;
+  // AC-5: atomic move backing the migration `.tmp` → primary swap.
+  rename(src: string, dst: string): Promise<void>;
+  // AC-12: cheap stat backing the in-memory index-cache fingerprint.
+  // Resolves `null` when the file is absent or cannot be stat'd.
+  stat(path: string): Promise<{ readonly size: number; readonly lastModified?: number } | null>;
 };

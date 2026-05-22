@@ -12,7 +12,11 @@
  * vi.mock'd crawler resolves immediately).
  */
 
-import type { IndexFile, LibraryCrawlerDeps } from "../../src/indexing/library-crawler.js";
+import {
+  CURRENT_SCHEMA_VERSION,
+  type IndexFile,
+  type LibraryCrawlerDeps
+} from "../../src/indexing/library-crawler.js";
 import type { IndexStorage } from "../../src/indexing/index-storage.js";
 
 export function stubCrawlerZotero(): LibraryCrawlerDeps["zotero"] {
@@ -39,10 +43,17 @@ export function stubCrawlerSettings(): LibraryCrawlerDeps["settings"] {
 
 export function stubIndexStorage(): IndexStorage {
   let stored: IndexFile | null = null;
+  let tmp: IndexFile | null = null;
+  let marker = false;
   return {
     // eslint-disable-next-line @typescript-eslint/require-await
     async read() {
       return stored;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async readWithMigration() {
+      const schemaVersion = stored?.schemaVersion ?? 1;
+      return { file: stored, migrationPending: marker || schemaVersion < CURRENT_SCHEMA_VERSION };
     },
     // eslint-disable-next-line @typescript-eslint/require-await
     async readItemCount() {
@@ -53,8 +64,42 @@ export function stubIndexStorage(): IndexStorage {
       stored = file;
     },
     // eslint-disable-next-line @typescript-eslint/require-await
+    async writeTmp(file) {
+      tmp = file;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async commitMigration() {
+      if (tmp === null) throw new Error("no .tmp to commit");
+      stored = tmp;
+      tmp = null;
+      marker = false;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async abandonMigration() {
+      tmp = null;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async writeMarker() {
+      marker = true;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async removeMarker() {
+      marker = false;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async hasMarker() {
+      return marker;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
     async clear() {
+      // FINDING-4: the real `IndexStorage.clear()` removes the primary,
+      // the meta sidecar, the migration `.tmp`, AND the `.migrating`
+      // marker. The stub mirrors that so a controller test exercising a
+      // clear-during-migration sees the same post-condition (no marker /
+      // tmp survives) the production storage layer guarantees.
       stored = null;
+      tmp = null;
+      marker = false;
     },
     path() {
       return "/var/test-fixture/test-index.json";

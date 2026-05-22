@@ -516,9 +516,20 @@ export function createCodexBackend(deps = {}) {
     let aborted = false;
     let idleTimer = null;
     let hardTimer = null;
+    // AC-12: spawn-timing MEASUREMENT (not a behaviour change). `codex
+    // exec` has no daemon/persistent-process mode — every turn pays a
+    // fresh process spawn + CLI init — so AC-12 makes the spawn-vs-
+    // inference split an observable fact in the proxy logs rather than
+    // attempting an unbuildable "warm daemon". `firstDeltaLogged` gates
+    // the spawn→first-delta line to the FIRST streamed delta only.
+    let firstDeltaLogged = false;
 
     function emitDelta(text) {
       if (!text) return;
+      if (!firstDeltaLogged) {
+        firstDeltaLogged = true;
+        console.error(`codex-backend: spawn→first-delta ${String(now() - spawnStartedAtMs)}ms`);
+      }
       fullText += text;
       onEvent({
         model: requestedModel,
@@ -642,6 +653,10 @@ export function createCodexBackend(deps = {}) {
     const exitCode = await exitPromise;
     if (idleTimer) clearInterval(idleTimer);
     if (hardTimer) clearTimeout(hardTimer);
+    // AC-12: spawn→close measurement — the full per-turn process
+    // lifetime. Paired with the spawn→first-delta line above this makes
+    // the spawn-vs-inference latency split observable in proxy logs.
+    console.error(`codex-backend: spawn→close ${String(now() - spawnStartedAtMs)}ms`);
 
     // Drain any trailing partial line in case codex did not terminate with \n.
     if (stdoutBuffer.trim().length > 0) {

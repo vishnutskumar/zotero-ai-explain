@@ -69,6 +69,109 @@ export const SECTION_BLOCK_STYLE = "display: flex; flex-direction: column; gap: 
 export const SECTION_BLURB_STYLE = `margin: 0; font-size: 11px; color: ${FG_MUTED}; line-height: 1.4;`;
 
 /**
+ * Shared markdown stylesheet (AC-13). Styles the block elements
+ * `renderMarkdown` emits — `h1`–`h4` (the parser caps headings at level
+ * 4, `markdown.ts:97`), `p`, `ul`/`ol`/`li`, inline and fenced
+ * `code`/`pre`, `blockquote`, and `a` — so the anchored popup and the
+ * sidebar render identical markdown typography from a single source of
+ * truth.
+ *
+ * Every rule is a DESCENDANT selector keyed on one of the three stable
+ * markdown container classes (`.zotero-ai-explain-popup__body`,
+ * `.zotero-ai-explain-popup__turn-body`,
+ * `.zotero-ai-explain-sidebar__body`) so the rules style markdown
+ * content WITHOUT bleeding into non-markdown chrome (headers, forms,
+ * quote blocks). Colors are design tokens with CSS system-color
+ * fallbacks — never literal `white` / `black` — so the typography
+ * tracks the OS theme.
+ *
+ * Callers append this constant verbatim into a `<style>` block; the
+ * selectors carry their own scoping prefixes so no caller-side wrapping
+ * is required.
+ */
+export const MARKDOWN_CSS = `
+  .zotero-ai-explain-popup__body h1,
+  .zotero-ai-explain-popup__turn-body h1,
+  .zotero-ai-explain-sidebar__body h1 {
+    margin: 0.4em 0 0.3em; font-size: 1.3em; font-weight: 600; line-height: 1.3;
+  }
+  .zotero-ai-explain-popup__body h2,
+  .zotero-ai-explain-popup__turn-body h2,
+  .zotero-ai-explain-sidebar__body h2 {
+    margin: 0.4em 0 0.3em; font-size: 1.18em; font-weight: 600; line-height: 1.3;
+  }
+  .zotero-ai-explain-popup__body h3,
+  .zotero-ai-explain-popup__turn-body h3,
+  .zotero-ai-explain-sidebar__body h3 {
+    margin: 0.4em 0 0.25em; font-size: 1.08em; font-weight: 600; line-height: 1.3;
+  }
+  .zotero-ai-explain-popup__body h4,
+  .zotero-ai-explain-popup__turn-body h4,
+  .zotero-ai-explain-sidebar__body h4 {
+    margin: 0.4em 0 0.25em; font-size: 1em; font-weight: 600; line-height: 1.3;
+  }
+  .zotero-ai-explain-popup__body p,
+  .zotero-ai-explain-popup__turn-body p,
+  .zotero-ai-explain-sidebar__body p {
+    margin: 0.35em 0;
+  }
+  .zotero-ai-explain-popup__body ul,
+  .zotero-ai-explain-popup__turn-body ul,
+  .zotero-ai-explain-sidebar__body ul,
+  .zotero-ai-explain-popup__body ol,
+  .zotero-ai-explain-popup__turn-body ol,
+  .zotero-ai-explain-sidebar__body ol {
+    margin: 0.35em 0; padding-left: 1.4em;
+  }
+  .zotero-ai-explain-popup__body ul,
+  .zotero-ai-explain-popup__turn-body ul,
+  .zotero-ai-explain-sidebar__body ul {
+    list-style: disc;
+  }
+  .zotero-ai-explain-popup__body ol,
+  .zotero-ai-explain-popup__turn-body ol,
+  .zotero-ai-explain-sidebar__body ol {
+    list-style: decimal;
+  }
+  .zotero-ai-explain-popup__body li,
+  .zotero-ai-explain-popup__turn-body li,
+  .zotero-ai-explain-sidebar__body li {
+    margin: 0.15em 0;
+  }
+  .zotero-ai-explain-popup__body code,
+  .zotero-ai-explain-popup__turn-body code,
+  .zotero-ai-explain-sidebar__body code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.92em; padding: 0.1em 0.3em; border-radius: 3px;
+    background: var(--fill-quarternary, ButtonFace);
+  }
+  .zotero-ai-explain-popup__body pre,
+  .zotero-ai-explain-popup__turn-body pre,
+  .zotero-ai-explain-sidebar__body pre {
+    margin: 0.4em 0; padding: 8px 10px; border-radius: 4px;
+    background: var(--fill-quarternary, ButtonFace);
+    overflow-x: auto;
+  }
+  .zotero-ai-explain-popup__body pre code,
+  .zotero-ai-explain-popup__turn-body pre code,
+  .zotero-ai-explain-sidebar__body pre code {
+    padding: 0; border-radius: 0; background: transparent;
+  }
+  .zotero-ai-explain-popup__body blockquote,
+  .zotero-ai-explain-popup__turn-body blockquote,
+  .zotero-ai-explain-sidebar__body blockquote {
+    margin: 0.4em 0; padding: 0.2em 0.8em;
+    border-left: 3px solid var(--accent-blue, Highlight);
+    color: var(--fill-secondary, GrayText);
+  }
+  .zotero-ai-explain-popup__body a,
+  .zotero-ai-explain-popup__turn-body a,
+  .zotero-ai-explain-sidebar__body a {
+    color: var(--accent-blue, Highlight); text-decoration: underline;
+  }
+`;
+
+/**
  * Wire a focus ring to an interactive element. CSS `:focus-visible` is
  * inconsistent across Zotero's chrome contexts, so we paint the outline
  * directly via focus/blur listeners.

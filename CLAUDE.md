@@ -1,10 +1,12 @@
 # Zotero AI Explain
 
-Zotero AI Explain is a Zotero plugin for selected-text explanations, sidebar follow-up chat, and
-NotebookLM-style "Ask your library" retrieval over per-provider on-disk indexes. Chat and embedding
-backends are configured independently; a bundled local LLM proxy lets the plugin route through the
-Codex or Claude Code CLIs (using the user's ChatGPT/Claude subscription) or pass through to a real
-Ollama daemon.
+Zotero AI Explain is a PDF-aware Zotero plugin for selected-text explanations, a focused "Ask a
+question" reader command, sidebar follow-up chat, and NotebookLM-style "Ask your library" retrieval
+over per-provider on-disk indexes. Reader-triggered requests carry PDF identity (item title + page)
+into the prompt and auto-scope RAG to the open document; library-chat citations are chunk-scoped and
+jump the reader to the cited page. Chat and embedding backends are configured independently; a
+bundled local LLM proxy lets the plugin route through the Codex or Claude Code CLIs (using the
+user's ChatGPT/Claude subscription) or pass through to a real Ollama daemon.
 
 ## Structure
 
@@ -25,13 +27,13 @@ zotero_ai/
   src/
     bootstrap.ts         # Entrypoint; wires runtime, proxy lifecycle, onboarding
     conversation/        # Conversation stores (per-selection popup + singleton library chat)
-    indexing/            # Library crawler, chunker, per-provider index storage, retrieval
-    platform/            # Zotero adapters, e2e driver, proxy lifecycle, subprocess wiring
+    indexing/            # Library crawler, per-source chunker, per-provider index storage + migration, retrieval
+    platform/            # Zotero adapters, citation-open, e2e driver, proxy lifecycle, subprocess wiring
     preferences/         # Provider profiles, preset dropdown, model discovery, onboarding pref
     providers/           # Chat + embed adapters (ollama, openai, claude-api, gemini)
     secrets/             # Secret references (no raw API keys in pref storage)
-    selection/           # Selection context normalization
-    ui/                  # Anchored popup, sidebar, library chat, settings, onboarding, markdown
+    selection/           # Selection context normalization (incl. PDF identity + RAG scope)
+    ui/                  # Anchored popup, sidebar, library chat, citation lookup, settings, markdown
   tests/                 # Vitest test suite (unit, integration, e2e, e2e-local)
   .forge/                # Forge phase state and learnings (mostly gitignored)
 ```
@@ -88,12 +90,16 @@ staged diff would never see.
 | `src/preferences/provider-profile.ts`      | Independent chat/embed provider selectors + per-provider API keys.                   |
 | `src/preferences/model-discovery.ts`       | Live model-list probe per backend (Ollama, proxy, OpenAI, Anthropic, Gemini).        |
 | `src/indexing/index-path.ts`               | Per-(provider, model) index filename rules + legacy back-compat.                     |
-| `src/indexing/index-search.ts`             | Cosine top-K retrieval; throws on dimension mismatch.                                |
-| `src/ui/library-chat-view.ts`              | NotebookLM-style "Ask your library" dialog with citation rendering.                  |
+| `src/indexing/index-storage.ts`            | JSON read/write, schemaVersion migration, in-memory parse cache.                     |
+| `src/indexing/index-search.ts`             | Cosine top-K retrieval (optional `scopedItemKey`); throws on dimension mismatch.     |
+| `src/indexing/per-source-chunks.ts`        | Per-source extraction: metadata / notes / per-page PDF text / non-PDF attachments.   |
+| `src/ui/library-chat-view.ts`              | NotebookLM-style "Ask your library" dialog with chunk-scoped citation rendering.     |
+| `src/ui/citation-lookup.ts`                | Parses `[itemKey#chunkIndex]` tokens against a per-turn lookup table.                |
+| `src/platform/citation-open.ts`            | Resolves a citation click to `Zotero.Reader.open(attachmentId, { pageIndex })`.      |
 | `scripts/llm-proxy/server.mjs`             | Node HTTP service (Ollama wire protocol; codex/claude/ollama backends).              |
 | `scripts/package-xpi.mjs`                  | Stages `scripts/llm-proxy/` into `addon/llm-proxy/`, zips the XPI.                   |
 | `.github/workflows/e2e-cross-platform.yml` | Three-OS release-gate matrix with real Ollama + real Zotero.                         |
-| `docs/decisions/`                          | Architectural Decision Records for the major Phase 4 decisions.                      |
+| `docs/decisions/`                          | Architectural Decision Records for the major design decisions.                       |
 
 ## Navigation
 

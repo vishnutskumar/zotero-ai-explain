@@ -21,8 +21,7 @@ const request: ChatRequest = {
       itemKey: "ITEM",
       itemTitle: "Paper",
       attachmentKey: "ATTACH",
-      pageLabel: "4",
-      location: "page 4"
+      pageLabel: "4"
     },
     anchor: null
   },

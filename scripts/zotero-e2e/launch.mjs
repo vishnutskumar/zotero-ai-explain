@@ -290,7 +290,10 @@ export async function startZoteroWithPlugin({
     // only the early "startup" line and miss the menu/reader registrations
     // that complete a few ms later.
     await handle.waitForLogLine(STARTUP_LINE, { timeoutMs: startupTimeoutMs });
-    await handle.waitForLogLine(/registered reader command: Explain with AI/u, {
+    // Matches both the legacy singular `registered reader command:` line and
+    // the current plural `registered reader commands:` line (the reader now
+    // registers Explain + Ask-a-question together via `addReaderCommands`).
+    await handle.waitForLogLine(/registered reader commands?: Explain with AI/u, {
       timeoutMs: 30_000
     });
   } catch (err) {

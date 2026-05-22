@@ -185,12 +185,18 @@
  *    `tests/fixtures/README.md`. If the file does not exist at test
  *    time, `beforeAll` throws a clear diagnostic.
  *  - The Zotero data directory is created at `<profile>/data` by
- *    `launch.mjs:115-116`. The index file therefore lives at
- *    `<profile>/data/zotero-ai-explain-index.json`. This path is
- *    deterministic per test run.
+ *    `launch.mjs:115-116`. Per ADR-0002 (per-provider index files) the
+ *    crawler persists to a per-(embed-provider, model) filename — for
+ *    this harness's Ollama embed provider + `embeddinggemma` model that
+ *    is `<profile>/data/zotero-ai-explain-index-ollama-embeddinggemma.json`.
+ *    The legacy flat `zotero-ai-explain-index.json` name is a read-only
+ *    back-compat alias that production with an Ollama provider never
+ *    writes. The index tests therefore glob `<profile>/data` for
+ *    `zotero-ai-explain-index*.json` rather than hardcoding a filename,
+ *    so they stay correct if the harness's embed provider/model changes.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -284,6 +290,38 @@ function parseRect(csv: string | null): {
     return null;
   }
   return { left, top, width, height };
+}
+
+/**
+ * Locate the on-disk index file the crawler persisted for this run.
+ *
+ * Per ADR-0002 (`docs/decisions/0002-per-provider-index-files.md`) the
+ * crawler writes a per-(embed-provider, model) filename — for this
+ * harness's Ollama embed provider + `embeddinggemma` model that is
+ * `zotero-ai-explain-index-ollama-embeddinggemma.json`. The legacy flat
+ * `zotero-ai-explain-index.json` name is a read-only back-compat alias
+ * that production with an Ollama provider never writes.
+ *
+ * Rather than hardcoding either filename, glob `<profile>/data` for
+ * `zotero-ai-explain-index*.json` so the assertion stays correct if the
+ * harness's embed provider/model ever changes. When a stale legacy file
+ * lingers alongside the per-provider file (e.g. a prior run's leftover),
+ * the per-provider file wins — legacy data is by definition stale.
+ *
+ * Returns the absolute path, or null when no index file exists at all.
+ */
+function locateIndexFile(profileDir: string): string | null {
+  const dataDir = join(profileDir, "data");
+  if (!existsSync(dataDir)) return null;
+  const matches = readdirSync(dataDir).filter(
+    (name) => name.startsWith("zotero-ai-explain-index") && name.endsWith(".json")
+  );
+  if (matches.length === 0) return null;
+  // Prefer a per-provider file (`...-index-<provider>-<model>.json`)
+  // over the legacy flat `zotero-ai-explain-index.json` alias.
+  const perProvider = matches.find((name) => name !== "zotero-ai-explain-index.json");
+  const chosen = perProvider ?? matches[0];
+  return chosen === undefined ? null : join(dataDir, chosen);
 }
 
 beforeAll(async () => {
@@ -988,15 +1026,23 @@ describe("real-PDF pipeline (AC2 headline suite)", () => {
       }
     });
 
-    it("index file exists at <dataDir>/zotero-ai-explain-index.json with at least one item", () => {
+    it("a per-provider index file exists under <dataDir> with at least one item", () => {
       const handle = requireHandle(state);
-      // launch.mjs:115 → dataDir = <profile>/data
-      const indexPath = join(handle.profileDir, "data", "zotero-ai-explain-index.json");
+      // launch.mjs:115 → dataDir = <profile>/data. Per ADR-0002 the
+      // crawler persists to a per-(embed-provider, model) filename
+      // (`zotero-ai-explain-index-ollama-embeddinggemma.json` for this
+      // harness's Ollama embed provider), so we glob rather than
+      // hardcode — see locateIndexFile.
+      const indexPath = locateIndexFile(handle.profileDir);
       expect(
-        existsSync(indexPath),
-        `Index JSON file missing at ${indexPath}. AC3+AC4 crawler did not persist any items to disk. ` +
+        indexPath,
+        `No zotero-ai-explain-index*.json file under ${join(handle.profileDir, "data")}. ` +
+          `AC3+AC4 crawler did not persist any items to disk. ` +
           `Either the crawler never ran, the storage layer is broken, or the controller never wired \`storage.write\`.`
-      ).toBe(true);
+      ).not.toBeNull();
+      // The `expect(...).not.toBeNull()` above already failed the test
+      // if indexPath is null; this guard narrows the type for tsc.
+      if (indexPath === null) return;
       const raw = readFileSync(indexPath, "utf8");
       const parsed = JSON.parse(raw) as {
         items?: Record<
@@ -1020,11 +1066,16 @@ describe("real-PDF pipeline (AC2 headline suite)", () => {
 
     it("every indexed item carries a non-empty `embedding` array per chunk", () => {
       const handle = requireHandle(state);
-      const indexPath = join(handle.profileDir, "data", "zotero-ai-explain-index.json");
-      if (!existsSync(indexPath)) {
+      // Per ADR-0002 the index lives at a per-provider filename; glob
+      // for it rather than hardcoding — see locateIndexFile.
+      const indexPath = locateIndexFile(handle.profileDir);
+      if (indexPath === null) {
         // The previous test already failed with a tailored diagnostic;
-        // skip with a marker so this test's failure isn't a duplicate.
-        throw new Error(`Index file missing at ${indexPath}; cannot validate embedding payloads`);
+        // throw a marker so this test's failure isn't a duplicate.
+        throw new Error(
+          `No zotero-ai-explain-index*.json file under ${join(handle.profileDir, "data")}; ` +
+            `cannot validate embedding payloads`
+        );
       }
       const parsed = JSON.parse(readFileSync(indexPath, "utf8")) as {
         items?: Record<
@@ -1048,6 +1099,50 @@ describe("real-PDF pipeline (AC2 headline suite)", () => {
           }
         }
       }
+    });
+
+    it("the persisted index carries a `pdf-page` chunk with pageIndex 0 for the sample PDF", () => {
+      // FINDING-1 (AC-4): the production crawler must take the
+      // `Zotero.PDFWorker.getFullText` per-page path — not the
+      // `.zotero-ft-cache` blob fallback. The driver attaches a real
+      // single-page `sample.pdf` to a parent item; after the crawl, the
+      // persisted index MUST contain at least one chunk stamped
+      // `sourceKind: "pdf-page"` with `pageIndex: 0` (a single-page PDF).
+      // If `PDFWorker` were never threaded into the production crawler
+      // deps, every PDF chunk would carry `sourceKind: "attachment"` and
+      // no `pageIndex` — this assertion would go RED.
+      const handle = requireHandle(state);
+      const indexPath = locateIndexFile(handle.profileDir);
+      if (indexPath === null) {
+        throw new Error(
+          `No zotero-ai-explain-index*.json file under ${join(handle.profileDir, "data")}; ` +
+            `cannot validate pdf-page provenance`
+        );
+      }
+      const parsed = JSON.parse(readFileSync(indexPath, "utf8")) as {
+        items?: Record<
+          string,
+          {
+            title?: string;
+            chunks?: { text?: string; sourceKind?: string; pageIndex?: number }[];
+          }
+        >;
+      };
+      const allChunks = Object.values(parsed.items ?? {}).flatMap((item) => item.chunks ?? []);
+      const pdfPageChunks = allChunks.filter((chunk) => chunk.sourceKind === "pdf-page");
+      expect(
+        pdfPageChunks.length,
+        "no `pdf-page` chunks in the persisted index — the production crawler did not take " +
+          "the Zotero.PDFWorker per-page extraction path (FINDING-1: PDFWorker not threaded " +
+          "through resolveZoteroLibraries)"
+      ).toBeGreaterThanOrEqual(1);
+      // `sample.pdf` is a single-page fixture, so every pdf-page chunk
+      // must carry `pageIndex: 0` — checked via `=== 0`, never truthiness.
+      const page0Chunks = pdfPageChunks.filter((chunk) => chunk.pageIndex === 0);
+      expect(
+        page0Chunks.length,
+        "no `pdf-page` chunk carries `pageIndex: 0`; the single-page sample PDF must yield page-0 chunks"
+      ).toBeGreaterThanOrEqual(1);
     });
 
     it("fake Ollama received POST /api/embed requests (one per chunk)", () => {

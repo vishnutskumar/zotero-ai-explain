@@ -8,6 +8,7 @@ import {
   FG_MUTED,
   FIELD_TEXTAREA_STYLE,
   FONT_STACK,
+  MARKDOWN_CSS,
   applyFocusRing,
   applyHoverState
 } from "./styles.js";
@@ -16,6 +17,14 @@ export type AnchoredPopupInput = {
   readonly disclosure: string;
   readonly anchor: SelectionContext["anchor"];
   readonly text: string;
+  /**
+   * Popup mode. `explain` (default) auto-streams an explanation on open.
+   * `ask-question` renders the selection as a sticky quote block, focuses
+   * the textarea, and waits for the user's first question (no auto-stream).
+   */
+  readonly mode?: "explain" | "ask-question";
+  /** Selection text rendered as a quote block — used only in `ask-question` mode. */
+  readonly quote?: string;
 };
 
 /**
@@ -25,8 +34,10 @@ export type AnchoredPopupInput = {
  * action buttons, and inline follow-up form.
  */
 export function renderAnchoredPopup(input: AnchoredPopupInput): HTMLElement {
+  const mode = input.mode ?? "explain";
   const element = document.createElement("section");
   element.className = "zotero-ai-explain-popup";
+  element.dataset.mode = mode;
   // The wrapper from `mountPopup` owns positioning (position: fixed; top; left).
   // Setting `position: absolute; left; top` here would create a positioned
   // descendant that escapes the wrapper's max-width and lands at
@@ -123,6 +134,7 @@ export function renderAnchoredPopup(input: AnchoredPopupInput): HTMLElement {
       flex-direction: column;
       gap: 8px;
     }
+${MARKDOWN_CSS}
   `;
 
   const loading = document.createElement("div");
@@ -144,7 +156,9 @@ export function renderAnchoredPopup(input: AnchoredPopupInput): HTMLElement {
   const dot3 = document.createElement("span");
   dot3.className = "zotero-ai-explain-popup__loading-dot";
   loading.append(loadingLabel, dot1, dot2, dot3);
-  if (input.text.length > 0) {
+  // In `ask-question` mode the popup never auto-streams — it waits for the
+  // user's first question, so the loading indicator starts hidden.
+  if (input.text.length > 0 || mode === "ask-question") {
     loading.hidden = true;
   }
 
@@ -205,7 +219,9 @@ export function renderAnchoredPopup(input: AnchoredPopupInput): HTMLElement {
 
   const followUp = document.createElement("textarea");
   followUp.name = "followUp";
-  followUp.placeholder = "Ask a follow-up";
+  // In ask-question mode the textarea hosts the FIRST question, so it is
+  // labelled accordingly; in explain mode it is the follow-up box.
+  followUp.placeholder = mode === "ask-question" ? "Ask a question" : "Ask a follow-up";
   followUp.setAttribute("style", `${FIELD_TEXTAREA_STYLE} min-height: 48px;`);
   applyFocusRing(followUp);
 
@@ -224,7 +240,39 @@ export function renderAnchoredPopup(input: AnchoredPopupInput): HTMLElement {
   turns.className = "zotero-ai-explain-popup__turns";
   turns.setAttribute("style", "display: flex; flex-direction: column; gap: 8px;");
 
-  element.append(styleTag, disclosure, body, errorBlock, turns, loading, actions, followForm);
+  // Ask-question mode: render the selection as a sticky quote block at the
+  // top of the popup so the user sees what their question is anchored to.
+  const children: HTMLElement[] = [styleTag];
+  if (mode === "ask-question") {
+    const quoteBlock = document.createElement("blockquote");
+    quoteBlock.className = "zotero-ai-explain-popup__quote";
+    quoteBlock.dataset.role = "quote";
+    quoteBlock.textContent = input.quote ?? "";
+    quoteBlock.setAttribute(
+      "style",
+      `margin: 0; padding: 6px 10px; border-left: 3px solid ${BORDER_HAIRLINE}; ` +
+        `background: rgba(127, 127, 127, 0.12); border-radius: 4px; font-size: 12px; ` +
+        `line-height: 1.45; font-style: italic; white-space: pre-wrap; word-break: break-word;`
+    );
+    children.push(quoteBlock);
+  }
+  children.push(disclosure, body, errorBlock, turns, loading, actions, followForm);
+  element.append(...children);
+
+  // Focus the textarea on mount in ask-question mode so the user can type
+  // their question immediately. `requestAnimationFrame` defers the call to
+  // after the element is attached to the document; a synchronous `focus()`
+  // on a detached node is a no-op.
+  if (mode === "ask-question") {
+    const view = element.ownerDocument.defaultView;
+    if (view !== null) {
+      view.requestAnimationFrame(() => {
+        followUp.focus();
+      });
+    } else {
+      followUp.focus();
+    }
+  }
 
   return element;
 }

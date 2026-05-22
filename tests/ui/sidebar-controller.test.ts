@@ -45,8 +45,7 @@ describe("createSidebarController", () => {
           itemKey: "I",
           itemTitle: "Paper",
           attachmentKey: "A",
-          pageLabel: "1",
-          location: "page=1"
+          pageLabel: "1"
         },
         anchor: null
       },
@@ -83,8 +82,7 @@ describe("createSidebarController", () => {
           itemKey: "I",
           itemTitle: "Paper",
           attachmentKey: "A",
-          pageLabel: "1",
-          location: "page=1"
+          pageLabel: "1"
         },
         anchor: null
       },
@@ -136,8 +134,7 @@ describe("createSidebarController", () => {
           itemKey: "I",
           itemTitle: "Paper",
           attachmentKey: "A",
-          pageLabel: "1",
-          location: "page=1"
+          pageLabel: "1"
         },
         anchor: null
       },
@@ -179,8 +176,7 @@ describe("createSidebarController", () => {
           itemKey: "I",
           itemTitle: null,
           attachmentKey: null,
-          pageLabel: null,
-          location: null
+          pageLabel: null
         },
         anchor: null
       },

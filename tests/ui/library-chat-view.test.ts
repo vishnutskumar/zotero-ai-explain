@@ -50,8 +50,10 @@ describe("renderLibraryChatView", () => {
   });
 
   it("renders [itemKey] in assistant output as a clickable link with data-item-key", () => {
+    // AC-6: the citation token alphabet is exactly `[A-Z0-9]{8}` — Zotero's
+    // item-key shape. Both keys below are 8-char so they linkify.
     const view = renderLibraryChatView({
-      messages: [{ role: "assistant", content: "Claim one [ABCD1234] and claim two [XYZ99]." }],
+      messages: [{ role: "assistant", content: "Claim one [ABCD1234] and claim two [XYZW5678]." }],
       status: "completed",
       errorMessage: null,
       hasIndex: true
@@ -60,7 +62,7 @@ describe("renderLibraryChatView", () => {
     expect(links.length).toBe(2);
     expect(links[0]?.dataset.itemKey).toBe("ABCD1234");
     expect(links[0]?.textContent).toBe("ABCD1234");
-    expect(links[1]?.dataset.itemKey).toBe("XYZ99");
+    expect(links[1]?.dataset.itemKey).toBe("XYZW5678");
   });
 
   it("escapes citation keys safely (no innerHTML / no markup injection)", () => {
@@ -156,9 +158,12 @@ describe("wireLibraryChatView", () => {
     detach();
   });
 
-  it("invokes onCitationClick with the item key when a citation link is clicked", () => {
+  it("invokes onCitationClick with the resolved citation when a citation link is clicked", () => {
+    // AC-6: `onCitationClick` receives a `{ itemKey, ... }` citation object
+    // (widened from a bare string). A legacy `[itemKey]` token with no
+    // lookup table emits just the itemKey — no page / attachment.
     const view = renderLibraryChatView({
-      messages: [{ role: "assistant", content: "Claim [KEY42]." }],
+      messages: [{ role: "assistant", content: "Claim [KEYABC42]." }],
       status: "completed",
       errorMessage: null,
       hasIndex: true
@@ -174,7 +179,7 @@ describe("wireLibraryChatView", () => {
     const link = view.querySelector<HTMLAnchorElement>("a[data-item-key]");
     expect(link).not.toBeNull();
     link?.click();
-    expect(onCitationClick).toHaveBeenCalledWith("KEY42");
+    expect(onCitationClick).toHaveBeenCalledWith(expect.objectContaining({ itemKey: "KEYABC42" }));
     detach();
   });
 

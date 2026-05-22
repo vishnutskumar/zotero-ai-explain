@@ -6,8 +6,7 @@ const emptySource = {
   itemKey: null,
   itemTitle: null,
   attachmentKey: null,
-  pageLabel: null,
-  location: null
+  pageLabel: null
 };
 
 describe("createReaderIntegration", () => {

@@ -432,27 +432,26 @@ describe("addReaderCommand: anchor coordinate construction (AC1)", () => {
     expect(selection.anchor?.viewportWidth).not.toBe(70);
   });
 
-  it("empty annotation text: handler still mounts the popup with quote='' (FINDING-11)", () => {
-    // Per plan L293-300: empty/whitespace `event.params.annotation.text`
-    // MUST still mount the popup. The handler proceeds with `quote: ""`
-    // and constructs the anchor normally (anchor is downstream-orthogonal).
+  it("empty annotation text: the command is hidden — no button is appended (AC-1)", () => {
+    // The v0.3.0 pdf-context-features plan (AC-1, adversarial case L404)
+    // supersedes the old FINDING-11 "mount with quote=''" behavior: an
+    // empty / whitespace-only reader selection HIDES the command — no
+    // command button is appended at all.
     const { action, handler } = setupAdapter({
       mainWindow: { innerWidth: 1400, innerHeight: 900 }
     });
-    const { event, getAppendedButton } = buildReaderEvent({
+    const { event } = buildReaderEvent({
       buttonRect: { left: 50, top: 30, width: 120, height: 24 },
       frameRect: { left: 200, top: 100, width: 1000, height: 700 },
       annotationText: "   "
     });
 
-    handler(event);
-    getAppendedButton().click();
-
-    const selection = readSelection(action);
-    expect(selection.quote).toBe("");
-    // Anchor coordinates are independent of quote content.
-    expect(selection.anchor?.left).toBe(250);
-    expect(selection.anchor?.top).toBe(130);
+    expect(() => {
+      handler(event);
+    }).not.toThrow();
+    // No button was appended ⇒ the command is hidden, and the action is
+    // never invoked because there is nothing to click.
+    expect(action).not.toHaveBeenCalled();
   });
 
   it("action() is invoked exactly once and synchronously on click", () => {

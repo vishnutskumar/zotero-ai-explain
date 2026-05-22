@@ -36,21 +36,33 @@ import type { SidebarController } from "../../src/ui/sidebar-controller.js";
 import { stubCrawlerProvider, stubCrawlerSettings } from "../indexing/controller-test-helpers.js";
 
 function makeIndex(): IndexFile {
-  // 3-dim embeddings; "ALPHA" sits on the X axis so a query of [1,0,0]
-  // ranks it first.
+  // 3-dim embeddings; "ALPHA001" sits on the X axis so a query of [1,0,0]
+  // ranks it first. Item keys are 8-char (Zotero's key shape) — AC-6's
+  // citation token alphabet is exactly `[A-Z0-9]{8}`.
   return {
+    schemaVersion: 2,
     indexedAt: new Date(0).toISOString(),
     items: {
-      ALPHA: {
+      ALPHA001: {
         title: "Alpha paper",
         chunks: [
-          { text: "ALPHA contains X.", embedding: [1, 0, 0] },
-          { text: "ALPHA also has unrelated content.", embedding: [0, 1, 0] }
+          { text: "ALPHA contains X.", embedding: [1, 0, 0], sourceKind: "metadata" },
+          {
+            text: "ALPHA also has unrelated content.",
+            embedding: [0, 1, 0],
+            sourceKind: "metadata"
+          }
         ]
       },
-      BETA: {
+      BETA0001: {
         title: "Beta paper",
-        chunks: [{ text: "BETA mentions X tangentially.", embedding: [0.5, 0.5, 0] }]
+        chunks: [
+          {
+            text: "BETA mentions X tangentially.",
+            embedding: [0.5, 0.5, 0],
+            sourceKind: "metadata"
+          }
+        ]
       }
     }
   };
@@ -61,11 +73,32 @@ function fakeStorage(file: IndexFile | null): IndexStorage {
     read() {
       return Promise.resolve(file);
     },
+    readWithMigration() {
+      return Promise.resolve({ file, migrationPending: false });
+    },
     readItemCount() {
       return Promise.resolve(file === null ? 0 : Object.keys(file.items).length);
     },
     write() {
       return Promise.resolve();
+    },
+    writeTmp() {
+      return Promise.resolve();
+    },
+    commitMigration() {
+      return Promise.resolve();
+    },
+    abandonMigration() {
+      return Promise.resolve();
+    },
+    writeMarker() {
+      return Promise.resolve();
+    },
+    removeMarker() {
+      return Promise.resolve();
+    },
+    hasMarker() {
+      return Promise.resolve(false);
     },
     clear() {
       return Promise.resolve();
@@ -101,6 +134,16 @@ function createFakeUi(calls: string[]): {
       calls.push(`menu:${label}`);
       menuActions.set(label, action);
       return () => calls.push(`remove-menu:${label}`);
+    },
+    addReaderCommands(commands) {
+      for (const command of commands) {
+        calls.push(`reader:${command.label}`);
+      }
+      return () => {
+        for (const command of commands) {
+          calls.push(`remove-reader:${command.label}`);
+        }
+      };
     },
     addReaderCommand(label) {
       calls.push(`reader:${label}`);
@@ -221,7 +264,7 @@ describe("library chat integration", () => {
     const { ui, menuActions } = createFakeUi(calls);
     const capturedPrompts: string[][] = [];
     const fakeProvider = makeFakeProvider({
-      deltas: ["Alpha discusses X [ALPHA]."],
+      deltas: ["Alpha discusses X [ALPHA001#0]."],
       capturedPrompts,
       embedding: [1, 0, 0]
     });
@@ -279,21 +322,25 @@ describe("library chat integration", () => {
       await Promise.resolve();
     }
 
-    // The prompt must contain ALPHA's excerpt with its bracketed key.
+    // The prompt must contain ALPHA001's excerpt with its chunk-scoped
+    // `[itemKey#chunkIndex]` token (AC-6).
     expect(capturedPrompts.length).toBe(1);
     const prompt = capturedPrompts[0]?.join("\n") ?? "";
-    expect(prompt).toContain("[ALPHA]");
+    expect(prompt).toContain("[ALPHA001#0]");
     expect(prompt).toContain("ALPHA contains X.");
     expect(prompt).toContain("Question: What does ALPHA say about X?");
 
-    // The streamed answer should render as a clickable citation link.
+    // The streamed answer should render as a clickable citation link that
+    // resolves against the per-turn lookup table.
     const link = document.querySelector<HTMLAnchorElement>(
       ".zotero-ai-library-chat a[data-item-key]"
     );
     expect(link).not.toBeNull();
-    expect(link?.dataset.itemKey).toBe("ALPHA");
+    expect(link?.dataset.itemKey).toBe("ALPHA001");
     link?.click();
-    expect(openItem).toHaveBeenCalledWith("ALPHA");
+    // AC-6/AC-7: `openItem` receives the resolved citation object, not a
+    // bare string. The ALPHA001 chunk 0 is a metadata chunk so no page.
+    expect(openItem).toHaveBeenCalledWith(expect.objectContaining({ itemKey: "ALPHA001" }));
 
     await runtime.shutdown();
   });
@@ -408,7 +455,7 @@ describe("library chat integration", () => {
     const { ui, menuActions } = createFakeUi(calls);
     const capturedPrompts: string[][] = [];
     const fakeProvider = makeFakeProvider({
-      deltas: ["First answer [ALPHA]."],
+      deltas: ["First answer [ALPHA001#0]."],
       capturedPrompts,
       embedding: [1, 0, 0]
     });
@@ -753,7 +800,7 @@ describe("library chat integration", () => {
           yield { type: "delta", text: "-late" };
         } else {
           // Second stream — runs to completion immediately.
-          yield { type: "delta", text: "fresh answer [ALPHA]." };
+          yield { type: "delta", text: "fresh answer [ALPHA001#0]." };
         }
         yield { type: "message_end" };
       },

@@ -39,7 +39,11 @@
  * UI reflects user intent immediately.
  */
 
-import { EmbedCircuitBreakerError, indexLibrary } from "./library-crawler.js";
+import {
+  CURRENT_SCHEMA_VERSION,
+  EmbedCircuitBreakerError,
+  indexLibrary
+} from "./library-crawler.js";
 import type { IndexFile, IndexLibraryOptions, LibraryCrawlerDeps } from "./library-crawler.js";
 import type { IndexStorage } from "./index-storage.js";
 import {
@@ -65,8 +69,21 @@ export type IndexingController = {
    * when the indexer is not idle (a live run owns the counters). Safe
    * to invoke multiple times — repeated calls produce no extra IO once
    * the status has been hydrated against a current file.
+   *
+   * Hydrate is the SOLE caller of `storage.readWithMigration()`: when a
+   * one-time index migration is pending it runs `runMigration()` first
+   * (or, for the C5 crash case where the rename already completed,
+   * clears the stale marker directly).
    */
   readonly hydrate: () => Promise<void>;
+  /**
+   * Run the one-time atomic index migration: ensure the sidecar marker
+   * exists, clear any stale `.tmp` from a previous crash, crawl the
+   * library into `<index>.tmp` producing `schemaVersion`-2 chunks, then
+   * atomically commit the `.tmp` over the primary. A crash at any point
+   * leaves the marker in place so the next launch resumes.
+   */
+  readonly runMigration: () => Promise<void>;
 };
 
 type Logger = {
@@ -147,6 +164,24 @@ export function createIndexingController(deps: {
   // Clear is serialized so concurrent clear() calls do not race
   // `storage.clear()`.
   let activeClear: Promise<void> | null = null;
+  // The in-flight migration crawl (AC-5). While non-null a `start()`
+  // call is deferred — the migration owns the index and a concurrent
+  // crawl writing the primary would race the atomic `.tmp` swap.
+  let activeMigration: Promise<void> | null = null;
+  // FINDING-4: the abort controller for the active migration crawl, so
+  // `clear()` can interrupt a long migration rather than blocking on it.
+  let migrationAbortController: AbortController | null = null;
+  // FINDING-4: set by `clear()` when it runs while a migration is in
+  // flight. The migration checks it immediately before `commitMigration`
+  // and skips the atomic swap — a commit after a clear would rename a
+  // stale `.tmp` over the (just-cleared) primary, silently undoing the
+  // clear. `clear()` still awaits the migration AND removes all four
+  // index artefacts afterwards, so this flag is the fast-path belt to
+  // the await-then-clear suspenders. Held in a mutable record (not a
+  // bare `let`) so the migration's reads survive across `await` points:
+  // `clear()` mutates it from a separate closure, which TS's flow
+  // narrowing of a captured `let` cannot see.
+  const migration: { cancelled: boolean } = { cancelled: false };
 
   const apply = (action: IndexingAction, label: string): void => {
     status = reduceIndexingStatus(status, action);
@@ -251,6 +286,121 @@ export function createIndexingController(deps: {
     );
   };
 
+  /**
+   * Whether `clear()` cancelled the in-flight migration. Read through a
+   * function (not the bare `migration.cancelled` property) so TS does not
+   * narrow it to a constant: `clear()` mutates the flag from a separate
+   * closure across an `await` boundary, which the type system's
+   * flow-narrowing cannot model.
+   */
+  const isMigrationCancelled = (): boolean => migration.cancelled;
+
+  /**
+   * Run the one-time atomic index migration (AC-5). A fan-in guard
+   * makes concurrent calls share the in-flight promise.
+   */
+  const runMigrationImpl = (): Promise<void> => {
+    if (activeMigration !== null) {
+      return activeMigration;
+    }
+    // FINDING-4: reset the cancel flag for this fresh migration. A prior
+    // migration may have been cancelled by a `clear()`; the flag must not
+    // leak into a later legitimate migration.
+    migration.cancelled = false;
+    const doMigration = async (): Promise<void> => {
+      try {
+        // (1) Ensure the sidecar marker exists (idempotent — covers the
+        //     C1/C2 crash cases). (2) Clear any stale `.tmp` left by a
+        //     previous crashed migration (C3/C4).
+        await deps.storage.writeMarker();
+        await deps.storage.abandonMigration();
+
+        // Seed an empty schemaVersion-2 `.tmp`. A library with no
+        // indexable items would otherwise leave no `.tmp` for
+        // `commitMigration` to rename; this guarantees the atomic swap
+        // always has a complete file to commit. The crawl's own
+        // `writeTmp` calls overwrite it as items are indexed.
+        await deps.storage.writeTmp({
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+          items: {},
+          indexedAt: new Date().toISOString()
+        });
+
+        // FINDING-4: a `clear()` issued before the crawl even started
+        // already flagged cancellation. Bail before doing any embed work.
+        if (isMigrationCancelled()) {
+          deps.logger.debug("Zotero AI Explain index:migration-cancelled pre-crawl");
+          return;
+        }
+        // (3) Crawl the library into `<index>.tmp`. The crawler's
+        //     `storage.read()` returns null here so it produces a full
+        //     fresh set of schemaVersion-2 chunks (no resume skip
+        //     against the legacy primary), and every `write()` lands in
+        //     the `.tmp` via `writeTmp` — the primary is never mutated
+        //     in place. The controller is stored on `migrationAbortController`
+        //     so a concurrent `clear()` can interrupt the crawl.
+        const controller = new AbortController();
+        migrationAbortController = controller;
+        const migrationStorage: LibraryCrawlerDeps["storage"] = {
+          read: () => Promise.resolve(null),
+          write: (file) => deps.storage.writeTmp(file),
+          clear: () => Promise.resolve(),
+          path: () => deps.storage.path()
+        };
+        const crawlerDeps: LibraryCrawlerDeps = {
+          ...makeCrawlerDeps(controller),
+          storage: migrationStorage
+        };
+        const options: IndexLibraryOptions = {
+          signal: controller.signal,
+          isPaused: () => false
+        };
+        deps.logger.debug("Zotero AI Explain index:migration-start");
+        const result = await indexLibrary(crawlerDeps, options);
+        if (!result.completed) {
+          // A non-completed crawl leaves the marker + `.tmp` in place so
+          // the next launch retries. Do NOT commit a partial swap.
+          deps.logger.debug("Zotero AI Explain index:migration-incomplete");
+          return;
+        }
+        // FINDING-4: a `clear()` issued during the crawl flagged
+        // cancellation. Skip the atomic commit — renaming `.tmp` over the
+        // primary would silently undo the user's clear. `clear()` itself
+        // removes the `.tmp` + marker after it awaits this migration.
+        if (isMigrationCancelled()) {
+          deps.logger.debug("Zotero AI Explain index:migration-cancelled skip-commit");
+          return;
+        }
+        // (4) Atomic commit: rename `.tmp` over the primary, remove the
+        //     marker. After this `readWithMigration` reports
+        //     `migrationPending: false`.
+        await deps.storage.commitMigration();
+        deps.logger.debug("Zotero AI Explain index:migration-complete");
+      } catch (err) {
+        // Failure leaves the marker in place; the stale `.tmp` is
+        // cleaned by `abandonMigration` on the next runMigration call.
+        deps.logger.debug(
+          `Zotero AI Explain index:migration-error ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      } finally {
+        activeMigration = null;
+        migrationAbortController = null;
+        // AC-14: project the migration's settled state onto the public
+        // status. Read-only — touches only `migrationActive`.
+        apply({ type: "migration-settled" }, "migration-settled");
+      }
+    };
+    activeMigration = doMigration();
+    // AC-14: project the migration's in-flight state onto the public
+    // status so the settings UI can disable "Index library" and explain
+    // why. Emitted right after `activeMigration` is assigned. Read-only —
+    // touches only `migrationActive`, no run-lifecycle field.
+    apply({ type: "migration-started" }, "migration-start");
+    return activeMigration;
+  };
+
   return {
     getStatus() {
       return status;
@@ -269,6 +419,14 @@ export function createIndexingController(deps: {
       // after the initial full scan has finished.
       if (status.state === "running" || status.state === "paused") {
         deps.logger.debug(`Zotero AI Explain index:start-ignored state=${status.state}`);
+        return;
+      }
+      // Defer while an AC-5 migration crawl owns the index — a second
+      // crawl writing the primary would race the atomic `.tmp` swap.
+      // The auto-reindex notifier (and the user) can re-click once the
+      // migration completes.
+      if (activeMigration !== null) {
+        deps.logger.debug("Zotero AI Explain index:start-ignored migration-active");
         return;
       }
       pausedFlag = false;
@@ -321,6 +479,13 @@ export function createIndexingController(deps: {
       const sourceState = status.state;
       const runToAwait = activeRun;
       const controllerToAbort = abortController;
+      // FINDING-4: capture the in-flight migration (if any). `clear()`
+      // must coordinate with it — a `commitMigration` rename completing
+      // AFTER `storage.clear()` would resurrect the index the user just
+      // removed, and a surviving `.migrating` marker would re-trigger
+      // migration on the next launch.
+      const migrationToAwait = activeMigration;
+      const migrationControllerToAbort = migrationAbortController;
 
       const doClear = async (): Promise<void> => {
         try {
@@ -336,6 +501,30 @@ export function createIndexingController(deps: {
               if (!isAbortError(err)) {
                 deps.logger.debug(
                   `Zotero AI Explain index:clear-await-error ${
+                    err instanceof Error ? err.message : String(err)
+                  }`
+                );
+              }
+            }
+          }
+          // FINDING-4: coordinate with an in-flight migration. (1) Flag
+          // cancellation so the migration skips its `commitMigration`
+          // even if its crawl already finished; (2) abort the migration
+          // crawl so it settles promptly; (3) AWAIT it fully — by the
+          // time it resolves, whatever it did (commit or not) is done,
+          // so the `storage.clear()` below is the LAST mutation and the
+          // index stays cleared regardless of the migration's outcome.
+          if (migrationToAwait !== null) {
+            migration.cancelled = true;
+            if (migrationControllerToAbort !== null) {
+              migrationControllerToAbort.abort();
+            }
+            try {
+              await migrationToAwait;
+            } catch (err) {
+              if (!isAbortError(err)) {
+                deps.logger.debug(
+                  `Zotero AI Explain index:clear-migration-await-error ${
                     err instanceof Error ? err.message : String(err)
                   }`
                 );
@@ -377,6 +566,38 @@ export function createIndexingController(deps: {
         deps.logger.debug(`Zotero AI Explain index:hydrate-ignored state=${status.state}`);
         return;
       }
+      // AC-5: hydrate is the SOLE caller of `readWithMigration`. Detect
+      // a pending one-time index migration and run it before seeding.
+      try {
+        const probe = await deps.storage.readWithMigration();
+        if (probe.migrationPending) {
+          const schemaCurrent = (probe.file?.schemaVersion ?? 1) >= CURRENT_SCHEMA_VERSION;
+          if (probe.file !== null && schemaCurrent) {
+            // C5: the atomic rename already completed (primary is v2)
+            // but the marker removal was interrupted. The correct
+            // action is to clear the stale marker — NOT a re-crawl.
+            deps.logger.debug("Zotero AI Explain index:migration-marker-stale -> removeMarker");
+            await deps.storage.removeMarker();
+          } else if (probe.file === null && !(await deps.storage.hasMarker())) {
+            // Fresh install: no on-disk index and no interrupted
+            // migration. There is nothing to migrate — the first user
+            // "Index library" run writes a v2 file directly. Skip.
+            deps.logger.debug("Zotero AI Explain index:migration-skip fresh-install");
+          } else {
+            // A legacy (pre-v2) index OR an interrupted migration
+            // (marker present) — run the atomic migration to completion.
+            await runMigrationImpl();
+          }
+        }
+      } catch (err) {
+        deps.logger.debug(
+          `Zotero AI Explain index:hydrate-migration-error ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+        // Fall through to the seed below — a migration probe failure
+        // must not block the UI from showing whatever is on disk.
+      }
       // Read the cheap sidecar (a handful of bytes) so a 70 MB+ index
       // doesn't force a sync JSON.parse on the chrome thread at startup.
       let previouslyIndexed: number;
@@ -392,6 +613,9 @@ export function createIndexingController(deps: {
       }
       if (previouslyIndexed === 0) return;
       apply({ type: "hydrate", previouslyIndexed }, "hydrate");
+    },
+    runMigration() {
+      return runMigrationImpl();
     }
   };
 }
@@ -431,6 +655,14 @@ export function describeIndexingStatus(status: IndexingStatus): string {
       }
       return counts;
     case "running":
+      // AC-14 Fix 3: between the "Index library" click and the first
+      // crawler `onRunStart`/`onProgress` event `totalItems` is still 0.
+      // The bare "Indexing 0 of 0" reads as a stalled/empty run; surface
+      // honest "just started" text instead. Once the crawler reports the
+      // library size (`totalItems > 0`) the existing format is unchanged.
+      if (status.totalItems === 0) {
+        return "Starting… scanning your library.";
+      }
       return `Indexing ${indexed} of ${total}. ${counts}`;
     case "paused":
       return `Paused. ${counts}`;

@@ -38,8 +38,7 @@ const baseSelection = {
     itemKey: null,
     itemTitle: null,
     attachmentKey: null,
-    pageLabel: null,
-    location: null
+    pageLabel: null
   },
   anchor: null
 };

@@ -252,6 +252,76 @@ describe("llm-proxy / codex backend", () => {
     }
   });
 
+  // AC-12 Adv-8 — codex spawn is MEASURED, not warmed (codex has no
+  // daemon mode, SP-12.5). The high-value guard is "exactly one
+  // `codex exec` child per turn, and turn N>1 passes `exec resume
+  // <sessionId>`" so multi-turn chats do not pay a cold first-turn
+  // re-init each time. Plan L702-704, L728.
+  it("AC-12 Adv-8: runTurn spawns exactly ONE codex child per turn", async () => {
+    const recorder = makeSpawnRecorder([
+      {
+        stdoutLines: [
+          JSON.stringify({ type: "session_configured", session_id: "sess-once" }),
+          JSON.stringify({ type: "agent_message_delta", delta: "answer" })
+        ]
+      }
+    ]);
+    const codexBackend = createCodexBackend({ spawn: recorder.spawn });
+    await codexBackend.runTurn({
+      messages: [{ role: "user", content: "single turn" }],
+      onEvent: () => undefined
+    });
+    await new Promise((r) => setImmediate(r));
+    // One turn → exactly one spawned child. A redundant re-spawn (e.g. a
+    // speculative warm-up or a double-exec) turns this red.
+    expect(recorder.calls.length).toBe(1);
+    expect(recorder.calls[0]?.args[0]).toBe("exec");
+  });
+
+  it("AC-12 Adv-8: turn N>1 of the same conversation passes `exec resume <sessionId>` — one child each", async () => {
+    const recorder = makeSpawnRecorder([
+      {
+        stdoutLines: [
+          JSON.stringify({ type: "session_configured", session_id: "sess-resume" }),
+          JSON.stringify({ type: "agent_message_delta", delta: "first" })
+        ]
+      },
+      {
+        stdoutLines: [
+          JSON.stringify({ type: "session_configured", session_id: "sess-resume" }),
+          JSON.stringify({ type: "agent_message_delta", delta: "second" })
+        ]
+      }
+    ]);
+    const codexBackend = createCodexBackend({ spawn: recorder.spawn });
+    const firstUser = "explain the krebs cycle";
+    await codexBackend.runTurn({
+      messages: [{ role: "user", content: firstUser }],
+      onEvent: () => undefined
+    });
+    await codexBackend.runTurn({
+      messages: [
+        { role: "user", content: firstUser },
+        { role: "assistant", content: "first" },
+        { role: "user", content: "and the electron transport chain?" }
+      ],
+      onEvent: () => undefined
+    });
+    await new Promise((r) => setImmediate(r));
+    // Each turn spawns exactly ONE child — two turns → two children.
+    expect(recorder.calls.length).toBe(2);
+    const firstArgs = recorder.calls[0]?.args ?? [];
+    const secondArgs = recorder.calls[1]?.args ?? [];
+    // Turn 1 is a fresh `codex exec`, NOT a resume.
+    expect(firstArgs[0]).toBe("exec");
+    expect(firstArgs).not.toContain("resume");
+    // Turn 2 reuses the codex session via `exec resume <sessionId>` so
+    // the model does not pay a cold first-turn re-init.
+    expect(secondArgs[0]).toBe("exec");
+    expect(secondArgs[1]).toBe("resume");
+    expect(secondArgs[2]).toBe("sess-resume");
+  });
+
   it("non-zero codex exit emits a terminal error chunk with stderr (no silent completion)", async () => {
     const { spawn } = makeSpawnRecorder([
       {

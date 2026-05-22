@@ -114,10 +114,11 @@ describe("preset-aware startup (Bug A1 + A2, e2e)", () => {
 
   it("ollama-config debug line reflects the codex preset's chatBaseUrl, not the default Ollama URL (Bug A2)", () => {
     const handle = requireHandle(state);
-    // bootstrap.ts:750 logs `ollama config: baseUrl=<value>` after
-    // `loadOllamaSettings`. With chatBaseUrl="http://localhost:11400/codex"
-    // saved into prefs, the log MUST surface the proxy URL — not the
-    // default :11434. The same fields drive the popup banner.
-    expect(handle.getLog()).toMatch(/ollama config: baseUrl=http:\/\/localhost:11400\/codex/u);
+    // bootstrap.ts logs `ollama config: chatBaseUrl=<value> embedBaseUrl=…`
+    // after `loadOllamaSettings` (AC-8b). With
+    // chatBaseUrl="http://localhost:11400/codex" saved into prefs, the
+    // log MUST surface the proxy URL on `chatBaseUrl` — not the default
+    // :11434. The same fields drive the popup banner.
+    expect(handle.getLog()).toMatch(/ollama config: chatBaseUrl=http:\/\/localhost:11400\/codex/u);
   });
 });

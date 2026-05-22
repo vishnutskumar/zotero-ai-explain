@@ -34,8 +34,37 @@ export type DialogHandle = {
   restore(): void;
 };
 
+/**
+ * Mode of a reader-selection command. `explain` mounts the popup and
+ * auto-streams an explanation; `ask-question` opens the popup with the
+ * selection preloaded as a quote block and waits for the user's first
+ * question (no auto-explain).
+ */
+export type ReaderCommandMode = "explain" | "ask-question";
+
+/**
+ * A single reader-selection command. Multiple specs registered together
+ * via {@link ZoteroUiAdapter.addReaderCommands} ride ONE
+ * `renderTextSelectionPopup` listener and append one button each.
+ */
+export type ReaderCommandSpec = {
+  readonly label: string;
+  readonly mode: ReaderCommandMode;
+  readonly action: (selection: SelectionContext) => void;
+};
+
 export type ZoteroUiAdapter = {
   addMenuItem(label: string, action: () => void): Unsubscribe;
+  /**
+   * Register one reader-event listener that appends one button per
+   * {@link ReaderCommandSpec}. The button is hidden (not rendered) when
+   * the reader reports no text selection.
+   */
+  addReaderCommands(commands: readonly ReaderCommandSpec[]): Unsubscribe;
+  /**
+   * Convenience wrapper — equivalent to
+   * `addReaderCommands([{ label, mode: "explain", action }])`.
+   */
   addReaderCommand(label: string, action: (selection: SelectionContext) => void): Unsubscribe;
   openDialog(title: string, content: HTMLElement): DialogHandle;
   mountPopup(content: HTMLElement, options?: PopupMountOptions): Unsubscribe;

@@ -21,6 +21,101 @@ var ZoteroAiExplain = (() => {
   };
   var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
+  // src/indexing/per-source-chunks.ts
+  function splitPdfWorkerText(text) {
+    return text.split("\f");
+  }
+  function metadataText(item) {
+    const title = (item.getField("title") ?? "").trim();
+    const abstract = (item.getField("abstractNote") ?? "").trim();
+    const parts = [];
+    if (title.length > 0) parts.push(title);
+    if (abstract.length > 0) parts.push(abstract);
+    return parts.join("\n\n");
+  }
+  function nonPdfSourceKind(contentType) {
+    if (contentType === void 0) return "epub";
+    const ct = contentType.toLowerCase();
+    if (ct.includes("epub")) return "epub";
+    if (ct.includes("html")) return "snapshot";
+    return "attachment";
+  }
+  function isPdfContentType(contentType) {
+    if (contentType === void 0) return void 0;
+    return contentType.toLowerCase().includes("pdf");
+  }
+  async function extractPdfPages(attachment, pdfWorker) {
+    try {
+      const result = await pdfWorker.getFullText(attachment.id);
+      return splitPdfWorkerText(result.text);
+    } catch {
+      return null;
+    }
+  }
+  async function* yieldAttachmentSources(attachment, access, maxChars) {
+    if (!attachment.isAttachment()) return;
+    if (attachment.isAnnotation()) return;
+    const contentType = attachment.attachmentContentType;
+    const pdfByContentType = isPdfContentType(contentType);
+    const pdfWorker = access.PDFWorker;
+    if (pdfWorker !== void 0 && pdfByContentType !== false) {
+      const pages = await extractPdfPages(attachment, pdfWorker);
+      if (pages !== null) {
+        for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
+          yield {
+            text: pages[pageIndex] ?? "",
+            sourceKind: "pdf-page",
+            pageIndex,
+            attachmentKey: attachment.key
+          };
+        }
+        return;
+      }
+      if (pdfByContentType === true) return;
+    }
+    const fullText = readAttachmentFullText(attachment, access, maxChars);
+    if (fullText.trim().length === 0) return;
+    yield {
+      text: fullText,
+      sourceKind: nonPdfSourceKind(contentType),
+      attachmentKey: attachment.key
+    };
+  }
+  async function* extractPerSourceChunks(item, access, options) {
+    const maxChars = options?.fullTextMaxChars ?? DEFAULT_FULLTEXT_MAX_CHARS;
+    const metadata = metadataText(item);
+    if (metadata.trim().length > 0) {
+      yield { text: metadata, sourceKind: "metadata" };
+    }
+    for (const body of readNoteBodies(item)) {
+      if (body.trim().length > 0) {
+        yield { text: body, sourceKind: "note" };
+      }
+    }
+    if (item.isAttachment()) {
+      yield* yieldAttachmentSources(item, access, maxChars);
+      return;
+    }
+    if (typeof item.getAttachments !== "function") return;
+    let attachmentIds;
+    try {
+      attachmentIds = item.getAttachments();
+    } catch {
+      return;
+    }
+    for (const id of attachmentIds) {
+      const child = access.Items.get(id);
+      if (child === null) continue;
+      yield* yieldAttachmentSources(child, access, maxChars);
+    }
+  }
+  var init_per_source_chunks = __esm({
+    "src/indexing/per-source-chunks.ts"() {
+      "use strict";
+      init_library_crawler();
+    }
+  });
+
   // src/indexing/library-crawler.ts
   function readNoteBodies(item) {
     if (typeof item.getNote !== "function") {
@@ -70,54 +165,6 @@ var ZoteroAiExplain = (() => {
     } catch {
       return "";
     }
-  }
-  function readChildAttachmentFullText(item, access, maxChars) {
-    if (typeof item.getAttachments !== "function") return "";
-    let attachmentIds;
-    try {
-      attachmentIds = item.getAttachments();
-    } catch {
-      return "";
-    }
-    if (attachmentIds.length === 0) return "";
-    const parts = [];
-    let remaining = maxChars;
-    for (const id of attachmentIds) {
-      if (remaining <= 0) break;
-      const child = access.Items.get(id);
-      if (child === null) continue;
-      const text = readAttachmentFullText(child, access, remaining);
-      if (text.length === 0) continue;
-      parts.push(text);
-      remaining -= text.length;
-    }
-    if (parts.length === 0) return "";
-    const joined = parts.join("\n\n");
-    return joined.length > maxChars ? joined.substring(0, maxChars) : joined;
-  }
-  function extractItemText(item, options) {
-    const title = (item.getField("title") ?? "").trim();
-    const abstract = (item.getField("abstractNote") ?? "").trim();
-    const notes = readNoteBodies(item).map((b) => b.trim());
-    const parts = [];
-    if (title.length > 0) parts.push(title);
-    if (abstract.length > 0) parts.push(abstract);
-    for (const note of notes) {
-      if (note.length > 0) parts.push(note);
-    }
-    if (options?.zotero !== void 0) {
-      const maxChars = options.fullTextMaxChars ?? DEFAULT_FULLTEXT_MAX_CHARS;
-      let fullText = "";
-      if (item.isAttachment()) {
-        fullText = readAttachmentFullText(item, options.zotero, maxChars);
-      } else {
-        fullText = readChildAttachmentFullText(item, options.zotero, maxChars);
-      }
-      if (fullText.trim().length > 0) {
-        parts.push(fullText);
-      }
-    }
-    return parts.join("\n\n");
   }
   function hardCut(text, maxBytes) {
     const chunks = [];
@@ -198,6 +245,7 @@ ${para}`;
     const items = await deps.zotero.Items.getAll(deps.zotero.Libraries.userLibraryID, true);
     const total = items.length;
     let currentFile = initialFile ?? {
+      schemaVersion: CURRENT_SCHEMA_VERSION,
       items: {},
       indexedAt: (/* @__PURE__ */ new Date()).toISOString()
     };
@@ -228,22 +276,34 @@ ${para}`;
       const access = {
         Items: deps.zotero.Items,
         ...deps.zotero.FullText !== void 0 ? { FullText: deps.zotero.FullText } : {},
-        ...deps.zotero.File !== void 0 ? { File: deps.zotero.File } : {}
+        ...deps.zotero.File !== void 0 ? { File: deps.zotero.File } : {},
+        ...deps.zotero.PDFWorker !== void 0 ? { PDFWorker: deps.zotero.PDFWorker } : {}
       };
-      let text;
-      let baseText;
+      let sources;
       try {
-        baseText = extractItemText(item);
-        text = extractItemText(item, {
-          zotero: access,
+        sources = [];
+        for await (const source of extractPerSourceChunks(item, access, {
           fullTextMaxChars: DEFAULT_FULLTEXT_MAX_CHARS
-        });
+        })) {
+          sources.push(source);
+        }
       } catch {
         failed += 1;
         deps.onProgress(indexed, failed, total, skippedNoText);
         continue;
       }
-      if (text.length === 0) {
+      const sourceChunks = [];
+      for (const source of sources) {
+        for (const chunk of chunkText(source.text, DEFAULT_CHUNK_BYTES)) {
+          sourceChunks.push({
+            text: chunk,
+            sourceKind: source.sourceKind,
+            ...source.pageIndex !== void 0 ? { pageIndex: source.pageIndex } : {},
+            ...source.attachmentKey !== void 0 ? { attachmentKey: source.attachmentKey } : {}
+          });
+        }
+      }
+      if (sourceChunks.length === 0) {
         skippedNoText += 1;
         if (item.isAttachment() && !item.isAnnotation()) {
           skippedAttachmentText += 1;
@@ -251,11 +311,12 @@ ${para}`;
         deps.onProgress(indexed, failed, total, skippedNoText);
         continue;
       }
-      const attachmentTextContributed = text.length > baseText.length;
-      const chunks = chunkText(text, DEFAULT_CHUNK_BYTES);
+      const attachmentTextContributed = sourceChunks.some(
+        (chunk) => chunk.attachmentKey !== void 0
+      );
       const accumulated = [];
       let itemFailed = false;
-      for (const chunk of chunks) {
+      for (const chunk of sourceChunks) {
         await deps.scheduler();
         if (options.isPaused()) {
           deps.abortController.abort();
@@ -266,7 +327,7 @@ ${para}`;
           const result = await deps.provider.embedTexts({
             baseUrl: deps.settings.baseUrl,
             model: deps.settings.embeddingModel,
-            texts: [chunk],
+            texts: [chunk.text],
             signal: deps.abortController.signal
           });
           embedding = result[0];
@@ -294,7 +355,13 @@ ${para}`;
           }
           break;
         }
-        accumulated.push({ text: chunk, embedding });
+        accumulated.push({
+          text: chunk.text,
+          embedding,
+          sourceKind: chunk.sourceKind,
+          ...chunk.pageIndex !== void 0 ? { pageIndex: chunk.pageIndex } : {},
+          ...chunk.attachmentKey !== void 0 ? { attachmentKey: chunk.attachmentKey } : {}
+        });
       }
       if (itemFailed) {
         failed += 1;
@@ -304,6 +371,7 @@ ${para}`;
       consecutiveFailures = 0;
       const title = (item.getField("title") ?? "").trim();
       currentFile = {
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         items: {
           ...currentFile.items,
           [item.key]: { title, chunks: accumulated }
@@ -324,14 +392,16 @@ ${para}`;
     mw?.console?.error(summary);
     return { completed: true };
   }
-  var DEFAULT_CHUNK_BYTES, CIRCUIT_BREAKER_THRESHOLD, CIRCUIT_BREAKER_MESSAGE, DEFAULT_FULLTEXT_MAX_CHARS, EmbedCircuitBreakerError;
+  var DEFAULT_CHUNK_BYTES, CIRCUIT_BREAKER_THRESHOLD, CIRCUIT_BREAKER_MESSAGE, DEFAULT_FULLTEXT_MAX_CHARS, CURRENT_SCHEMA_VERSION, EmbedCircuitBreakerError;
   var init_library_crawler = __esm({
     "src/indexing/library-crawler.ts"() {
       "use strict";
+      init_per_source_chunks();
       DEFAULT_CHUNK_BYTES = 2048;
       CIRCUIT_BREAKER_THRESHOLD = 3;
       CIRCUIT_BREAKER_MESSAGE = "Connection to Ollama lost after 3 consecutive failures.";
       DEFAULT_FULLTEXT_MAX_CHARS = 5e4;
+      CURRENT_SCHEMA_VERSION = 2;
       EmbedCircuitBreakerError = class extends Error {
         name = "EmbedCircuitBreakerError";
         constructor(message = CIRCUIT_BREAKER_MESSAGE) {
@@ -349,7 +419,8 @@ ${para}`;
       indexedItems: 0,
       failedItems: 0,
       previouslyIndexed: 0,
-      skippedNoText: 0
+      skippedNoText: 0,
+      migrationActive: false
     };
   }
   function reduceIndexingStatus(status, action) {
@@ -398,6 +469,10 @@ ${para}`;
         };
       case "cleared":
         return createInitialIndexingStatus();
+      case "migration-started":
+        return { ...status, migrationActive: true };
+      case "migration-settled":
+        return { ...status, migrationActive: false };
     }
   }
   var init_indexing_status = __esm({
@@ -434,6 +509,9 @@ ${para}`;
     let abortController = null;
     let pausedFlag = false;
     let activeClear = null;
+    let activeMigration = null;
+    let migrationAbortController = null;
+    const migration = { cancelled: false };
     const apply = (action, label) => {
       status = reduceIndexingStatus(status, action);
       deps.logger.debug(
@@ -507,6 +585,67 @@ ${para}`;
         }
       );
     };
+    const isMigrationCancelled = () => migration.cancelled;
+    const runMigrationImpl = () => {
+      if (activeMigration !== null) {
+        return activeMigration;
+      }
+      migration.cancelled = false;
+      const doMigration = async () => {
+        try {
+          await deps.storage.writeMarker();
+          await deps.storage.abandonMigration();
+          await deps.storage.writeTmp({
+            schemaVersion: CURRENT_SCHEMA_VERSION,
+            items: {},
+            indexedAt: (/* @__PURE__ */ new Date()).toISOString()
+          });
+          if (isMigrationCancelled()) {
+            deps.logger.debug("Zotero AI Explain index:migration-cancelled pre-crawl");
+            return;
+          }
+          const controller = new AbortController();
+          migrationAbortController = controller;
+          const migrationStorage = {
+            read: () => Promise.resolve(null),
+            write: (file) => deps.storage.writeTmp(file),
+            clear: () => Promise.resolve(),
+            path: () => deps.storage.path()
+          };
+          const crawlerDeps = {
+            ...makeCrawlerDeps(controller),
+            storage: migrationStorage
+          };
+          const options = {
+            signal: controller.signal,
+            isPaused: () => false
+          };
+          deps.logger.debug("Zotero AI Explain index:migration-start");
+          const result = await indexLibrary(crawlerDeps, options);
+          if (!result.completed) {
+            deps.logger.debug("Zotero AI Explain index:migration-incomplete");
+            return;
+          }
+          if (isMigrationCancelled()) {
+            deps.logger.debug("Zotero AI Explain index:migration-cancelled skip-commit");
+            return;
+          }
+          await deps.storage.commitMigration();
+          deps.logger.debug("Zotero AI Explain index:migration-complete");
+        } catch (err) {
+          deps.logger.debug(
+            `Zotero AI Explain index:migration-error ${err instanceof Error ? err.message : String(err)}`
+          );
+        } finally {
+          activeMigration = null;
+          migrationAbortController = null;
+          apply({ type: "migration-settled" }, "migration-settled");
+        }
+      };
+      activeMigration = doMigration();
+      apply({ type: "migration-started" }, "migration-start");
+      return activeMigration;
+    };
     return {
       getStatus() {
         return status;
@@ -520,6 +659,10 @@ ${para}`;
       start() {
         if (status.state === "running" || status.state === "paused") {
           deps.logger.debug(`Zotero AI Explain index:start-ignored state=${status.state}`);
+          return;
+        }
+        if (activeMigration !== null) {
+          deps.logger.debug("Zotero AI Explain index:start-ignored migration-active");
           return;
         }
         pausedFlag = false;
@@ -556,6 +699,8 @@ ${para}`;
         const sourceState = status.state;
         const runToAwait = activeRun;
         const controllerToAbort = abortController;
+        const migrationToAwait = activeMigration;
+        const migrationControllerToAbort = migrationAbortController;
         const doClear = async () => {
           try {
             if (sourceState === "running" && controllerToAbort !== null && runToAwait !== null) {
@@ -566,6 +711,21 @@ ${para}`;
                 if (!isAbortError2(err)) {
                   deps.logger.debug(
                     `Zotero AI Explain index:clear-await-error ${err instanceof Error ? err.message : String(err)}`
+                  );
+                }
+              }
+            }
+            if (migrationToAwait !== null) {
+              migration.cancelled = true;
+              if (migrationControllerToAbort !== null) {
+                migrationControllerToAbort.abort();
+              }
+              try {
+                await migrationToAwait;
+              } catch (err) {
+                if (!isAbortError2(err)) {
+                  deps.logger.debug(
+                    `Zotero AI Explain index:clear-migration-await-error ${err instanceof Error ? err.message : String(err)}`
                   );
                 }
               }
@@ -593,6 +753,24 @@ ${para}`;
           deps.logger.debug(`Zotero AI Explain index:hydrate-ignored state=${status.state}`);
           return;
         }
+        try {
+          const probe = await deps.storage.readWithMigration();
+          if (probe.migrationPending) {
+            const schemaCurrent = (probe.file?.schemaVersion ?? 1) >= CURRENT_SCHEMA_VERSION;
+            if (probe.file !== null && schemaCurrent) {
+              deps.logger.debug("Zotero AI Explain index:migration-marker-stale -> removeMarker");
+              await deps.storage.removeMarker();
+            } else if (probe.file === null && !await deps.storage.hasMarker()) {
+              deps.logger.debug("Zotero AI Explain index:migration-skip fresh-install");
+            } else {
+              await runMigrationImpl();
+            }
+          }
+        } catch (err) {
+          deps.logger.debug(
+            `Zotero AI Explain index:hydrate-migration-error ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
         let previouslyIndexed;
         try {
           previouslyIndexed = await deps.storage.readItemCount();
@@ -604,6 +782,9 @@ ${para}`;
         }
         if (previouslyIndexed === 0) return;
         apply({ type: "hydrate", previouslyIndexed }, "hydrate");
+      },
+      runMigration() {
+        return runMigrationImpl();
       }
     };
   }
@@ -622,6 +803,9 @@ ${para}`;
         }
         return counts;
       case "running":
+        if (status.totalItems === 0) {
+          return "Starting\u2026 scanning your library.";
+        }
         return `Indexing ${indexed} of ${total}. ${counts}`;
       case "paused":
         return `Paused. ${counts}`;
@@ -678,7 +862,7 @@ ${para}`;
       button.style.borderColor = "";
     });
   }
-  var FONT_STACK, FG, FG_MUTED, SURFACE_BG, TOOLBAR_BG, STRIPE_BG, BORDER_HAIRLINE, ACCENT, ACCENT_FG, BUTTON_BG, ROOT_STYLE, FIELD_GROUP_STYLE, FIELD_LABEL_STYLE, FIELD_INPUT_STYLE, FIELD_TEXTAREA_STYLE, FORM_STACK_STYLE, BUTTON_BASE_STYLE, BUTTON_PRIMARY_STYLE, BUTTON_ROW_STYLE, SECTION_HEADING_STYLE, MUTED_TEXT_STYLE, SECTION_DIVIDER_STYLE, SECTION_BLOCK_STYLE, SECTION_BLURB_STYLE;
+  var FONT_STACK, FG, FG_MUTED, SURFACE_BG, TOOLBAR_BG, STRIPE_BG, BORDER_HAIRLINE, ACCENT, ACCENT_FG, BUTTON_BG, ROOT_STYLE, FIELD_GROUP_STYLE, FIELD_LABEL_STYLE, FIELD_INPUT_STYLE, FIELD_TEXTAREA_STYLE, FORM_STACK_STYLE, BUTTON_BASE_STYLE, BUTTON_PRIMARY_STYLE, BUTTON_ROW_STYLE, SECTION_HEADING_STYLE, MUTED_TEXT_STYLE, SECTION_DIVIDER_STYLE, SECTION_BLOCK_STYLE, SECTION_BLURB_STYLE, MARKDOWN_CSS;
   var init_styles = __esm({
     "src/ui/styles.ts"() {
       "use strict";
@@ -706,17 +890,116 @@ ${para}`;
       SECTION_DIVIDER_STYLE = `border-top: 1px solid ${BORDER_HAIRLINE}; padding-top: 12px;`;
       SECTION_BLOCK_STYLE = "display: flex; flex-direction: column; gap: 8px;";
       SECTION_BLURB_STYLE = `margin: 0; font-size: 11px; color: ${FG_MUTED}; line-height: 1.4;`;
+      MARKDOWN_CSS = `
+  .zotero-ai-explain-popup__body h1,
+  .zotero-ai-explain-popup__turn-body h1,
+  .zotero-ai-explain-sidebar__body h1 {
+    margin: 0.4em 0 0.3em; font-size: 1.3em; font-weight: 600; line-height: 1.3;
+  }
+  .zotero-ai-explain-popup__body h2,
+  .zotero-ai-explain-popup__turn-body h2,
+  .zotero-ai-explain-sidebar__body h2 {
+    margin: 0.4em 0 0.3em; font-size: 1.18em; font-weight: 600; line-height: 1.3;
+  }
+  .zotero-ai-explain-popup__body h3,
+  .zotero-ai-explain-popup__turn-body h3,
+  .zotero-ai-explain-sidebar__body h3 {
+    margin: 0.4em 0 0.25em; font-size: 1.08em; font-weight: 600; line-height: 1.3;
+  }
+  .zotero-ai-explain-popup__body h4,
+  .zotero-ai-explain-popup__turn-body h4,
+  .zotero-ai-explain-sidebar__body h4 {
+    margin: 0.4em 0 0.25em; font-size: 1em; font-weight: 600; line-height: 1.3;
+  }
+  .zotero-ai-explain-popup__body p,
+  .zotero-ai-explain-popup__turn-body p,
+  .zotero-ai-explain-sidebar__body p {
+    margin: 0.35em 0;
+  }
+  .zotero-ai-explain-popup__body ul,
+  .zotero-ai-explain-popup__turn-body ul,
+  .zotero-ai-explain-sidebar__body ul,
+  .zotero-ai-explain-popup__body ol,
+  .zotero-ai-explain-popup__turn-body ol,
+  .zotero-ai-explain-sidebar__body ol {
+    margin: 0.35em 0; padding-left: 1.4em;
+  }
+  .zotero-ai-explain-popup__body ul,
+  .zotero-ai-explain-popup__turn-body ul,
+  .zotero-ai-explain-sidebar__body ul {
+    list-style: disc;
+  }
+  .zotero-ai-explain-popup__body ol,
+  .zotero-ai-explain-popup__turn-body ol,
+  .zotero-ai-explain-sidebar__body ol {
+    list-style: decimal;
+  }
+  .zotero-ai-explain-popup__body li,
+  .zotero-ai-explain-popup__turn-body li,
+  .zotero-ai-explain-sidebar__body li {
+    margin: 0.15em 0;
+  }
+  .zotero-ai-explain-popup__body code,
+  .zotero-ai-explain-popup__turn-body code,
+  .zotero-ai-explain-sidebar__body code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.92em; padding: 0.1em 0.3em; border-radius: 3px;
+    background: var(--fill-quarternary, ButtonFace);
+  }
+  .zotero-ai-explain-popup__body pre,
+  .zotero-ai-explain-popup__turn-body pre,
+  .zotero-ai-explain-sidebar__body pre {
+    margin: 0.4em 0; padding: 8px 10px; border-radius: 4px;
+    background: var(--fill-quarternary, ButtonFace);
+    overflow-x: auto;
+  }
+  .zotero-ai-explain-popup__body pre code,
+  .zotero-ai-explain-popup__turn-body pre code,
+  .zotero-ai-explain-sidebar__body pre code {
+    padding: 0; border-radius: 0; background: transparent;
+  }
+  .zotero-ai-explain-popup__body blockquote,
+  .zotero-ai-explain-popup__turn-body blockquote,
+  .zotero-ai-explain-sidebar__body blockquote {
+    margin: 0.4em 0; padding: 0.2em 0.8em;
+    border-left: 3px solid var(--accent-blue, Highlight);
+    color: var(--fill-secondary, GrayText);
+  }
+  .zotero-ai-explain-popup__body a,
+  .zotero-ai-explain-popup__turn-body a,
+  .zotero-ai-explain-sidebar__body a {
+    color: var(--accent-blue, Highlight); text-decoration: underline;
+  }
+`;
     }
   });
 
   // src/ui/index-controls-view.ts
+  function startBlocked(status) {
+    return status.state === "running" || status.state === "paused" || status.migrationActive === true;
+  }
+  function noOpReason(status) {
+    if (status.migrationActive === true) {
+      return "Migrating the index \u2014 please wait\u2026";
+    }
+    if (status.state === "running") {
+      return "Already indexing\u2026";
+    }
+    if (status.state === "paused") {
+      return "Paused \u2014 use Resume to continue.";
+    }
+    return "";
+  }
+  function clearItemCount(status) {
+    return Math.max(status.previouslyIndexed ?? 0, status.indexedItems);
+  }
   function renderIndexControls(status) {
     const element = document.createElement("section");
     element.className = "zotero-ai-index-controls";
     element.setAttribute("style", "display: flex; flex-direction: column; gap: 8px;");
     const summary = document.createElement("p");
     summary.className = "zotero-ai-index-controls__summary";
-    summary.textContent = describeIndexingStatus(status);
+    summary.textContent = composeSummary(status, false);
     summary.setAttribute("style", `margin: 0; font-size: 11px; color: ${FG_MUTED};`);
     const buttons = document.createElement("div");
     buttons.className = "zotero-ai-index-controls__buttons";
@@ -724,47 +1007,84 @@ ${para}`;
     const start = makeButton("start-index", "Index library", true);
     const pause = makeButton("pause-index", "Pause", false);
     const resume = makeButton("resume-index", "Resume", false);
-    const clear = makeButton("clear-index", "Clear index", false);
+    const clear = makeButton("clear-index", CLEAR_LABEL, false);
+    setDisabled(start, startBlocked(status));
+    setDisabled(pause, status.state !== "running");
+    setDisabled(resume, status.state !== "paused");
+    setDisabled(clear, status.migrationActive === true);
     buttons.append(start, pause, resume, clear);
     element.append(summary, buttons);
     return element;
   }
   function attachIndexControls(root, controller) {
     const summary = root.querySelector(".zotero-ai-index-controls__summary");
-    const updateSummary = () => {
+    const startBtn = root.querySelector('[data-action="start-index"]');
+    const pauseBtn = root.querySelector('[data-action="pause-index"]');
+    const resumeBtn = root.querySelector('[data-action="resume-index"]');
+    const clearBtn = root.querySelector('[data-action="clear-index"]');
+    let pendingClearConfirm = false;
+    const refreshControls = () => {
+      const status = controller.getStatus();
+      setDisabled(startBtn, startBlocked(status));
+      setDisabled(pauseBtn, status.state !== "running");
+      setDisabled(resumeBtn, status.state !== "paused");
+      setDisabled(clearBtn, status.migrationActive === true);
       if (summary !== null) {
-        summary.textContent = describeIndexingStatus(controller.getStatus());
+        summary.textContent = composeSummary(status, pendingClearConfirm);
+      }
+    };
+    const cancelClearConfirm = () => {
+      if (!pendingClearConfirm) {
+        return;
+      }
+      pendingClearConfirm = false;
+      if (clearBtn !== null) {
+        clearBtn.textContent = CLEAR_LABEL;
       }
     };
     const bindings = [
       {
-        selector: '[data-action="start-index"]',
+        button: startBtn,
         handler: () => {
+          cancelClearConfirm();
           controller.start();
         }
       },
       {
-        selector: '[data-action="pause-index"]',
+        button: pauseBtn,
         handler: () => {
+          cancelClearConfirm();
           controller.pause();
         }
       },
       {
-        selector: '[data-action="resume-index"]',
+        button: resumeBtn,
         handler: () => {
+          cancelClearConfirm();
           controller.resume();
         }
       },
       {
-        selector: '[data-action="clear-index"]',
+        button: clearBtn,
         handler: () => {
+          if (!pendingClearConfirm) {
+            pendingClearConfirm = true;
+            if (clearBtn !== null) {
+              clearBtn.textContent = CLEAR_CONFIRM_LABEL;
+            }
+            refreshControls();
+            return;
+          }
+          pendingClearConfirm = false;
+          if (clearBtn !== null) {
+            clearBtn.textContent = CLEAR_LABEL;
+          }
           void controller.clear();
         }
       }
     ];
     const removers = [];
-    for (const { selector, handler } of bindings) {
-      const button = root.querySelector(selector);
+    for (const { button, handler } of bindings) {
       if (button === null) {
         continue;
       }
@@ -774,15 +1094,39 @@ ${para}`;
       });
     }
     const unsubscribe = controller.subscribe(() => {
-      updateSummary();
+      cancelClearConfirm();
+      refreshControls();
     });
-    updateSummary();
+    refreshControls();
     return () => {
       unsubscribe();
       for (const remove of removers) {
         remove();
       }
     };
+  }
+  function composeSummary(status, clearConfirmArmed) {
+    const parts = [describeIndexingStatus(status)];
+    const reason = noOpReason(status);
+    if (reason.length > 0) {
+      parts.push(reason);
+    }
+    if (clearConfirmArmed) {
+      const n = String(clearItemCount(status));
+      parts.push(
+        `This deletes all ${n} embedded items. Re-indexing will re-embed your whole library. Click "${CLEAR_CONFIRM_LABEL}" again to proceed, or any other button to cancel.`
+      );
+    }
+    return parts.join(" ");
+  }
+  function setDisabled(button, disabled) {
+    if (button === null) {
+      return;
+    }
+    button.disabled = disabled;
+    button.setAttribute("aria-disabled", disabled ? "true" : "false");
+    button.style.opacity = disabled ? "0.5" : "";
+    button.style.cursor = disabled ? "default" : "pointer";
   }
   function makeButton(action, label, primary) {
     const button = document.createElement("button");
@@ -796,11 +1140,14 @@ ${para}`;
     }
     return button;
   }
+  var CLEAR_LABEL, CLEAR_CONFIRM_LABEL;
   var init_index_controls_view = __esm({
     "src/ui/index-controls-view.ts"() {
       "use strict";
       init_indexing_controller();
       init_styles();
+      CLEAR_LABEL = "Clear index";
+      CLEAR_CONFIRM_LABEL = "Confirm clear";
     }
   });
 
@@ -2344,13 +2691,44 @@ ${para}`;
           item.remove();
         };
       },
-      addReaderCommand(label, action) {
+      addReaderCommands(commands) {
+        const resolveSource = (event) => {
+          const readerRaw = event.reader;
+          const item = readerRaw?._item ?? readerRaw?.wrappedJSObject?._item;
+          const attachmentKey = item?.key ?? null;
+          const parent = item?.parentItem ?? null;
+          const itemKey = parent?.key ?? item?.key ?? null;
+          const itemTitle = parent?.getDisplayTitle?.() ?? item?.getDisplayTitle?.() ?? null;
+          const pageLabel = event.params?.annotation?.pageLabel ?? null;
+          const pageIndex = event.params?.annotation?.position?.pageIndex;
+          return {
+            itemKey,
+            itemTitle,
+            attachmentKey,
+            pageLabel,
+            // `pageIndex: 0` is a valid first page — only attach the field
+            // when the reader event actually supplied a number, never
+            // conflate an absent position with 0.
+            ...typeof pageIndex === "number" ? { pageIndex } : {}
+          };
+        };
         const handler = (event) => {
           const quote = event.params?.annotation?.text?.trim() ?? "";
+          if (quote.length === 0) {
+            return;
+          }
+          const source = resolveSource(event);
+          for (const spec of commands) {
+            appendReaderCommandButton(event, spec, quote, source);
+          }
+        };
+        const appendReaderCommandButton = (event, spec, quote, source) => {
+          const { label, action } = spec;
           const button = event.doc.createElement("button");
           button.type = "button";
           button.textContent = label;
-          button.dataset.action = "explain-with-ai";
+          button.dataset.action = spec.mode === "ask-question" ? "ask-question" : "explain-with-ai";
+          button.dataset.mode = spec.mode;
           button.addEventListener("click", () => {
             const rect = button.getBoundingClientRect();
             const viewWindow = event.doc.defaultView ?? null;
@@ -2392,13 +2770,6 @@ ${para}`;
               };
               viewWindow?.setTimeout(restore, 1500);
             }
-            const source = {
-              itemKey: null,
-              itemTitle: null,
-              attachmentKey: null,
-              pageLabel: null,
-              location: null
-            };
             if (mainWindow === null || readerFrameRect === null) {
               action({ quote, source, anchor: null });
               return;
@@ -2423,10 +2794,15 @@ ${para}`;
         }
         const reader = input.Zotero.Reader;
         reader.registerEventListener("renderTextSelectionPopup", handler, input.pluginId);
-        input.Zotero.debug(`Zotero AI Explain registered reader command: ${label}`);
+        input.Zotero.debug(
+          `Zotero AI Explain registered reader commands: ${commands.map((c) => c.label).join(", ")}`
+        );
         return () => {
           reader.unregisterEventListener("renderTextSelectionPopup", handler);
         };
+      },
+      addReaderCommand(label, action) {
+        return this.addReaderCommands([{ label, mode: "explain", action }]);
       },
       openDialog(title, content) {
         const mainWindow = input.Zotero.getMainWindow?.();
@@ -2719,10 +3095,10 @@ ${para}`;
       DIALOG_TITLE_STYLE = `margin: 0; font-size: 14px; font-weight: 600; color: ${FG2};`;
       DIALOG_CLOSE_STYLE = `appearance: none; border: 1px solid transparent; background: transparent; color: ${FG2}; width: 24px; height: 24px; padding: 0; border-radius: 4px; cursor: pointer; font-size: 16px; line-height: 1; display: inline-flex; align-items: center; justify-content: center;`;
       DIALOG_BODY_STYLE = "padding: 16px; overflow: auto; flex: 1 1 auto;";
-      POPUP_WRAPPER_BASE_STYLE = `position: fixed; z-index: 999999; max-width: 480px; min-width: 320px; background: ${SURFACE_BG2}; color: ${FG2}; font-family: ${FONT_STACK2}; font-size: 13px; line-height: 1.45; border-radius: 6px; border: 1px solid ${BORDER_HAIRLINE2}; box-shadow: 0 12px 32px rgba(0,0,0,0.35); max-height: 60vh; display: flex; flex-direction: column;`;
-      POPUP_HEADER_STYLE = `display: flex; align-items: center; justify-content: flex-end; padding: 4px 6px 0 6px; cursor: move; user-select: none;`;
+      POPUP_WRAPPER_BASE_STYLE = `position: fixed; z-index: 999999; max-width: 480px; min-width: 320px; background: ${SURFACE_BG2}; color: ${FG2}; font-family: ${FONT_STACK2}; font-size: 13px; line-height: 1.45; border-radius: 6px; border: 1px solid ${BORDER_HAIRLINE2}; box-shadow: 0 12px 32px rgba(0,0,0,0.35); max-height: 60vh; overflow-y: auto; display: flex; flex-direction: column;`;
+      POPUP_HEADER_STYLE = `display: flex; align-items: center; justify-content: flex-end; padding: 4px 6px 0 6px; cursor: move; user-select: none; position: sticky; top: 0; z-index: 1; background: ${SURFACE_BG2};`;
       POPUP_CLOSE_STYLE = `appearance: none; border: 1px solid transparent; background: transparent; color: ${FG2}; width: 22px; height: 22px; padding: 0; border-radius: 4px; cursor: pointer; font-size: 16px; line-height: 1; display: inline-flex; align-items: center; justify-content: center;`;
-      POPUP_BODY_WRAPPER_STYLE = "padding: 0 14px 12px 14px; overflow: auto; flex: 1 1 auto;";
+      POPUP_BODY_WRAPPER_STYLE = "padding: 0 14px 12px 14px; overflow-y: auto; flex: 0 0 auto;";
       POPUP_FALLBACK_POSITION_STYLE = "top: 80px; left: 50%; transform: translateX(-50%);";
       POPUP_MAX_WIDTH = 480;
       POPUP_MIN_WIDTH = 320;
@@ -2736,6 +3112,8 @@ ${para}`;
   // src/bootstrap.ts
   var bootstrap_exports = {};
   __export(bootstrap_exports, {
+    attachAutoReindex: () => attachAutoReindex,
+    openCitationInReader: () => openCitationInReader,
     shutdown: () => shutdown,
     startup: () => startup
   });
@@ -2786,6 +3164,9 @@ ${para}`;
       },
       appendUserMessage(id, content) {
         appendMessage(id, { role: "user", content });
+      },
+      appendSystemMessage(id, content) {
+        appendMessage(id, { role: "system", content });
       },
       appendAssistantDelta(id, text) {
         update(id, (conversation) => {
@@ -2871,6 +3252,7 @@ ${para}`;
   var LEGACY_INDEX_FILE_NAME = LEGACY_FILE_NAME;
 
   // src/indexing/index-storage.ts
+  init_library_crawler();
   var LEGACY_FILE_NAME2 = LEGACY_INDEX_FILE_NAME;
   function joinPath(dir, name) {
     return dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`;
@@ -2892,6 +3274,8 @@ ${para}`;
     const filePath = joinPath(deps.zotero.DataDirectory.dir, fileName);
     const legacyFilePath = joinPath(deps.zotero.DataDirectory.dir, LEGACY_FILE_NAME2);
     const metaPath = `${filePath.replace(/\.json$/u, "")}.meta.json`;
+    const tmpPath = `${filePath}.tmp`;
+    const markerPath = `${filePath}.migrating`;
     function isLegacyEligible() {
       if (deps.embedProvider === void 0) return false;
       if (deps.embedProvider.kind !== "ollama") return false;
@@ -2918,27 +3302,67 @@ ${para}`;
       }
       return parsed;
     }
+    async function readPure() {
+      const primary = await tryReadParsed(filePath);
+      if (primary !== null) {
+        return primary;
+      }
+      if (filePath === legacyFilePath || !isLegacyEligible()) {
+        return null;
+      }
+      return tryReadParsed(legacyFilePath);
+    }
+    async function removeMarkerImpl() {
+      if (await deps.io.exists(markerPath)) {
+        try {
+          await deps.io.remove(markerPath);
+        } catch {
+        }
+      }
+    }
+    let cache = null;
+    async function computeFingerprint() {
+      const primaryStat = await deps.io.stat(filePath);
+      if (primaryStat === null) {
+        return null;
+      }
+      if (typeof primaryStat.lastModified !== "number" || !Number.isFinite(primaryStat.lastModified)) {
+        return null;
+      }
+      let metaComponent = "absent";
+      try {
+        const rawMeta = await deps.io.readString(metaPath);
+        JSON.parse(rawMeta);
+        metaComponent = rawMeta;
+      } catch {
+        metaComponent = "absent";
+      }
+      return JSON.stringify({
+        meta: metaComponent,
+        size: primaryStat.size,
+        // Guaranteed a finite number by the guard above.
+        lastModified: primaryStat.lastModified
+      });
+    }
+    function invalidateCache() {
+      cache = null;
+    }
     return {
       path() {
         return filePath;
       },
       async read() {
-        const primary = await tryReadParsed(filePath);
-        if (primary !== null) {
-          return primary;
+        const fingerprint = await computeFingerprint();
+        if (fingerprint !== null && cache !== null && cache.fingerprint === fingerprint) {
+          return cache.file;
         }
-        if (filePath === legacyFilePath || !isLegacyEligible()) {
-          return null;
+        const file = await readPure();
+        if (fingerprint !== null && file !== null) {
+          cache = { fingerprint, file };
+        } else {
+          cache = null;
         }
-        const legacy = await tryReadParsed(legacyFilePath);
-        if (legacy === null) {
-          return null;
-        }
-        try {
-          await deps.io.writeString(filePath, JSON.stringify(legacy));
-        } catch {
-        }
-        return legacy;
+        return file;
       },
       async readItemCount() {
         const primaryExists = await deps.io.exists(filePath);
@@ -2972,7 +3396,40 @@ ${para}`;
         }
         return itemCount;
       },
+      async readWithMigration() {
+        const file = await readPure();
+        const markerPresent = await deps.io.exists(markerPath);
+        const schemaVersion = file?.schemaVersion ?? 1;
+        const migrationPending = markerPresent || schemaVersion < CURRENT_SCHEMA_VERSION;
+        return { file, migrationPending };
+      },
+      async writeTmp(file) {
+        await deps.io.writeString(tmpPath, JSON.stringify(file));
+      },
+      async commitMigration() {
+        await deps.io.rename(tmpPath, filePath);
+        invalidateCache();
+        await removeMarkerImpl();
+      },
+      async abandonMigration() {
+        if (await deps.io.exists(tmpPath)) {
+          try {
+            await deps.io.remove(tmpPath);
+          } catch {
+          }
+        }
+      },
+      async writeMarker() {
+        await deps.io.writeString(markerPath, (/* @__PURE__ */ new Date()).toISOString());
+      },
+      removeMarker() {
+        return removeMarkerImpl();
+      },
+      hasMarker() {
+        return deps.io.exists(markerPath);
+      },
       async write(file) {
+        invalidateCache();
         const serialized = JSON.stringify(file);
         await deps.io.writeString(filePath, serialized);
         try {
@@ -2985,23 +3442,83 @@ ${para}`;
         }
       },
       async clear() {
-        if (await deps.io.exists(filePath)) {
-          try {
-            await deps.io.remove(filePath);
-          } catch {
+        invalidateCache();
+        const removeIfPresent = async (path) => {
+          if (await deps.io.exists(path)) {
+            try {
+              await deps.io.remove(path);
+            } catch {
+            }
           }
-        }
-        if (await deps.io.exists(metaPath)) {
-          try {
-            await deps.io.remove(metaPath);
-          } catch {
-          }
-        }
+        };
+        await removeIfPresent(filePath);
+        await removeIfPresent(metaPath);
+        await removeIfPresent(tmpPath);
+        await removeIfPresent(markerPath);
       }
     };
   }
 
   // src/bootstrap.ts
+  init_indexing_controller();
+
+  // src/platform/citation-open.ts
+  function isPdfAttachment(att) {
+    return att.isPDFAttachment?.() === true || att.attachmentContentType === "application/pdf";
+  }
+  function resolveParentPdfAttachment(parent, zotero, attachmentKey) {
+    if (parent.getAttachments === void 0) {
+      return null;
+    }
+    const childIds = parent.getAttachments();
+    if (attachmentKey !== void 0 && attachmentKey.length > 0) {
+      for (const childId of childIds) {
+        const att = zotero.Items?.get?.(childId);
+        if (att === null || att === void 0) continue;
+        if (att.key === attachmentKey && isPdfAttachment(att)) {
+          return att.id;
+        }
+      }
+    }
+    for (const childId of childIds) {
+      const att = zotero.Items?.get?.(childId);
+      if (att === null || att === void 0) continue;
+      if (isPdfAttachment(att)) {
+        return att.id;
+      }
+    }
+    return null;
+  }
+  function openCitationInReader(citation, zotero) {
+    const userLibraryID = zotero.Libraries?.userLibraryID ?? 1;
+    const item = zotero.Items?.getByLibraryAndKey?.(userLibraryID, citation.itemKey);
+    if (item === false || item === null || item === void 0) {
+      return { outcome: "not-found" };
+    }
+    let attachmentId = null;
+    const isRegular = item.isRegularItem?.() === true;
+    if (isRegular) {
+      attachmentId = resolveParentPdfAttachment(item, zotero, citation.attachmentKey);
+    } else {
+      attachmentId = item.id;
+    }
+    if (attachmentId !== null && zotero.Reader?.open !== void 0) {
+      if (citation.pageIndex !== void 0) {
+        void zotero.Reader.open(attachmentId, { pageIndex: citation.pageIndex });
+        return { outcome: "opened-with-page", attachmentId };
+      }
+      void zotero.Reader.open(attachmentId);
+      return { outcome: "opened-no-page", attachmentId };
+    }
+    const pane = zotero.getActiveZoteroPane?.();
+    if (pane?.selectItems !== void 0) {
+      void pane.selectItems([item.id]);
+      return { outcome: "selected-row" };
+    }
+    return { outcome: "no-target" };
+  }
+
+  // src/platform/e2e-driver.ts
   init_indexing_controller();
 
   // src/ui/markdown.ts
@@ -3275,8 +3792,10 @@ ${para}`;
   // src/ui/anchored-popup-view.ts
   init_styles();
   function renderAnchoredPopup(input) {
+    const mode = input.mode ?? "explain";
     const element = document.createElement("section");
     element.className = "zotero-ai-explain-popup";
+    element.dataset.mode = mode;
     void input.anchor;
     element.style.display = "flex";
     element.style.flexDirection = "column";
@@ -3350,6 +3869,7 @@ ${para}`;
       flex-direction: column;
       gap: 8px;
     }
+${MARKDOWN_CSS}
   `;
     const loading = document.createElement("div");
     loading.className = "zotero-ai-explain-popup__loading";
@@ -3370,7 +3890,7 @@ ${para}`;
     const dot3 = document.createElement("span");
     dot3.className = "zotero-ai-explain-popup__loading-dot";
     loading.append(loadingLabel, dot1, dot2, dot3);
-    if (input.text.length > 0) {
+    if (input.text.length > 0 || mode === "ask-question") {
       loading.hidden = true;
     }
     const errorBlock = document.createElement("div");
@@ -3414,7 +3934,7 @@ ${para}`;
     );
     const followUp = document.createElement("textarea");
     followUp.name = "followUp";
-    followUp.placeholder = "Ask a follow-up";
+    followUp.placeholder = mode === "ask-question" ? "Ask a question" : "Ask a follow-up";
     followUp.setAttribute("style", `${FIELD_TEXTAREA_STYLE} min-height: 48px;`);
     applyFocusRing(followUp);
     const send = document.createElement("button");
@@ -3427,12 +3947,319 @@ ${para}`;
     const turns = document.createElement("div");
     turns.className = "zotero-ai-explain-popup__turns";
     turns.setAttribute("style", "display: flex; flex-direction: column; gap: 8px;");
-    element.append(styleTag, disclosure, body, errorBlock, turns, loading, actions, followForm);
+    const children = [styleTag];
+    if (mode === "ask-question") {
+      const quoteBlock = document.createElement("blockquote");
+      quoteBlock.className = "zotero-ai-explain-popup__quote";
+      quoteBlock.dataset.role = "quote";
+      quoteBlock.textContent = input.quote ?? "";
+      quoteBlock.setAttribute(
+        "style",
+        `margin: 0; padding: 6px 10px; border-left: 3px solid ${BORDER_HAIRLINE}; background: rgba(127, 127, 127, 0.12); border-radius: 4px; font-size: 12px; line-height: 1.45; font-style: italic; white-space: pre-wrap; word-break: break-word;`
+      );
+      children.push(quoteBlock);
+    }
+    children.push(disclosure, body, errorBlock, turns, loading, actions, followForm);
+    element.append(...children);
+    if (mode === "ask-question") {
+      const view = element.ownerDocument.defaultView;
+      if (view !== null) {
+        view.requestAnimationFrame(() => {
+          followUp.focus();
+        });
+      } else {
+        followUp.focus();
+      }
+    }
     return element;
+  }
+
+  // src/ui/citation-lookup.ts
+  function buildCitationLookup(chunks) {
+    const lookup = /* @__PURE__ */ new Map();
+    for (const chunk of chunks) {
+      if (typeof chunk.chunkIndex !== "number") {
+        continue;
+      }
+      const key = `${chunk.itemKey}#${String(chunk.chunkIndex)}`;
+      lookup.set(key, {
+        itemKey: chunk.itemKey,
+        text: chunk.text,
+        ...typeof chunk.pageIndex === "number" ? { pageIndex: chunk.pageIndex } : {},
+        ...chunk.attachmentKey !== void 0 ? { attachmentKey: chunk.attachmentKey } : {}
+      });
+    }
+    return lookup;
   }
 
   // src/platform/e2e-driver.ts
   init_index_controls_view();
+
+  // src/ui/library-chat-view.ts
+  init_styles();
+  var CITATION_PATTERN = /\[([A-Z0-9]{8})(?:#(\d+))?\]/gu;
+  var MESSAGES_STYLE = "list-style: none; margin: 0; padding: 12px 16px; flex: 1 1 auto; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;";
+  function renderLibraryChatView(input) {
+    const root = document.createElement("aside");
+    root.className = "zotero-ai-library-chat";
+    root.setAttribute(
+      "style",
+      `display: flex; flex-direction: column; min-height: 360px; max-height: 70vh; font-family: ${FONT_STACK}; color: ${FG};`
+    );
+    const styleTag = document.createElement("style");
+    styleTag.textContent = `
+    @keyframes zotero-ai-library-chat-pulse {
+      0%, 80%, 100% { opacity: 0.2; transform: scale(0.85); }
+      40% { opacity: 1; transform: scale(1); }
+    }
+    .zotero-ai-library-chat__streaming { display: inline-flex; align-items: center; gap: 4px; }
+    .zotero-ai-library-chat__streaming-dot {
+      display: inline-block; width: 5px; height: 5px; margin: 0 2px;
+      border-radius: 50%; background: currentColor; vertical-align: middle;
+      animation: zotero-ai-library-chat-pulse 1.2s infinite ease-in-out;
+    }
+    .zotero-ai-library-chat__streaming-dot:nth-child(2) { animation-delay: 0.15s; }
+    .zotero-ai-library-chat__streaming-dot:nth-child(3) { animation-delay: 0.3s; }
+    .zotero-ai-library-chat__messages li[data-role] {
+      list-style: none;
+      max-width: 88%;
+      padding: 8px 12px;
+      border-radius: 12px;
+      line-height: 1.45;
+    }
+    .zotero-ai-library-chat__messages li[data-role="assistant"] {
+      align-self: flex-start;
+      background: rgba(127, 127, 127, 0.15);
+      border-bottom-left-radius: 4px;
+    }
+    .zotero-ai-library-chat__messages li[data-role="user"] {
+      align-self: flex-end;
+      background: rgba(64, 128, 255, 0.22);
+      border-bottom-right-radius: 4px;
+    }
+    .zotero-ai-library-chat__role {
+      /* Role is communicated by side + colour; the text label is redundant. */
+      display: none;
+    }
+  `;
+    root.append(styleTag);
+    const header = document.createElement("header");
+    header.className = "zotero-ai-library-chat__header";
+    header.setAttribute(
+      "style",
+      `padding: 10px 16px; background: ${TOOLBAR_BG}; border-bottom: 1px solid ${BORDER_HAIRLINE}; display: flex; align-items: center; justify-content: space-between; gap: 8px;`
+    );
+    const title = document.createElement("h2");
+    title.textContent = "Ask your library";
+    title.setAttribute("style", "margin: 0; font-size: 14px; font-weight: 600;");
+    const reset = document.createElement("button");
+    reset.type = "button";
+    reset.dataset.action = "new-conversation";
+    reset.textContent = "New conversation";
+    reset.setAttribute("style", BUTTON_BASE_STYLE);
+    applyFocusRing(reset);
+    header.append(title, reset);
+    const messages = document.createElement("ol");
+    messages.className = "zotero-ai-library-chat__messages";
+    messages.setAttribute("style", MESSAGES_STYLE);
+    if (input.messages.length === 0) {
+      messages.append(renderEmptyState(input.hasIndex));
+    } else {
+      input.messages.forEach((message, index) => {
+        messages.append(renderMessage(message, input.citationLookups?.get(index)));
+      });
+    }
+    if (input.status === "streaming") {
+      messages.append(renderStreamingIndicator());
+    }
+    if (input.status === "failed" && input.errorMessage !== null) {
+      messages.append(renderError(input.errorMessage));
+    }
+    const form = document.createElement("form");
+    form.className = "zotero-ai-library-chat__form";
+    form.setAttribute(
+      "style",
+      `padding: 12px 16px; border-top: 1px solid ${BORDER_HAIRLINE}; background: ${SURFACE_BG}; display: flex; flex-direction: column; gap: 8px;`
+    );
+    const textarea = document.createElement("textarea");
+    textarea.name = "question";
+    textarea.placeholder = "Ask a question about your library\u2026";
+    textarea.setAttribute("style", FIELD_TEXTAREA_STYLE);
+    applyFocusRing(textarea);
+    const submit = document.createElement("button");
+    submit.type = "submit";
+    submit.dataset.action = "submit-question";
+    submit.textContent = "Ask";
+    submit.setAttribute("style", `${BUTTON_PRIMARY_STYLE} align-self: flex-end;`);
+    applyFocusRing(submit);
+    form.append(textarea, submit);
+    root.append(header, messages, form);
+    return root;
+  }
+  function renderEmptyState(hasIndex) {
+    const empty = document.createElement("li");
+    empty.className = "zotero-ai-library-chat__empty";
+    empty.setAttribute(
+      "style",
+      `list-style: none; padding: 16px; text-align: center; color: ${FG_MUTED}; font-size: 12px; line-height: 1.5;`
+    );
+    if (!hasIndex) {
+      empty.textContent = "Index your library first to enable retrieval. Open the settings dialog and click \u201CIndex library\u201D to build the index.";
+    } else {
+      empty.textContent = "Ask a question about your library. Answers cite source items by key in [brackets].";
+    }
+    return empty;
+  }
+  function renderStreamingIndicator() {
+    const li = document.createElement("li");
+    li.className = "zotero-ai-library-chat__streaming";
+    li.setAttribute("style", `font-size: 11px; color: ${FG_MUTED}; font-style: italic;`);
+    const label = document.createElement("span");
+    label.textContent = "Working";
+    const dot1 = document.createElement("span");
+    dot1.className = "zotero-ai-library-chat__streaming-dot";
+    const dot2 = document.createElement("span");
+    dot2.className = "zotero-ai-library-chat__streaming-dot";
+    const dot3 = document.createElement("span");
+    dot3.className = "zotero-ai-library-chat__streaming-dot";
+    li.append(label, dot1, dot2, dot3);
+    return li;
+  }
+  function renderError(message) {
+    const li = document.createElement("li");
+    li.className = "zotero-ai-library-chat__error";
+    li.setAttribute("style", "color: #d70015; font-size: 12px; line-height: 1.4;");
+    li.textContent = message;
+    return li;
+  }
+  function renderMessage(message, lookup) {
+    const row = document.createElement("li");
+    row.dataset.role = message.role;
+    const attribution = document.createElement("span");
+    attribution.className = "zotero-ai-library-chat__role";
+    attribution.setAttribute("style", `font-size: 11px; color: ${FG_MUTED};`);
+    attribution.textContent = `${message.role}: `;
+    const body = document.createElement("div");
+    body.className = "zotero-ai-library-chat__body";
+    body.setAttribute("style", "font-size: 13px; line-height: 1.45; white-space: pre-wrap;");
+    if (message.role === "assistant") {
+      appendWithCitations(body, message.content, lookup);
+    } else {
+      body.append(document.createTextNode(message.content));
+    }
+    row.append(attribution, body);
+    return row;
+  }
+  function appendWithCitations(target, source, lookup) {
+    CITATION_PATTERN.lastIndex = 0;
+    let cursor = 0;
+    let match;
+    while ((match = CITATION_PATTERN.exec(source)) !== null) {
+      if (match.index > cursor) {
+        target.append(document.createTextNode(source.slice(cursor, match.index)));
+      }
+      const itemKey = match[1] ?? "";
+      const rawChunkIndex = match[2];
+      const entry = rawChunkIndex !== void 0 && lookup !== void 0 ? lookup.get(`${itemKey}#${rawChunkIndex}`) : void 0;
+      target.append(renderCitationLink(itemKey, entry, rawChunkIndex));
+      cursor = match.index + match[0].length;
+    }
+    if (cursor < source.length) {
+      target.append(document.createTextNode(source.slice(cursor)));
+    }
+  }
+  function renderCitationLink(itemKey, entry, rawChunkIndex) {
+    const link = document.createElement("a");
+    link.dataset.itemKey = itemKey;
+    if (entry !== void 0) {
+      if (rawChunkIndex !== void 0) {
+        link.dataset.chunkIndex = rawChunkIndex;
+      }
+      if (entry.attachmentKey !== void 0) {
+        link.dataset.attachmentKey = entry.attachmentKey;
+      }
+      if (typeof entry.pageIndex === "number") {
+        link.dataset.pageIndex = String(entry.pageIndex);
+      }
+    }
+    link.setAttribute("href", "#");
+    link.setAttribute("style", `color: ${ACCENT}; text-decoration: underline; cursor: pointer;`);
+    link.textContent = itemKey;
+    return link;
+  }
+  function wireLibraryChatView(input) {
+    const { view, onSubmit, onReset, onCitationClick } = input;
+    const form = view.querySelector(".zotero-ai-library-chat__form");
+    const textarea = view.querySelector('[name="question"]');
+    const reset = view.querySelector('[data-action="new-conversation"]');
+    const handleSubmit = (event) => {
+      event.preventDefault();
+      const value = textarea?.value ?? "";
+      const trimmed = value.trim();
+      if (trimmed.length === 0) {
+        return;
+      }
+      if (textarea) {
+        textarea.value = "";
+      }
+      void onSubmit(trimmed);
+    };
+    const handleReset = () => {
+      onReset();
+    };
+    const handleClick = (event) => {
+      const target = event.target;
+      if (target === null) return;
+      const link = target.closest("a[data-item-key]");
+      if (link === null) return;
+      event.preventDefault();
+      const key = link.dataset.itemKey ?? "";
+      if (key.length === 0) {
+        return;
+      }
+      const attachmentKey = link.dataset.attachmentKey;
+      const rawPageIndex = link.dataset.pageIndex;
+      const pageIndex = rawPageIndex !== void 0 && /^\d+$/u.test(rawPageIndex) ? Number(rawPageIndex) : void 0;
+      onCitationClick({
+        itemKey: key,
+        ...attachmentKey !== void 0 ? { attachmentKey } : {},
+        ...pageIndex !== void 0 ? { pageIndex } : {}
+      });
+    };
+    const handleKeydown = (event) => {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        form?.requestSubmit();
+      }
+    };
+    form?.addEventListener("submit", handleSubmit);
+    reset?.addEventListener("click", handleReset);
+    view.addEventListener("click", handleClick);
+    textarea?.addEventListener("keydown", handleKeydown);
+    return () => {
+      form?.removeEventListener("submit", handleSubmit);
+      reset?.removeEventListener("click", handleReset);
+      view.removeEventListener("click", handleClick);
+      textarea?.removeEventListener("keydown", handleKeydown);
+    };
+  }
+  function buildLibraryPrompt(input) {
+    const excerpts = input.chunks.length === 0 ? "(no excerpts available)" : input.chunks.map((c) => {
+      const token = typeof c.chunkIndex === "number" ? `[${c.itemKey}#${String(c.chunkIndex)}]` : `[${c.itemKey}]`;
+      return `${token} ${c.text}`;
+    }).join("\n\n");
+    return `You are answering questions using only the excerpts below from the user's Zotero library.
+Each excerpt is labelled with a token of the form [itemKey#chunkIndex]. Cite the exact
+token in square brackets after each claim, e.g. "X is true [ABCD1234#3]".
+If the excerpts don't contain enough information, say so directly.
+
+Excerpts:
+${excerpts}
+
+Question: ${input.question}`;
+  }
+
+  // src/platform/e2e-driver.ts
   init_settings_view();
 
   // src/ui/sidebar-view.ts
@@ -3445,6 +4272,8 @@ ${para}`;
       "style",
       `display: flex; flex-direction: column; height: 100%; font-family: ${FONT_STACK};`
     );
+    const styleTag = document.createElement("style");
+    styleTag.textContent = MARKDOWN_CSS;
     const header = document.createElement("header");
     header.className = "zotero-ai-explain-sidebar__header";
     header.setAttribute(
@@ -3483,7 +4312,7 @@ ${para}`;
       "list-style: none; margin: 0; padding: 12px 16px; flex: 1 1 auto; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;"
     );
     for (const message of input.messages) {
-      messages.append(renderMessage(message));
+      messages.append(renderMessage2(message));
     }
     const form = document.createElement("form");
     form.className = "zotero-ai-explain-sidebar__form";
@@ -3503,10 +4332,10 @@ ${para}`;
     send.setAttribute("style", `${BUTTON_PRIMARY_STYLE} align-self: flex-end;`);
     applyFocusRing(send);
     form.append(followUp, send);
-    element.append(header, messages, form);
+    element.append(styleTag, header, messages, form);
     return element;
   }
-  function renderMessage(message) {
+  function renderMessage2(message) {
     const row = document.createElement("li");
     row.dataset.role = message.role;
     row.setAttribute("style", "display: flex; flex-direction: column; gap: 2px;");
@@ -3523,6 +4352,8 @@ ${para}`;
   // src/platform/e2e-driver.ts
   var TRIGGER_PREF = "extensions.zotero-ai-explain.e2e-trigger";
   var SAMPLE_PDF_PREF = "extensions.zotero-ai-explain.e2e-sample-pdf";
+  var MULTIPAGE_PDF_PREF = "extensions.zotero-ai-explain.e2e-multipage-pdf";
+  var CORRUPT_PDF_PREF = "extensions.zotero-ai-explain.e2e-corrupt-pdf";
   var currentReaderIframeDoc = null;
   var currentReaderInstance = null;
   var currentReaderAttachmentItemID = null;
@@ -3538,13 +4369,19 @@ ${para}`;
     log("trigger", trigger);
     try {
       let preludeReady = true;
-      if (trigger === "all" || trigger === "real-pdf-setup") {
+      if (trigger === "all" || trigger === "real-pdf-setup" || trigger === "pdfworker-smoke") {
         const { readyOk } = await runRealPdfSetupFlow(deps, log);
         preludeReady = readyOk;
       }
       if (!preludeReady) {
         log("done", "error");
         return;
+      }
+      if (trigger === "all" || trigger === "pdfworker-smoke") {
+        await runPdfWorkerSmokeFlow(deps, log);
+      }
+      if (trigger === "all" || trigger === "migration-resume") {
+        await runMigrationResumeFlow(deps, log);
       }
       if (trigger === "all" || trigger === "settings") {
         runSettingsFlow(deps, log);
@@ -3554,6 +4391,12 @@ ${para}`;
       }
       if (trigger === "all" || trigger === "explain") {
         await runExplainFlow(deps, log);
+      }
+      if (trigger === "all" || trigger === "ask-question") {
+        await runAskQuestionFlow(deps, log);
+      }
+      if (trigger === "all" || trigger === "citation-jump") {
+        await runCitationJumpFlow(deps, log);
       }
       if (trigger === "all" || trigger === "sidebar-followup") {
         await runSidebarFlow(deps, log);
@@ -3662,6 +4505,143 @@ ${para}`;
     }
     return false;
   }
+  function pdfPrefix(text) {
+    return text.slice(0, 20).replace(/[\n\r\f]/gu, " ");
+  }
+  async function importPdfAttachment(zotero, path, title) {
+    const parent = new zotero.Item("book");
+    parent.setField("title", `E2E ${title} parent`);
+    const parentID = await parent.saveTx();
+    const attachment = await zotero.Attachments.importFromFile({
+      file: zotero.File.pathToFile(path),
+      parentItemID: parentID,
+      title
+    });
+    return attachment.id;
+  }
+  async function logPdfFullText(pdfWorker, attachmentID, keyPrefix, log) {
+    const result = await pdfWorker.getFullText(attachmentID);
+    const pages = result.text.split("\f");
+    log(`${keyPrefix}:totalPages`, String(result.totalPages));
+    log(`${keyPrefix}:extractedPages`, String(result.extractedPages));
+    log(`${keyPrefix}:formFeedCount`, String((result.text.match(/\f/gu) ?? []).length));
+    log(`${keyPrefix}:splitLength`, String(pages.length));
+    log(`${keyPrefix}:firstPagePrefix`, pdfPrefix(pages[0] ?? ""));
+    log(`${keyPrefix}:lastPagePrefix`, pdfPrefix(pages.at(-1) ?? ""));
+  }
+  async function runPdfWorkerSmokeFlow(deps, log) {
+    log("phase", "pdfworker-smoke:start");
+    const zotero = deps.zotero;
+    const pdfWorker = zotero.PDFWorker;
+    if (pdfWorker === void 0 || typeof pdfWorker.getFullText !== "function") {
+      log("pdfworker:error", "no-pdfworker-getfulltext-api");
+      log("phase", "pdfworker-smoke:done");
+      return;
+    }
+    const attachmentID = currentReaderAttachmentItemID;
+    if (attachmentID === null) {
+      log("pdfworker:error", "no-sample-attachment");
+      log("phase", "pdfworker-smoke:done");
+      return;
+    }
+    try {
+      await logPdfFullText(pdfWorker, attachmentID, "pdfworker", log);
+    } catch (err) {
+      log("pdfworker:error", err instanceof Error ? err.message : String(err));
+      log("phase", "pdfworker-smoke:done");
+      return;
+    }
+    const multipagePath = deps.prefs.get(MULTIPAGE_PDF_PREF)?.trim();
+    if (multipagePath !== void 0 && multipagePath.length > 0) {
+      try {
+        const id = await importPdfAttachment(zotero, multipagePath, "multipage.pdf");
+        await logPdfFullText(pdfWorker, id, "pdfworker:multipage", log);
+      } catch (err) {
+        log("pdfworker:multipage:error", err instanceof Error ? err.message : String(err));
+      }
+    }
+    const corruptPath = deps.prefs.get(CORRUPT_PDF_PREF)?.trim();
+    if (corruptPath !== void 0 && corruptPath.length > 0) {
+      try {
+        const id = await importPdfAttachment(zotero, corruptPath, "corrupt.pdf");
+        const result = await pdfWorker.getFullText(id);
+        log("pdfworker:corrupt:rejected", "false");
+        log("pdfworker:corrupt:unexpected-totalPages", String(result.totalPages));
+      } catch (err) {
+        log("pdfworker:corrupt:rejected", "true");
+        log("pdfworker:corrupt:error", err instanceof Error ? err.message : String(err));
+      }
+    }
+    log("phase", "pdfworker-smoke:done");
+  }
+  function legacyMigrationFixture() {
+    return {
+      items: {
+        LEGACYE2E: {
+          title: "Legacy E2E Paper",
+          chunks: [{ text: "legacy chunk body", embedding: [0.1, 0.2, 0.3] }]
+        }
+      },
+      indexedAt: "2026-05-01T00:00:00.000Z"
+    };
+  }
+  async function runMigrationResumeFlow(deps, log) {
+    log("phase", "migration-resume:start");
+    const harness = deps.migrationHarness;
+    if (harness === void 0) {
+      log("migration:error", "no-migration-harness");
+      log("phase", "migration-resume:done");
+      return;
+    }
+    let primaryWritePath = null;
+    let seedComplete = false;
+    let primaryWrittenInPlace = false;
+    const spyIo = {
+      readString: (p) => harness.io.readString(p),
+      async writeString(p, contents) {
+        if (seedComplete && p === primaryWritePath) {
+          primaryWrittenInPlace = true;
+        }
+        await harness.io.writeString(p, contents);
+      },
+      remove: (p) => harness.io.remove(p),
+      exists: (p) => harness.io.exists(p),
+      rename: (src, dst) => harness.io.rename(src, dst),
+      // AC-12: forward `stat` to the harness io adapter so the in-memory
+      // index cache's fingerprint works under the e2e harness.
+      stat: (p) => harness.io.stat(p)
+    };
+    const storage = createIndexStorage({
+      zotero: { DataDirectory: { dir: harness.dataDir } },
+      io: spyIo,
+      embedProvider: harness.embedProvider
+    });
+    primaryWritePath = storage.path();
+    try {
+      await storage.write(legacyMigrationFixture());
+      seedComplete = true;
+      const before = await storage.readWithMigration();
+      log("migration:pending-before", String(before.migrationPending));
+      log("migration:schema-before", String(before.file?.schemaVersion ?? "legacy"));
+      const controller = createIndexingController({
+        logger: deps.zotero,
+        zotero: harness.crawlerZotero,
+        provider: harness.crawlerProvider,
+        settings: harness.crawlerSettings,
+        storage
+      });
+      await controller.hydrate();
+      log("migration:ran", String(before.migrationPending));
+      const after = await storage.readWithMigration();
+      log("migration:schema-after", String(after.file?.schemaVersion ?? "missing"));
+      log("migration:marker-after", String(await storage.hasMarker()));
+      log("migration:pending-after", String(after.migrationPending));
+      log("migration:primary-mutated-in-place", String(primaryWrittenInPlace));
+    } catch (err) {
+      log("migration:error", err instanceof Error ? err.message : String(err));
+    }
+    log("phase", "migration-resume:done");
+  }
   async function runRealPdfTeardownFlow(deps, log) {
     log("phase", "real-pdf-teardown:start");
     const id = currentReaderAttachmentItemID;
@@ -3703,21 +4683,22 @@ ${para}`;
       indexStatus: deps.indexingController.getStatus()
     });
     const detach = attachIndexControls(view, deps.indexingController);
-    deps.ui.openDialog("Zotero AI Explain", view);
+    const dialogHandle = deps.ui.openDialog("Zotero AI Explain", view);
     const document2 = getDocument(deps.zotero);
     const backdrop = document2?.querySelector(".zotero-ai-dialog-backdrop");
-    const dialog = document2?.querySelector(".zotero-ai-dialog");
-    const present = backdrop !== null && backdrop !== void 0 && dialog !== null && dialog !== void 0;
-    log("settings:backdrop-present", String(backdrop !== null && backdrop !== void 0));
-    log("settings:dialog-present", String(dialog !== null && dialog !== void 0));
+    const dialog = view.closest(".zotero-ai-dialog");
+    const backdropPresent = backdrop !== null && backdrop !== void 0;
+    const dialogPresent = dialog !== null;
+    const present = backdropPresent && dialogPresent;
+    log("settings:backdrop-present", String(backdropPresent));
+    log("settings:dialog-present", String(dialogPresent));
     log("settings:dialog-rendered", String(present));
-    const baseUrlInput = document2?.querySelector('[name="baseUrl"]');
+    const baseUrlInput = view.querySelector('[name="baseUrl"]');
     log("settings:baseUrl-value", baseUrlInput?.value ?? "<missing>");
     log("settings:base-url-input", baseUrlInput?.value ?? "<missing>");
-    const chatInput = document2?.querySelector('[name="chatModel"]');
+    const chatInput = view.querySelector('[name="chatModel"]');
     log("settings:chatModel-value", chatInput?.value ?? "<missing>");
-    const close = document2?.querySelector('[data-action="close-dialog"]');
-    close?.click();
+    dialogHandle.close();
     detach();
     log("phase", "settings:done");
   }
@@ -3728,16 +4709,15 @@ ${para}`;
       indexStatus: deps.indexingController.getStatus()
     });
     const detach = attachIndexControls(view, deps.indexingController);
-    deps.ui.openDialog("Zotero AI Explain", view);
-    const document2 = getDocument(deps.zotero);
-    const summary = document2?.querySelector(".zotero-ai-index-controls__summary");
+    const dialog = deps.ui.openDialog("Zotero AI Explain", view);
+    const summary = view.querySelector(".zotero-ai-index-controls__summary");
     log("index:summary-before", summary?.textContent ?? "<missing>");
-    const startBtn = document2?.querySelector('[data-action="start-index"]');
+    const startBtn = view.querySelector('[data-action="start-index"]');
     startBtn?.click();
     log("index:started", "true");
     log("index:summary-after-start", summary?.textContent ?? "<missing>");
     log("index:status-after-start", deps.indexingController.getStatus().state);
-    const pauseBtn = document2?.querySelector('[data-action="pause-index"]');
+    const pauseBtn = view.querySelector('[data-action="pause-index"]');
     pauseBtn?.click();
     await waitFor(
       () => {
@@ -3749,7 +4729,7 @@ ${para}`;
     );
     log("index:summary-after-pause", summary?.textContent ?? "<missing>");
     log("index:status-after-pause", deps.indexingController.getStatus().state);
-    const resumeBtn = document2?.querySelector('[data-action="resume-index"]');
+    const resumeBtn = view.querySelector('[data-action="resume-index"]');
     resumeBtn?.click();
     log("index:summary-after-resume", summary?.textContent ?? "<missing>");
     log("index:status-after-resume", deps.indexingController.getStatus().state);
@@ -3758,7 +4738,8 @@ ${para}`;
       8e3,
       50
     );
-    const clearBtn = document2?.querySelector('[data-action="clear-index"]');
+    const clearBtn = view.querySelector('[data-action="clear-index"]');
+    clearBtn?.click();
     clearBtn?.click();
     await waitFor(() => deps.indexingController.getStatus().state === "idle", 2e3, 50);
     log("index:summary-after-clear", summary?.textContent ?? "<missing>");
@@ -3767,8 +4748,7 @@ ${para}`;
     await waitFor(() => deps.indexingController.getStatus().state === "complete", 1e4, 50);
     log("index:final-status", deps.indexingController.getStatus().state);
     log("index:final-summary", summary?.textContent ?? "<missing>");
-    const close = document2?.querySelector('[data-action="close-dialog"]');
-    close?.click();
+    dialog.close();
     detach();
     log("phase", "index:done");
   }
@@ -3781,7 +4761,7 @@ ${para}`;
         itemTitle: "E2E Source",
         attachmentKey: "e2e-attach",
         pageLabel: "1",
-        location: "page=1"
+        pageIndex: 0
       },
       anchor: null
     };
@@ -3819,6 +4799,255 @@ ${para}`;
     popupUnsubscribe();
     popupUnmount();
     log("phase", "explain:done");
+  }
+  async function runAskQuestionFlow(deps, log) {
+    log("phase", "ask-question:start");
+    const askSelectionText = "Ask-question selected passage.";
+    const { iframeDoc, buttonHost } = dispatchRealReaderEvent(deps, log, {
+      phase: "ask-question",
+      selectionText: askSelectionText,
+      buttonContainerStyle: "position: absolute; left: 70px; top: 200px;"
+    });
+    if (iframeDoc === null || buttonHost === null) {
+      log("phase", "ask-question:done");
+      return;
+    }
+    const askButton = buttonHost.querySelector("button[data-action='ask-question']");
+    log("ask-question:command-present", String(askButton !== null));
+    if (askButton === null) {
+      log("ask-question:error", "no-ask-button-captured");
+      buttonHost.remove();
+      log("phase", "ask-question:done");
+      return;
+    }
+    askButton.click();
+    const chromeDoc = getDocument(deps.zotero);
+    if (chromeDoc === null) {
+      log("ask-question:error", "no-chrome-doc");
+      buttonHost.remove();
+      log("phase", "ask-question:done");
+      return;
+    }
+    const wrapper = await waitForPopup(chromeDoc, 5e3);
+    log("ask-question:popup-mounted", String(wrapper !== null));
+    if (wrapper === null) {
+      buttonHost.remove();
+      log("phase", "ask-question:done");
+      return;
+    }
+    const quoteBlock = wrapper.querySelector(".zotero-ai-explain-popup__quote");
+    log("ask-question:quote-block-text", (quoteBlock?.textContent ?? "").trim());
+    const askTextarea = findFollowUpTextarea(wrapper);
+    await waitForCondition(() => chromeDoc.activeElement === askTextarea, 2e3, chromeDoc);
+    log("ask-question:textarea-focused", String(chromeDoc.activeElement === askTextarea));
+    const autoStreamed = (wrapper.querySelector(".zotero-ai-explain-popup__body")?.textContent ?? "").trim().length > 0 || wrapper.querySelector("[data-role='assistant']") !== null;
+    log("ask-question:auto-streamed", String(autoStreamed));
+    let emptySubmitRejected = true;
+    if (askTextarea !== null) {
+      askTextarea.value = "";
+      const form = askTextarea.closest("form");
+      if (form !== null) {
+        const win = chromeDoc.defaultView;
+        const EventCtor = win?.Event ?? globalThis.Event;
+        form.dispatchEvent(new EventCtor("submit", { bubbles: true, cancelable: true }));
+      }
+      await waitFor(() => false, 300, 50);
+      const liveWrapper = findPopupWrapper(chromeDoc);
+      emptySubmitRejected = liveWrapper === null || (liveWrapper.querySelector(".zotero-ai-explain-popup__body")?.textContent ?? "").trim().length === 0 && liveWrapper.querySelector("[data-role='assistant']") === null;
+    }
+    log("ask-question:empty-submit-rejected", String(emptySubmitRejected));
+    findPopupWrapper(chromeDoc)?.remove();
+    buttonHost.remove();
+    const emptyEvent = dispatchRealReaderEvent(deps, log, {
+      phase: "ask-question-empty",
+      selectionText: "",
+      buttonContainerStyle: "position: absolute; left: 70px; top: 260px;"
+    });
+    const emptyHost = emptyEvent.buttonHost;
+    const hiddenWhenNoSelection = (emptyHost?.querySelector("button[data-action='ask-question']") ?? null) === null;
+    log("ask-question:hidden-when-no-selection", String(hiddenWhenNoSelection));
+    emptyHost?.remove();
+    const selection = {
+      quote: askSelectionText,
+      source: {
+        itemKey: "e2e-ask-item",
+        itemTitle: "E2E Ask Source",
+        attachmentKey: "e2e-ask-attach",
+        pageLabel: "1"
+      },
+      anchor: null
+    };
+    const conversation = deps.store.createFromSelection(selection, deps.profile());
+    deps.store.appendSystemMessage(
+      conversation.id,
+      `The user is asking about this quoted passage: "${selection.quote}"`
+    );
+    await deps.popupController.sendFollowUp(
+      conversation.id,
+      `Quote: "${selection.quote}"
+
+Question: First question about the passage?`
+    );
+    const afterFirst = deps.store.get(conversation.id);
+    const firstTurn = afterFirst?.messages.find((m) => m.role === "user")?.content ?? "<missing>";
+    log("ask-question:first-turn", firstTurn.replace(/[\n\r]/gu, " "));
+    for (let turn = 2; turn <= 5; turn += 1) {
+      await deps.popupController.sendFollowUp(conversation.id, `Follow-up question ${String(turn)}?`);
+    }
+    const afterFive = deps.store.get(conversation.id);
+    const systemFrame = afterFive?.messages.find((m) => m.role === "system")?.content ?? "";
+    const userTurnCount = afterFive?.messages.filter((m) => m.role === "user").length ?? 0;
+    log(
+      "ask-question:turn5-has-quote",
+      String(userTurnCount >= 5 && systemFrame.includes(selection.quote))
+    );
+    log("phase", "ask-question:done");
+  }
+  function classifyReaderOpenArg(location) {
+    if (location === void 0 || location === null) {
+      return "none";
+    }
+    if (typeof location === "object" && "location" in location) {
+      return "nested-location";
+    }
+    if (typeof location === "object" && "pageIndex" in location) {
+      return "positional";
+    }
+    return "none";
+  }
+  async function runCitationJumpFlow(deps, log) {
+    log("phase", "citation-jump:start");
+    const attachmentID = currentReaderAttachmentItemID;
+    if (attachmentID === null) {
+      log("citation-jump:error", "no-sample-attachment");
+      log("phase", "citation-jump:done");
+      return;
+    }
+    const zotero = deps.zotero;
+    let citedItemKey = null;
+    let attachmentKey = null;
+    try {
+      const attachmentItem = zotero.Items.get(attachmentID);
+      attachmentKey = attachmentItem?.key ?? null;
+      const parentID = attachmentItem?.parentItemID;
+      if (typeof parentID === "number") {
+        citedItemKey = zotero.Items.get(parentID)?.key ?? null;
+      } else {
+        citedItemKey = attachmentKey;
+      }
+    } catch (err) {
+      log("citation-jump:error", err instanceof Error ? err.message : String(err));
+      log("phase", "citation-jump:done");
+      return;
+    }
+    if (citedItemKey === null || !/^[A-Z0-9]{8}$/u.test(citedItemKey)) {
+      log("citation-jump:error", `bad-item-key:${citedItemKey ?? "null"}`);
+      log("phase", "citation-jump:done");
+      return;
+    }
+    const reader = zotero.Reader;
+    const realOpen = reader.open.bind(reader);
+    const captured = [];
+    const wrappedReader = {
+      open: (id, location) => {
+        const argShape = classifyReaderOpenArg(location);
+        const pageIndex = argShape === "positional" && typeof location === "object" && location !== null ? location.pageIndex : void 0;
+        captured.push({ attachmentId: id, pageIndex, argShape });
+        return realOpen(id, location);
+      }
+    };
+    const citationZotero = {
+      Items: zotero.Items,
+      Libraries: zotero.Libraries,
+      Reader: wrappedReader
+    };
+    const chunk0Page = 2;
+    const chunk1Page = 17;
+    const retrieved = [
+      {
+        itemKey: citedItemKey,
+        title: "E2E Sample PDF",
+        text: "Chunk zero body on an early page.",
+        score: 0.99,
+        chunkIndex: 0,
+        pageIndex: chunk0Page,
+        sourceKind: "pdf-page",
+        ...attachmentKey !== null ? { attachmentKey } : {}
+      },
+      {
+        itemKey: citedItemKey,
+        title: "E2E Sample PDF",
+        text: "Chunk one body on a much later page.",
+        score: 0.95,
+        chunkIndex: 1,
+        pageIndex: chunk1Page,
+        sourceKind: "pdf-page",
+        ...attachmentKey !== null ? { attachmentKey } : {}
+      }
+    ];
+    const prompt = buildLibraryPrompt({ question: "What does the sample cover?", chunks: retrieved });
+    const label0 = `[${citedItemKey}#0]`;
+    const label1 = `[${citedItemKey}#1]`;
+    const distinctLabels = prompt.includes(label0) && prompt.includes(label1) && label0 !== label1;
+    log("citation-jump:prompt-has-distinct-labels", String(distinctLabels));
+    const lookup = buildCitationLookup(retrieved);
+    const onCitationClick = (citation) => {
+      openCitationInReader(citation, citationZotero);
+    };
+    const renderAndClick = (assistantContent, turnLookup) => {
+      const view = renderLibraryChatView({
+        messages: [{ role: "assistant", content: assistantContent }],
+        status: "completed",
+        errorMessage: null,
+        hasIndex: true,
+        citationLookups: /* @__PURE__ */ new Map([[0, turnLookup]])
+      });
+      const detach = wireLibraryChatView({
+        view,
+        onSubmit: () => Promise.resolve(),
+        onReset: () => void 0,
+        onCitationClick
+      });
+      for (const link of Array.from(view.querySelectorAll("a[data-item-key]"))) {
+        link.click();
+      }
+      detach();
+    };
+    renderAndClick(`Claim zero ${label0}. Claim one ${label1}.`, lookup);
+    await waitFor(() => false, 400, 100);
+    const chunk0Call = captured.find((c) => c.pageIndex === chunk0Page);
+    const chunk1Call = captured.find((c) => c.pageIndex === chunk1Page);
+    log("citation-jump:chunk0-page", String(chunk0Call?.pageIndex ?? "undefined"));
+    log("citation-jump:chunk0-arg-shape", chunk0Call?.argShape ?? "none");
+    log("citation-jump:chunk1-page", String(chunk1Call?.pageIndex ?? "undefined"));
+    const sameAttachment = chunk0Call !== void 0 && chunk0Call.attachmentId === chunk1Call?.attachmentId;
+    const readerTabCount = reader._readers.filter((r) => r.itemID === attachmentID).length;
+    log("citation-jump:same-tab-navigated", String(sameAttachment && readerTabCount === 1));
+    log("citation-jump:reader-tab-count", String(readerTabCount));
+    const noPageChunk = {
+      itemKey: citedItemKey,
+      title: "E2E Sample PDF",
+      text: "Metadata chunk with no page.",
+      score: 0.9,
+      chunkIndex: 0,
+      sourceKind: "metadata"
+    };
+    const noPageLookup = buildCitationLookup([noPageChunk]);
+    captured.length = 0;
+    renderAndClick(`Legacy-style claim [${citedItemKey}#0].`, noPageLookup);
+    const noPageCall = captured.at(-1);
+    log("citation-jump:nolocation-open", String(noPageCall?.argShape === "none"));
+    log(
+      "citation-jump:nolocation-page-arg",
+      noPageCall?.pageIndex === void 0 ? "absent" : String(noPageCall.pageIndex)
+    );
+    const wrongKey = "WRONGKEY";
+    captured.length = 0;
+    renderAndClick(`Hallucinated cite [${wrongKey}#0].`, lookup);
+    const hallucinatedCall = captured.at(-1);
+    const routedToChunk0 = hallucinatedCall?.attachmentId === attachmentID && hallucinatedCall.pageIndex === chunk0Page;
+    log("citation-jump:hallucinated-routed-to-chunk0", String(routedToChunk0));
+    log("phase", "citation-jump:done");
   }
   async function runSidebarFlow(deps, log) {
     log("phase", "sidebar:start");
@@ -4393,15 +5622,13 @@ ${para}`;
       indexStatus: deps.indexingController.getStatus()
     });
     const detach = attachIndexControls(view, deps.indexingController);
-    deps.ui.openDialog("Zotero AI Explain", view);
-    const document2 = getDocument(deps.zotero);
-    const dialog = document2?.querySelector(".zotero-ai-dialog");
+    const dialogHandle = deps.ui.openDialog("Zotero AI Explain", view);
+    const dialog = view.closest(".zotero-ai-dialog");
     const text = dialog?.textContent ?? "";
     log("honest-indexing:dialog-present", String(dialog !== null));
     log("honest-indexing:contains-phase2", String(/Phase ?2/iu.test(text)));
     log("honest-indexing:contains-not-yet-implemented", String(/not yet implemented/iu.test(text)));
-    const close = document2?.querySelector('[data-action="close-dialog"]');
-    close?.click();
+    dialogHandle.close();
     detach();
     log("phase", "honest-indexing:done");
   }
@@ -5106,7 +6333,7 @@ ${para}`;
 
   // src/conversation/library-conversation-store.ts
   function initialState() {
-    return { status: "idle", messages: [], errorMessage: null };
+    return { status: "idle", messages: [], errorMessage: null, citationLookups: /* @__PURE__ */ new Map() };
   }
   function createLibraryConversationStore() {
     let state = initialState();
@@ -5159,6 +6386,11 @@ ${para}`;
       reset() {
         set(initialState());
       },
+      attachCitationLookup(messageIndex, lookup) {
+        const next = new Map(state.citationLookups);
+        next.set(messageIndex, lookup);
+        set({ ...state, citationLookups: next });
+      },
       subscribe(listener) {
         listeners.add(listener);
         return () => {
@@ -5199,17 +6431,33 @@ ${para}`;
     }
     return dot / (Math.sqrt(normA) * Math.sqrt(normB));
   }
-  function topKChunks(indexFile, queryEmbedding, k) {
+  function topKChunks(indexFile, queryEmbedding, k, options) {
     if (k <= 0) return [];
+    const scopedItemKey = options?.scopedItemKey;
     const scored = [];
     for (const [itemKey, item] of Object.entries(indexFile.items)) {
+      if (scopedItemKey !== void 0 && itemKey !== scopedItemKey) {
+        continue;
+      }
       for (const chunk of item.chunks) {
         const score = cosineSimilarity(queryEmbedding, chunk.embedding);
-        scored.push({ itemKey, title: item.title, text: chunk.text, score });
+        scored.push({
+          itemKey,
+          title: item.title,
+          text: chunk.text,
+          score,
+          // Provenance carried verbatim from the index chunk. `sourceKind`
+          // is always present (required on `IndexedItemChunk`); `pageIndex`/
+          // `attachmentKey` are optional, attached only when supplied.
+          // `pageIndex: 0` is preserved — only attach when it is a number.
+          sourceKind: chunk.sourceKind,
+          ...typeof chunk.pageIndex === "number" ? { pageIndex: chunk.pageIndex } : {},
+          ...chunk.attachmentKey !== void 0 ? { attachmentKey: chunk.attachmentKey } : {}
+        });
       }
     }
     scored.sort((x, y) => y.score - x.score);
-    return scored.slice(0, k);
+    return scored.slice(0, k).map((chunk, index) => ({ ...chunk, chunkIndex: index }));
   }
 
   // src/preferences/ollama-profile.ts
@@ -5360,247 +6608,6 @@ ${para}`;
 
   // src/platform/zotero-runtime.ts
   init_index_controls_view();
-
-  // src/ui/library-chat-view.ts
-  init_styles();
-  var CITATION_PATTERN = /\[([A-Za-z0-9_]{3,32})\]/gu;
-  var MESSAGES_STYLE = "list-style: none; margin: 0; padding: 12px 16px; flex: 1 1 auto; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;";
-  function renderLibraryChatView(input) {
-    const root = document.createElement("aside");
-    root.className = "zotero-ai-library-chat";
-    root.setAttribute(
-      "style",
-      `display: flex; flex-direction: column; min-height: 360px; max-height: 70vh; font-family: ${FONT_STACK}; color: ${FG};`
-    );
-    const styleTag = document.createElement("style");
-    styleTag.textContent = `
-    @keyframes zotero-ai-library-chat-pulse {
-      0%, 80%, 100% { opacity: 0.2; transform: scale(0.85); }
-      40% { opacity: 1; transform: scale(1); }
-    }
-    .zotero-ai-library-chat__streaming { display: inline-flex; align-items: center; gap: 4px; }
-    .zotero-ai-library-chat__streaming-dot {
-      display: inline-block; width: 5px; height: 5px; margin: 0 2px;
-      border-radius: 50%; background: currentColor; vertical-align: middle;
-      animation: zotero-ai-library-chat-pulse 1.2s infinite ease-in-out;
-    }
-    .zotero-ai-library-chat__streaming-dot:nth-child(2) { animation-delay: 0.15s; }
-    .zotero-ai-library-chat__streaming-dot:nth-child(3) { animation-delay: 0.3s; }
-    .zotero-ai-library-chat__messages li[data-role] {
-      list-style: none;
-      max-width: 88%;
-      padding: 8px 12px;
-      border-radius: 12px;
-      line-height: 1.45;
-    }
-    .zotero-ai-library-chat__messages li[data-role="assistant"] {
-      align-self: flex-start;
-      background: rgba(127, 127, 127, 0.15);
-      border-bottom-left-radius: 4px;
-    }
-    .zotero-ai-library-chat__messages li[data-role="user"] {
-      align-self: flex-end;
-      background: rgba(64, 128, 255, 0.22);
-      border-bottom-right-radius: 4px;
-    }
-    .zotero-ai-library-chat__role {
-      /* Role is communicated by side + colour; the text label is redundant. */
-      display: none;
-    }
-  `;
-    root.append(styleTag);
-    const header = document.createElement("header");
-    header.className = "zotero-ai-library-chat__header";
-    header.setAttribute(
-      "style",
-      `padding: 10px 16px; background: ${TOOLBAR_BG}; border-bottom: 1px solid ${BORDER_HAIRLINE}; display: flex; align-items: center; justify-content: space-between; gap: 8px;`
-    );
-    const title = document.createElement("h2");
-    title.textContent = "Ask your library";
-    title.setAttribute("style", "margin: 0; font-size: 14px; font-weight: 600;");
-    const reset = document.createElement("button");
-    reset.type = "button";
-    reset.dataset.action = "new-conversation";
-    reset.textContent = "New conversation";
-    reset.setAttribute("style", BUTTON_BASE_STYLE);
-    applyFocusRing(reset);
-    header.append(title, reset);
-    const messages = document.createElement("ol");
-    messages.className = "zotero-ai-library-chat__messages";
-    messages.setAttribute("style", MESSAGES_STYLE);
-    if (input.messages.length === 0) {
-      messages.append(renderEmptyState(input.hasIndex));
-    } else {
-      for (const message of input.messages) {
-        messages.append(renderMessage2(message));
-      }
-    }
-    if (input.status === "streaming") {
-      messages.append(renderStreamingIndicator());
-    }
-    if (input.status === "failed" && input.errorMessage !== null) {
-      messages.append(renderError(input.errorMessage));
-    }
-    const form = document.createElement("form");
-    form.className = "zotero-ai-library-chat__form";
-    form.setAttribute(
-      "style",
-      `padding: 12px 16px; border-top: 1px solid ${BORDER_HAIRLINE}; background: ${SURFACE_BG}; display: flex; flex-direction: column; gap: 8px;`
-    );
-    const textarea = document.createElement("textarea");
-    textarea.name = "question";
-    textarea.placeholder = "Ask a question about your library\u2026";
-    textarea.setAttribute("style", FIELD_TEXTAREA_STYLE);
-    applyFocusRing(textarea);
-    const submit = document.createElement("button");
-    submit.type = "submit";
-    submit.dataset.action = "submit-question";
-    submit.textContent = "Ask";
-    submit.setAttribute("style", `${BUTTON_PRIMARY_STYLE} align-self: flex-end;`);
-    applyFocusRing(submit);
-    form.append(textarea, submit);
-    root.append(header, messages, form);
-    return root;
-  }
-  function renderEmptyState(hasIndex) {
-    const empty = document.createElement("li");
-    empty.className = "zotero-ai-library-chat__empty";
-    empty.setAttribute(
-      "style",
-      `list-style: none; padding: 16px; text-align: center; color: ${FG_MUTED}; font-size: 12px; line-height: 1.5;`
-    );
-    if (!hasIndex) {
-      empty.textContent = "Index your library first to enable retrieval. Open the settings dialog and click \u201CIndex library\u201D to build the index.";
-    } else {
-      empty.textContent = "Ask a question about your library. Answers cite source items by key in [brackets].";
-    }
-    return empty;
-  }
-  function renderStreamingIndicator() {
-    const li = document.createElement("li");
-    li.className = "zotero-ai-library-chat__streaming";
-    li.setAttribute("style", `font-size: 11px; color: ${FG_MUTED}; font-style: italic;`);
-    const label = document.createElement("span");
-    label.textContent = "Working";
-    const dot1 = document.createElement("span");
-    dot1.className = "zotero-ai-library-chat__streaming-dot";
-    const dot2 = document.createElement("span");
-    dot2.className = "zotero-ai-library-chat__streaming-dot";
-    const dot3 = document.createElement("span");
-    dot3.className = "zotero-ai-library-chat__streaming-dot";
-    li.append(label, dot1, dot2, dot3);
-    return li;
-  }
-  function renderError(message) {
-    const li = document.createElement("li");
-    li.className = "zotero-ai-library-chat__error";
-    li.setAttribute("style", "color: #d70015; font-size: 12px; line-height: 1.4;");
-    li.textContent = message;
-    return li;
-  }
-  function renderMessage2(message) {
-    const row = document.createElement("li");
-    row.dataset.role = message.role;
-    const attribution = document.createElement("span");
-    attribution.className = "zotero-ai-library-chat__role";
-    attribution.setAttribute("style", `font-size: 11px; color: ${FG_MUTED};`);
-    attribution.textContent = `${message.role}: `;
-    const body = document.createElement("div");
-    body.className = "zotero-ai-library-chat__body";
-    body.setAttribute("style", "font-size: 13px; line-height: 1.45; white-space: pre-wrap;");
-    if (message.role === "assistant") {
-      appendWithCitations(body, message.content);
-    } else {
-      body.append(document.createTextNode(message.content));
-    }
-    row.append(attribution, body);
-    return row;
-  }
-  function appendWithCitations(target, source) {
-    CITATION_PATTERN.lastIndex = 0;
-    let cursor = 0;
-    let match;
-    while ((match = CITATION_PATTERN.exec(source)) !== null) {
-      if (match.index > cursor) {
-        target.append(document.createTextNode(source.slice(cursor, match.index)));
-      }
-      const itemKey = match[1] ?? "";
-      target.append(renderCitationLink(itemKey));
-      cursor = match.index + match[0].length;
-    }
-    if (cursor < source.length) {
-      target.append(document.createTextNode(source.slice(cursor)));
-    }
-  }
-  function renderCitationLink(itemKey) {
-    const link = document.createElement("a");
-    link.dataset.itemKey = itemKey;
-    link.setAttribute("href", "#");
-    link.setAttribute("style", `color: ${ACCENT}; text-decoration: underline; cursor: pointer;`);
-    link.textContent = itemKey;
-    return link;
-  }
-  function wireLibraryChatView(input) {
-    const { view, onSubmit, onReset, onCitationClick } = input;
-    const form = view.querySelector(".zotero-ai-library-chat__form");
-    const textarea = view.querySelector('[name="question"]');
-    const reset = view.querySelector('[data-action="new-conversation"]');
-    const handleSubmit = (event) => {
-      event.preventDefault();
-      const value = textarea?.value ?? "";
-      const trimmed = value.trim();
-      if (trimmed.length === 0) {
-        return;
-      }
-      if (textarea) {
-        textarea.value = "";
-      }
-      void onSubmit(trimmed);
-    };
-    const handleReset = () => {
-      onReset();
-    };
-    const handleClick = (event) => {
-      const target = event.target;
-      if (target === null) return;
-      const link = target.closest("a[data-item-key]");
-      if (link === null) return;
-      event.preventDefault();
-      const key = link.dataset.itemKey ?? "";
-      if (key.length > 0) {
-        onCitationClick(key);
-      }
-    };
-    const handleKeydown = (event) => {
-      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
-        event.preventDefault();
-        form?.requestSubmit();
-      }
-    };
-    form?.addEventListener("submit", handleSubmit);
-    reset?.addEventListener("click", handleReset);
-    view.addEventListener("click", handleClick);
-    textarea?.addEventListener("keydown", handleKeydown);
-    return () => {
-      form?.removeEventListener("submit", handleSubmit);
-      reset?.removeEventListener("click", handleReset);
-      view.removeEventListener("click", handleClick);
-      textarea?.removeEventListener("keydown", handleKeydown);
-    };
-  }
-  function buildLibraryPrompt(input) {
-    const excerpts = input.chunks.length === 0 ? "(no excerpts available)" : input.chunks.map((c) => `[${c.itemKey}] ${c.text}`).join("\n\n");
-    return `You are answering questions using only the excerpts below from the user's Zotero library.
-Cite the item key in square brackets after each claim, e.g. "X is true [ABCD1234]".
-If the excerpts don't contain enough information, say so directly.
-
-Excerpts:
-${excerpts}
-
-Question: ${input.question}`;
-  }
-
-  // src/platform/zotero-runtime.ts
   init_model_discovery();
   init_settings_view();
   var LIBRARY_CHAT_TOP_K = 8;
@@ -5611,8 +6618,7 @@ Question: ${input.question}`;
         itemKey: null,
         itemTitle: null,
         attachmentKey: null,
-        pageLabel: null,
-        location: null
+        pageLabel: null
       },
       anchor: null
     };
@@ -5623,9 +6629,17 @@ Question: ${input.question}`;
     let currentSettings = deps.settings;
     let currentProviderProfile = deps.providerProfile;
     const fetchImpl = deps.fetch ?? globalThis.fetch;
+    function resolvePageReference(source) {
+      const label = source.pageLabel?.trim();
+      if (label !== void 0 && label.length > 0) {
+        return label;
+      }
+      const pageIndex = source.pageIndex;
+      return typeof pageIndex === "number" ? String(pageIndex + 1) : void 0;
+    }
     function describeSource(selection) {
       const title = selection.source.itemTitle?.trim();
-      const page = selection.source.pageLabel?.trim();
+      const page = resolvePageReference(selection.source);
       if (title && page) {
         return `${title}, p. ${page}`;
       }
@@ -5637,6 +6651,41 @@ Question: ${input.question}`;
       }
       return "Unknown source";
     }
+    function describeSourceFrame(selection) {
+      const source = selection.source;
+      const title = source.itemTitle?.trim();
+      const itemKey = typeof source.itemKey === "string" ? source.itemKey.trim() : "";
+      const attachmentKey = typeof source.attachmentKey === "string" ? source.attachmentKey.trim() : "";
+      const page = resolvePageReference(source);
+      const lines = [];
+      if (title !== void 0 && title.length > 0) {
+        lines.push(`Document: ${title}`);
+      }
+      if (page !== void 0) {
+        lines.push(`Page: ${page}`);
+      }
+      if (itemKey.length > 0) {
+        lines.push(`Zotero item key: ${itemKey}`);
+      }
+      if (attachmentKey.length > 0) {
+        lines.push(`Zotero attachment key: ${attachmentKey}`);
+      }
+      if (lines.length === 0) {
+        return null;
+      }
+      return `The selected text comes from this source:
+${lines.join("\n")}`;
+    }
+    function withReaderScope(selection) {
+      const itemKey = selection.source.itemKey;
+      if (typeof itemKey !== "string" || itemKey.length === 0) {
+        return selection;
+      }
+      return {
+        ...selection,
+        source: { ...selection.source, scopedItemKey: itemKey }
+      };
+    }
     function firstAssistantMessage(conversation) {
       return conversation.messages.find((message) => message.role === "assistant");
     }
@@ -5647,8 +6696,66 @@ Question: ${input.question}`;
       }
       return conversation.messages.slice(firstAssistantIndex + 1);
     }
-    function startExplain(selection) {
+    function renderPopupConversation(updated, refs) {
+      const firstAssistant = firstAssistantMessage(updated);
+      const followTurns = followUpTurns(updated);
+      const streaming = updated.status === "streaming";
+      const failed = updated.status === "failed" && updated.errorMessage !== null;
+      const trailingAssistantPending = (() => {
+        if (followTurns.length === 0) {
+          return (firstAssistant?.content.length ?? 0) === 0;
+        }
+        const last = followTurns[followTurns.length - 1];
+        if (last === void 0) return false;
+        if (last.role !== "assistant") return true;
+        return last.content.length === 0;
+      })();
+      if (refs.loading !== null) {
+        refs.loading.hidden = !(streaming && trailingAssistantPending);
+      }
+      if (refs.errorBlock !== null && refs.errorMessageEl !== null) {
+        if (failed) {
+          refs.errorMessageEl.textContent = updated.errorMessage;
+          refs.errorBlock.hidden = false;
+        } else {
+          refs.errorBlock.hidden = true;
+          refs.errorMessageEl.textContent = "";
+        }
+      }
+      if (firstAssistant !== void 0 && firstAssistant.content.length > 0) {
+        renderMarkdown(refs.body, firstAssistant.content);
+      } else {
+        renderMarkdown(refs.body, "");
+      }
+      const turnsContainer = refs.turnsContainer;
+      if (turnsContainer !== null) {
+        const fragments = followTurns.map((message) => {
+          const article = turnsContainer.ownerDocument.createElement("article");
+          article.className = `zotero-ai-explain-popup__turn`;
+          article.dataset.role = message.role;
+          article.setAttribute(
+            "style",
+            "margin: 0; font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;"
+          );
+          const attribution = turnsContainer.ownerDocument.createElement("span");
+          attribution.className = "zotero-ai-explain-popup__turn-role";
+          attribution.textContent = `${message.role}: `;
+          const turnBody = turnsContainer.ownerDocument.createElement("div");
+          turnBody.className = "zotero-ai-explain-popup__turn-body";
+          renderMarkdown(turnBody, message.content);
+          article.append(attribution, turnBody);
+          return article;
+        });
+        turnsContainer.replaceChildren(...fragments);
+      }
+    }
+    function startExplain(rawSelection) {
+      const selection = withReaderScope(rawSelection);
       const conversation = deps.store.createFromSelection(selection, deps.profile());
+      const sourceFrame = describeSourceFrame(selection);
+      if (sourceFrame !== null) {
+        deps.store.appendSystemMessage(conversation.id, sourceFrame);
+      }
       deps.store.appendUserMessage(conversation.id, `Explain this: ${selection.quote}`);
       const popup = renderAnchoredPopup({
         disclosure: deps.disclosure(),
@@ -5780,60 +6887,102 @@ Question: ${input.question}`;
         if (body === null) {
           return;
         }
-        const firstAssistant = firstAssistantMessage(updated);
-        const followTurns = followUpTurns(updated);
-        const streaming = updated.status === "streaming";
-        const failed = updated.status === "failed" && updated.errorMessage !== null;
-        const trailingAssistantPending = (() => {
-          if (followTurns.length === 0) {
-            return (firstAssistant?.content.length ?? 0) === 0;
-          }
-          const last = followTurns[followTurns.length - 1];
-          if (last === void 0) return false;
-          if (last.role !== "assistant") return true;
-          return last.content.length === 0;
-        })();
-        if (loading !== null) {
-          loading.hidden = !(streaming && trailingAssistantPending);
-        }
-        if (errorBlock !== null && errorMessageEl !== null) {
-          if (failed) {
-            errorMessageEl.textContent = updated.errorMessage;
-            errorBlock.hidden = false;
-          } else {
-            errorBlock.hidden = true;
-            errorMessageEl.textContent = "";
-          }
-        }
-        if (firstAssistant !== void 0 && firstAssistant.content.length > 0) {
-          renderMarkdown(body, firstAssistant.content);
-        } else {
-          renderMarkdown(body, "");
-        }
-        if (turnsContainer !== null) {
-          const fragments = followTurns.map((message) => {
-            const article = turnsContainer.ownerDocument.createElement("article");
-            article.className = `zotero-ai-explain-popup__turn`;
-            article.dataset.role = message.role;
-            article.setAttribute(
-              "style",
-              "margin: 0; font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;"
-            );
-            const attribution = turnsContainer.ownerDocument.createElement("span");
-            attribution.className = "zotero-ai-explain-popup__turn-role";
-            attribution.textContent = `${message.role}: `;
-            const turnBody = turnsContainer.ownerDocument.createElement("div");
-            turnBody.className = "zotero-ai-explain-popup__turn-body";
-            renderMarkdown(turnBody, message.content);
-            article.append(attribution, turnBody);
-            return article;
-          });
-          turnsContainer.replaceChildren(...fragments);
-        }
+        renderPopupConversation(updated, {
+          body,
+          loading,
+          errorBlock,
+          errorMessageEl,
+          turnsContainer
+        });
       });
       cleanup.push(cleanupExplain);
       void dismissPopup;
       void deps.popupController.explain(conversation.id);
+    }
+    function quoteSystemFrame(quote) {
+      return `The user is asking about this quoted passage: "${quote}"`;
+    }
+    function startAskQuestion(rawSelection) {
+      const selection = withReaderScope(rawSelection);
+      const conversation = deps.store.createFromSelection(selection, deps.profile());
+      deps.store.appendSystemMessage(conversation.id, quoteSystemFrame(selection.quote));
+      const sourceFrame = describeSourceFrame(selection);
+      if (sourceFrame !== null) {
+        deps.store.appendSystemMessage(conversation.id, sourceFrame);
+      }
+      const popup = renderAnchoredPopup({
+        disclosure: deps.disclosure(),
+        anchor: selection.anchor,
+        text: "",
+        mode: "ask-question",
+        quote: selection.quote
+      });
+      const body = popup.querySelector(".zotero-ai-explain-popup__body");
+      const loading = popup.querySelector(".zotero-ai-explain-popup__loading");
+      const errorBlock = popup.querySelector(".zotero-ai-explain-popup__error");
+      const errorMessageEl = popup.querySelector(
+        ".zotero-ai-explain-popup__error-message"
+      );
+      const turnsContainer = popup.querySelector(".zotero-ai-explain-popup__turns");
+      let popupUnmount = null;
+      let popupUnsubscribe = null;
+      const cleanupAsk = () => {
+        popupUnsubscribe?.();
+        popupUnmount?.();
+      };
+      let firstTurnSent = false;
+      const followForm = popup.querySelector(".zotero-ai-explain-popup__form");
+      const followTextarea = popup.querySelector(
+        '.zotero-ai-explain-popup__form [name="followUp"]'
+      );
+      followForm?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const raw = followTextarea?.value ?? "";
+        if (raw.trim().length === 0) {
+          return;
+        }
+        if (followTextarea) {
+          followTextarea.value = "";
+        }
+        if (!firstTurnSent) {
+          firstTurnSent = true;
+          void deps.popupController.sendFollowUp(
+            conversation.id,
+            `Quote: "${selection.quote}"
+
+Question: ${raw.trim()}`
+          );
+          return;
+        }
+        void deps.popupController.sendFollowUp(conversation.id, raw.trim());
+      });
+      followTextarea?.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+          event.preventDefault();
+          followForm?.requestSubmit();
+        }
+      });
+      popupUnmount = deps.ui.mountPopup(popup, {
+        anchor: selection.anchor,
+        onDismiss: () => {
+          popupUnsubscribe?.();
+          popupUnsubscribe = null;
+          popupUnmount = null;
+        }
+      });
+      popupUnsubscribe = deps.store.subscribe(conversation.id, (updated) => {
+        if (body === null) {
+          return;
+        }
+        renderPopupConversation(updated, {
+          body,
+          loading,
+          errorBlock,
+          errorMessageEl,
+          turnsContainer
+        });
+      });
+      cleanup.push(cleanupAsk);
     }
     async function validateSettings(values) {
       if (fetchImpl === void 0) {
@@ -6155,7 +7304,7 @@ Question: ${input.question}`;
         hasIndex
       });
       const dialog = deps.ui.openDialog("Ask your library", root);
-      const handleCitationClick = (itemKey) => {
+      const handleCitationClick = (citation) => {
         const win = deps.zotero?.getMainWindow?.() ?? null;
         const scheduler = win !== null ? win.setTimeout ?? globalThis.setTimeout : globalThis.setTimeout;
         scheduler(() => {
@@ -6164,7 +7313,7 @@ Question: ${input.question}`;
           } catch {
           }
         }, 0);
-        chat.openItem(itemKey);
+        chat.openItem(citation);
       };
       const submit = async (question) => {
         if (currentSubmitToken !== null) {
@@ -6209,6 +7358,10 @@ Question: ${input.question}`;
             store.fail("No indexed content found \u2014 index your library first.");
             return;
           }
+          store.attachCitationLookup(
+            store.getState().messages.length,
+            buildCitationLookup(retrieved)
+          );
           const messages = [
             { role: "user", content: buildLibraryPrompt({ question, chunks: retrieved }) }
           ];
@@ -6306,8 +7459,7 @@ Question: ${input.question}`;
             itemKey: null,
             itemTitle: null,
             attachmentKey: null,
-            pageLabel: null,
-            location: null
+            pageLabel: null
           },
           anchor: rect === null ? null : { left: rect.left + rect.width / 2, top: rect.top + 60, width: 0, height: 0 }
         };
@@ -6353,7 +7505,12 @@ Question: ${input.question}`;
         if (libraryChat !== void 0) {
           cleanup.push(deps.ui.addMenuItem("Ask your library", openLibraryChatDialog));
         }
-        cleanup.push(deps.ui.addReaderCommand("Explain with AI", startExplain));
+        cleanup.push(
+          deps.ui.addReaderCommands([
+            { label: "Explain with AI", mode: "explain", action: startExplain },
+            { label: "Ask a question", mode: "ask-question", action: startAskQuestion }
+          ])
+        );
         cleanup.push(registerKeyboardShortcuts());
         return Promise.resolve();
       },
@@ -6850,12 +8007,20 @@ Question: ${input.question}`;
       id: deps.inner.id,
       displayName: deps.inner.displayName,
       async *streamChat(request, signal) {
-        const augmented = await augmentMessages(request.messages, deps, topK, debug, signal);
+        const scopedItemKey = request.selection.source.scopedItemKey;
+        const augmented = await augmentMessages(
+          request.messages,
+          deps,
+          topK,
+          debug,
+          signal,
+          scopedItemKey
+        );
         yield* deps.inner.streamChat({ ...request, messages: augmented }, signal);
       }
     };
   }
-  async function augmentMessages(messages, deps, topK, debug, signal) {
+  async function augmentMessages(messages, deps, topK, debug, signal, scopedItemKey) {
     const latestUser = findLatestUser(messages);
     if (latestUser === null || latestUser.length === 0) return messages;
     let file;
@@ -6884,7 +8049,12 @@ Question: ${input.question}`;
     if (queryEmbedding === void 0) return messages;
     let retrieved;
     try {
-      retrieved = topKChunks(file, queryEmbedding, topK);
+      retrieved = topKChunks(
+        file,
+        queryEmbedding,
+        topK,
+        scopedItemKey !== void 0 ? { scopedItemKey } : void 0
+      );
     } catch (err) {
       debug(`rag-augment: topKChunks failed: ${err instanceof Error ? err.message : String(err)}`);
       return messages;
@@ -7647,6 +8817,12 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
     };
   }
   function attachAutoReindex(deps) {
+    if (deps.e2eTriggerPref !== void 0 && deps.e2eTriggerPref.trim().length > 0) {
+      deps.zotero.debug(
+        "Zotero AI Explain: e2e-trigger pref set; auto-reindex disabled for the e2e session."
+      );
+      return () => void 0;
+    }
     const zoteroAny = deps.zotero;
     const notifier = zoteroAny.Notifier;
     if (notifier === void 0 || typeof notifier.registerObserver !== "function") {
@@ -7769,6 +8945,12 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
         // eslint-disable-next-line @typescript-eslint/require-await
         async exists() {
           return false;
+        },
+        async rename() {
+        },
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async stat() {
+          return null;
         }
       };
     }
@@ -7791,6 +8973,23 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
       },
       exists(path) {
         return utils.exists(path);
+      },
+      async rename(source, dest) {
+        await utils.move(source, dest);
+      },
+      async stat(path) {
+        if (typeof utils.stat !== "function") {
+          return null;
+        }
+        try {
+          const info = await utils.stat(path);
+          return {
+            size: typeof info.size === "number" ? info.size : 0,
+            ...typeof info.lastModified === "number" ? { lastModified: info.lastModified } : {}
+          };
+        } catch {
+          return null;
+        }
       }
     };
   }
@@ -7805,7 +9004,15 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
         // items. Both fields are optional — when absent the crawler still
         // indexes title+abstract.
         ...zotero.FullText !== void 0 ? { FullText: zotero.FullText } : {},
-        ...zotero.File !== void 0 ? { File: zotero.File } : {}
+        ...zotero.File !== void 0 ? { File: zotero.File } : {},
+        // Phase 4 (FINDING-1): thread Zotero.PDFWorker through so the
+        // PRODUCTION crawler takes the per-page PDF extraction path —
+        // emitting `sourceKind: "pdf-page"` chunks with `pageIndex` —
+        // instead of falling back to the `.zotero-ft-cache` blob (which
+        // stamps `sourceKind: "attachment"` and carries no page). Optional:
+        // a host that stripped `Zotero.PDFWorker` (tests, custom bundles)
+        // degrades to the cache-blob path with no crash.
+        ...zotero.PDFWorker !== void 0 ? { PDFWorker: zotero.PDFWorker } : {}
       };
     }
     zotero.debug(
@@ -8080,7 +9287,9 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
     const zotero = context.Zotero;
     maybeDumpTokens(zotero);
     const settings = loadOllamaSettings(zotero);
-    context.Zotero.debug(`Zotero AI Explain ollama config: baseUrl=${settings.baseUrl}`);
+    context.Zotero.debug(
+      `Zotero AI Explain ollama config: chatBaseUrl=${settings.chatBaseUrl} embedBaseUrl=${settings.embedBaseUrl} (legacy baseUrl=${settings.baseUrl})`
+    );
     const getProfile = () => ollamaSettingsToProfile(loadOllamaSettings(zotero));
     const store = createConversationStore();
     const prefReader = asStringPrefReader(zotero.Prefs);
@@ -8106,13 +9315,16 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
       ollamaProvider
     });
     void registry;
+    const indexStorageIo = buildIndexStorageIo(context.Zotero);
+    const indexStorageDataDir = resolveDataDirectory(zotero);
+    const indexEmbedProvider = {
+      kind: providerProfile.embedProvider,
+      model: settings.embeddingModel
+    };
     const indexStorage = createIndexStorage({
-      zotero: { DataDirectory: resolveDataDirectory(zotero) },
-      io: buildIndexStorageIo(context.Zotero),
-      embedProvider: {
-        kind: providerProfile.embedProvider,
-        model: settings.embeddingModel
-      }
+      zotero: { DataDirectory: indexStorageDataDir },
+      io: indexStorageIo,
+      embedProvider: indexEmbedProvider
     });
     const embeddingProvider = buildEmbeddingProvider({
       fetch: fetchForAdapters,
@@ -8120,17 +9332,16 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
       readProviderProfile,
       ollamaProvider
     });
+    const crawlerZotero = resolveZoteroLibraries(zotero);
+    const crawlerSettings = {
+      baseUrl: settings.embedBaseUrl,
+      embeddingModel: settings.embeddingModel
+    };
     const indexingController = createIndexingController({
       logger: context.Zotero,
-      zotero: resolveZoteroLibraries(zotero),
+      zotero: crawlerZotero,
       provider: embeddingProvider,
-      // Crawler hits the EMBEDDING endpoint (Ollama `/api/embeddings`), so
-      // it must use `embedBaseUrl`. After the split-URL change, `baseUrl`
-      // semantically mirrors `chatBaseUrl` and would route embed traffic
-      // through the chat proxy — wrong destination, slow at best, broken
-      // at worst. For direct-API providers the `baseUrl` field is
-      // ignored by the adapter (we hard-code the canonical host).
-      settings: { baseUrl: settings.embedBaseUrl, embeddingModel: settings.embeddingModel },
+      settings: crawlerSettings,
       storage: indexStorage
     });
     void indexingController.hydrate();
@@ -8220,41 +9431,15 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
       embeddingProvider,
       indexStorage,
       embedSettings: { baseUrl: settings.embedBaseUrl, model: settings.embeddingModel },
-      openItem: (itemKey) => {
+      openItem: (citation) => {
         try {
-          const zoteroAny = zotero;
-          const userLibraryID = zoteroAny.Libraries?.userLibraryID ?? 1;
-          const item = zoteroAny.Items?.getByLibraryAndKey?.(userLibraryID, itemKey);
-          if (item === false || item === null || item === void 0) {
-            zotero.debug(`Zotero AI Explain: library-chat citation ${itemKey} not found`);
-            return;
-          }
-          let attachmentId = null;
-          const isRegular = item.isRegularItem?.() === true;
-          if (isRegular && item.getAttachments !== void 0) {
-            for (const childId of item.getAttachments()) {
-              const att = zoteroAny.Items?.get?.(childId);
-              if (att === null || att === void 0) continue;
-              const isPdf = att.isPDFAttachment?.() === true || att.attachmentContentType === "application/pdf";
-              if (isPdf) {
-                attachmentId = att.id;
-                break;
-              }
-            }
-          } else if (!isRegular) {
-            attachmentId = item.id;
-          }
-          if (attachmentId !== null && zoteroAny.Reader?.open !== void 0) {
-            void zoteroAny.Reader.open(attachmentId);
-            return;
-          }
-          const pane = zoteroAny.getActiveZoteroPane?.();
-          if (pane?.selectItems !== void 0) {
-            void pane.selectItems([item.id]);
+          const result = openCitationInReader(citation, zotero);
+          if (result.outcome === "not-found") {
+            zotero.debug(`Zotero AI Explain: library-chat citation ${citation.itemKey} not found`);
           }
         } catch (err) {
           zotero.debug(
-            `Zotero AI Explain: openItem(${itemKey}) failed ${err instanceof Error ? err.message : String(err)}`
+            `Zotero AI Explain: openItem(${citation.itemKey}) failed ${err instanceof Error ? err.message : String(err)}`
           );
         }
       }
@@ -8308,7 +9493,13 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
     detachAutoReindex = attachAutoReindex({
       zotero: context.Zotero,
       indexingController,
-      debounceMs: 5e3
+      debounceMs: 5e3,
+      // AC-8a e2e hermeticity: disable auto-reindex when the diagnostic
+      // driver is active so it can't race the driver's deterministic
+      // index-flow scrapes. The pref is read through the same narrow
+      // `StringPrefReader` bridge the rest of bootstrap uses; `undefined`
+      // (production) leaves auto-reindex fully enabled.
+      e2eTriggerPref: asStringPrefReader(zotero.Prefs).get("extensions.zotero-ai-explain.e2e-trigger")
     });
     void maybeRunOnboarding({
       zotero,
@@ -8328,7 +9519,18 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
       popupController,
       sidebarController,
       indexingController,
-      disclosure: describeDisclosureFor(readProviderProfile)
+      disclosure: describeDisclosureFor(readProviderProfile),
+      // AC-5 migration-resume harness: the raw pieces the diagnostic
+      // driver needs to build a fresh storage + controller on a spy io
+      // adapter. No effect in production (the driver flow is pref-gated).
+      migrationHarness: {
+        io: indexStorageIo,
+        dataDir: indexStorageDataDir.dir,
+        embedProvider: indexEmbedProvider,
+        crawlerZotero,
+        crawlerProvider: embeddingProvider,
+        crawlerSettings
+      }
     });
   }
   async function shutdown(context) {

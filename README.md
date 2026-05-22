@@ -3,299 +3,285 @@
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178c6?logo=typescript&logoColor=white)
 ![JavaScript](https://img.shields.io/badge/JavaScript-ESM-f7df1e?logo=javascript&logoColor=222222)
 ![CSS](https://img.shields.io/badge/CSS-UI%20Surfaces-1572b6?logo=css3&logoColor=white)
-![Zotero](https://img.shields.io/badge/Zotero-Plugin-990000)
+![Zotero](https://img.shields.io/badge/Zotero-8.0%E2%80%939.99-990000)
 ![Tests](https://img.shields.io/badge/tests-vitest-6e9f18?logo=vitest&logoColor=white)
 
-Zotero AI Explain is a Zotero plugin for explaining selected text in-place, holding follow-up
-conversations in a sidebar, and asking NotebookLM-style questions across your entire library. Select
-a passage in the Zotero reader, ask for an explanation, review the answer in an anchored popup above
-the text, move the conversation into a sidebar when you want to keep chatting, and ask "Ask your
-library" questions that cite the items they came from.
+**Zotero AI Explain** is a Zotero plugin that turns a passage in the PDF reader into an AI
+conversation and lets you ask NotebookLM-style questions across your whole library — with answers
+that cite the items and pages they came from. It is PDF-aware: it knows which document and page you
+are reading, scopes retrieval to the open PDF, and jumps the reader to a cited page when you click a
+citation.
+
+You bring the model. Chat and embeddings are configured independently and can run fully locally
+(Ollama), against your ChatGPT or Claude subscription (through a bundled local proxy that drives the
+Codex or Claude Code CLIs), or against the OpenAI / Anthropic / Gemini APIs — without the plugin
+ever holding an API key in plaintext preferences.
 
 ![Animated preview of Zotero AI Explain inside Zotero](docs/assets/readme-zotero-ai-preview.svg)
 
-## Extension Preview
+## Features
+
+### Selected-text explanation — "Explain with AI"
+
+Select a passage in the Zotero PDF reader and choose **Explain with AI** from the reader context
+menu (or press **Cmd/Ctrl+Shift+E**). An anchored popup appears above the selection and streams a
+markdown explanation in place. The popup is positioned at chrome-window coordinates so it floats
+above the reader without stealing focus.
+
+### "Ask a question" — focused reader chat
+
+A second reader command, **Ask a question**, opens the same anchored popup but with the textarea
+focused and _no_ auto-explanation: you type your own question about the selected passage. The
+selection is pinned as a sticky quote — every turn of the conversation re-applies the quote as a
+system message, so a five-turn chat stays anchored to the text you started from. Both reader
+commands are hidden when the reader reports no active selection.
+
+### Sidebar follow-up chat
+
+While a popup is open, **Continue in sidebar** hands the conversation off to a persistent sidebar
+pane. The reader stays in view and you keep asking follow-ups without the popup covering the page.
+Popup and sidebar share a single markdown stylesheet, so headings, lists, code blocks, and
+blockquotes render identically across both surfaces and track the OS theme.
+
+### PDF identity in the prompt
+
+Reader-triggered explain and ask-question requests carry the document's identity into the prompt
+frame: the item title, the attachment key, and the page reference (the reader's page label, or the
+1-based page number as a fallback). The model knows it is answering about _"<paper title>, p. 14"_
+rather than an anonymous block of text.
+
+### "Ask your library" — NotebookLM-style RAG chat
+
+**Tools → Ask your library** (or **Cmd/Ctrl+Shift+L**) opens a retrieval-augmented chat dialog over
+your indexed library. You type a question; the plugin embeds it, cosine-ranks every chunk in the
+on-disk index, threads the top **K = 8** chunks into a grounded prompt, and streams an answer whose
+bracketed `[itemKey#chunkIndex]` citations render as clickable links.
+
+### In-PDF RAG scoping
+
+Retrieval is context-aware. When you ask a question from a reader popup, RAG is **auto-scoped to the
+open document** — only chunks from that PDF are retrieved, so the answer stays grounded in what you
+are reading. The library-chat dialog stays **library-wide**. The scope is request-scoped: two reader
+windows asking questions about two different PDFs never cross-contaminate.
+
+### Citation jump-to-page
+
+Library-chat citations are chunk-scoped. Each chunk knows its source PDF page, so clicking a
+citation opens (or navigates an already-open reader to) the exact cited page via
+`Zotero.Reader.open(attachmentId, { pageIndex })`. Two citations from different pages of the same
+paper navigate the same reader tab rather than spawning duplicates. A hallucinated or legacy
+citation token falls back gracefully — it opens the item at page 1 or renders inert, never silently
+routing to the wrong source.
+
+### Per-page PDF text extraction
+
+The library indexer extracts PDF text **per page** via Zotero's bundled
+`Zotero.PDFWorker.getFullText` worker, splitting on the form-feed delimiter so every chunk carries
+the page it came from. Metadata, child notes, and non-PDF attachments (EPUB, snapshots) are indexed
+alongside, each tagged with its source kind.
+
+### Per-provider on-disk indexes with schema-versioned migration
+
+Each `(embedding-provider, model)` pair gets its own index file under the Zotero data directory, so
+switching providers never corrupts cosine scores by mixing embedding spaces. The index carries a
+`schemaVersion`; upgrading to v0.3.0 triggers a one-time, crash-safe migration that re-crawls into a
+sibling temp file and atomically swaps it in — a plugin reload mid-migration resumes cleanly from a
+sidecar marker, and concurrent readers always see a fully-populated file.
+
+### Local LLM proxy — use your ChatGPT / Claude subscription
+
+A small Node HTTP service ships inside the XPI. It speaks the Ollama wire protocol on the front side
+and routes each request to the **Codex CLI**, the **Claude Code CLI**, or a real **Ollama** daemon.
+The plugin auto-spawns it from the settings dialog. This lets you plug a ChatGPT or Claude
+subscription into the plugin without ever pasting an API key.
+
+### Keyboard shortcuts
+
+| Shortcut             | Action                                   |
+| -------------------- | ---------------------------------------- |
+| **Cmd/Ctrl+Shift+E** | Explain the current reader selection.    |
+| **Cmd/Ctrl+Shift+L** | Open the "Ask your library" chat dialog. |
+
+### Compatibility
+
+Zotero **8.0 – 9.99.99** (the plugin manifest's `strict_min_version` / `strict_max_version`).
 
 ![Screenshot-style preview of the Zotero reader popup and sidebar](docs/assets/readme-sidebar-screenshot.svg)
 
-## Architecture overview
+## Install
 
-Zotero AI Explain is composed of five user-visible surfaces and one bundled subprocess:
-
-- **Anchored "Explain with AI" popup** — appears at chrome-window coordinates above the selected
-  text in the Zotero PDF reader. Streams the explanation in markdown with citation links.
-- **Sidebar follow-up chat** — when the popup is open, "Continue in sidebar" hands the conversation
-  off to a persistent sidebar pane so the user can keep asking follow-ups while the reader stays in
-  view.
-- **Library indexing** — the settings dialog's Index controls walk every item in the active library,
-  extract title + abstract + child notes + cached PDF text (`.zotero-ft-cache` when Zotero has
-  already indexed the attachment), chunk to ~2 KB, embed each chunk via the configured embedding
-  provider, and persist the resulting vectors + chunk text to a JSON file under the Zotero data
-  directory.
-- **"Ask your library"** (Tools menu) — a NotebookLM-style chat surface that takes a question,
-  cosine-ranks the persisted chunks, threads the top K into a grounded prompt, streams the answer,
-  and renders `[ITEM_KEY]` citations as clickable links that select the cited item in Zotero.
-- **Settings dialog** — preset dropdown ("Local Ollama", "Codex via Proxy", "Claude via Proxy",
-  "OpenAI Direct", "Anthropic Direct", "Custom") + independent chat/embed provider selectors + live
-  model discovery (probes the configured URL/API on every URL or key change to populate the model
-  dropdowns) + the Library Index controls + the Local LLM Proxy controls.
-- **Local LLM proxy** (bundled subprocess) — a small Node HTTP service shipped inside the XPI that
-  speaks the Ollama `/api/chat` wire protocol and routes each request to either the Codex CLI, the
-  Claude Code CLI, or a real Ollama daemon. Auto-spawned by the plugin via Mozilla's
-  `Subprocess.sys.mjs` when the user clicks Start in settings. Lets users plug ChatGPT and Claude
-  subscriptions into the plugin without ever holding an API key.
-
-## Quick start
-
-The settings dialog opens with a single **Preset** dropdown at the top. Pick the preset that matches
-your install and the dropdown writes URLs, providers, and model names into every field for you.
-Manual edits flip the dropdown to **Custom** without touching the values you typed.
-
-| Preset               | What it does                                                          | What you need                                                                   |
-| -------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| **Local Ollama**     | Chat + embeddings on your machine.                                    | [Ollama](https://ollama.com) installed; `gemma4:e4b` + `embeddinggemma` pulled. |
-| **Codex via Proxy**  | Chat via Codex CLI (your ChatGPT login); embed on Ollama.             | Codex CLI installed and `codex login` run; Ollama for embeddings.               |
-| **Claude via Proxy** | Chat via Claude Code CLI (your Claude subscription); embed on Ollama. | Claude Code CLI installed and `claude login` run; Ollama for embeddings.        |
-| **OpenAI Direct**    | Chat + embed against the OpenAI REST API.                             | An OpenAI API key.                                                              |
-| **Anthropic Direct** | Chat against the Anthropic API; embed on Ollama.                      | An Anthropic API key; Ollama for embeddings (Anthropic has no embed API).       |
-| **Custom**           | Keep whatever you have configured.                                    | Whatever the previous configuration required.                                   |
-
-For the Codex/Claude/Anthropic presets, the bundled LLM proxy must be running. Click **Start** in
-the settings dialog's "Local LLM Proxy" section and the plugin spawns it for you (see
-[LLM proxy](#llm-proxy) below). For the Local Ollama preset you need `ollama serve` running on
-`http://localhost:11434`.
-
-## Provider matrix
-
-| Backend              | Chat | Embed | API key |   Subscription / CLI auth   | Local?                               |
-| -------------------- | :--: | :---: | :-----: | :-------------------------: | ------------------------------------ |
-| `ollama`             | yes  |  yes  |   no    |             no              | yes (your machine)                   |
-| `codex-cli`          | yes  |  no   |   no    | ChatGPT (via `codex login`) | yes (via bundled proxy + Codex CLI)  |
-| `claude-cli`         | yes  |  no   |   no    | Claude (via `claude login`) | yes (via bundled proxy + Claude CLI) |
-| `codex-api` / OpenAI | yes  |  yes  |   yes   |             no              | no                                   |
-| `claude-api`         | yes  |  no   |   yes   |             no              | no                                   |
-| `gemini` (embed)     |  no  |  yes  |   yes   |             no              | no                                   |
-
-Chat and embed providers are chosen independently. A common configuration is `chat=codex-cli` (uses
-your ChatGPT login through the proxy) with `embed=ollama` (free, local, private). The preset
-dropdown is the shortcut; advanced users can pick any combination directly in the Chat Backend and
-Embedding Backend selectors.
-
-## Library chat ("Ask your library")
-
-`Tools → Ask your library` opens a NotebookLM-style dialog hosted in a Zotero window. The flow:
-
-1. The user types a question.
-2. The active embedding provider embeds the question.
-3. Every chunk in the persisted index is scored by cosine similarity to the query embedding.
-4. The top **K = 8** chunks (≈ 16 KB of context) are threaded into a grounded prompt that asks the
-   chat model to cite the source `[itemKey]` after each claim.
-5. The chat provider streams the answer.
-6. Bracketed citations in the streamed text render as clickable links — clicking `[ABC1234]` selects
-   the matching Zotero item via `Zotero.Items.getByLibraryAndKey(...)` +
-   `Zotero.getActiveZoteroPane().selectItems(...)`.
-
-The retrieval is **flat across chunks** (no per-item dedup), so a question that hits multiple
-sections of a single paper can legitimately surface several chunks from the same item. "New
-conversation" resets the in-memory thread; messages persist across follow-ups within a session but
-not across plugin restarts. When the index doesn't exist or the query embedding has a different
-dimension than the persisted vectors (provider switched without re-indexing), a clear in-dialog
-error surfaces rather than a fabricated answer.
-
-See
-[`docs/decisions/0005-library-chat-rag-design.md`](docs/decisions/0005-library-chat-rag-design.md)
-for the rationale.
-
-## Per-provider indexes
-
-Each `(embedding-provider, model)` pair gets its own on-disk index file under the Zotero data
-directory:
-
-```text
-zotero-ai-explain-index-ollama-embeddinggemma.json
-zotero-ai-explain-index-openai-3-small.json
-zotero-ai-explain-index-openai-3-large.json
-zotero-ai-explain-index-gemini-004.json
-```
-
-Mixing vectors from different providers in one file would silently corrupt cosine-similarity scores
-(different embedding spaces, sometimes different dimensions: Ollama `embeddinggemma` is 768, OpenAI
-`text-embedding-3-large` is 3072, etc.). The plugin avoids this by writing one file per (provider,
-model). Switching providers in settings instantly loads the matching index — re-indexing is only
-required when the file for the chosen (provider, model) pair doesn't yet exist or when the user
-clicks **Clear** in the Library Index controls.
-
-The legacy `zotero-ai-explain-index.json` filename is honoured as a back-compat alias for
-`ollama / embeddinggemma` so existing installs don't lose their index on upgrade.
-
-See
-[`docs/decisions/0002-per-provider-index-files.md`](docs/decisions/0002-per-provider-index-files.md)
-for the rationale.
-
-## LLM proxy
-
-`scripts/llm-proxy/server.mjs` is a Node HTTP service that speaks the Ollama `/api/chat` wire
-protocol on the front side and routes each request to one of three backends:
-
-- `/codex` — spawns `codex exec --json -` (first turn) or `codex exec resume <SESSION_ID> --json -`
-  (follow-ups) and translates Codex's JSON event stream into Ollama-format NDJSON.
-- `/claude` — spawns `claude -p --output-format json --allowedTools "" -` (first turn) or
-  `claude --resume <SESSION_ID> -p --output-format json --allowedTools "" -` (follow-ups). The empty
-  `--allowedTools` allowlist hard-disables every Claude Code tool so the CLI behaves as a pure chat
-  model.
-- `/ollama` — forwards verbatim to a real Ollama daemon at `OLLAMA_BASE_URL` (default
-  `http://localhost:11434`).
-
-**The proxy is bundled inside the XPI.** When the user clicks **Start** in the settings dialog's
-Local LLM Proxy section, `src/bootstrap.ts` resolves the bundled `addon/llm-proxy/server.mjs` path
-from the plugin's `rootURI`, auto-detects a Node binary (`/opt/homebrew/bin/node` first to match
-Apple Silicon defaults, then `which node`, then a fallback list), and spawns the child via Mozilla's
-`Subprocess.sys.mjs`. The child is sent SIGTERM (with a 3 s grace before SIGKILL) on plugin
-shutdown. If auto-detection can't find Node, the settings dialog reveals a "Node binary path" field
-with a copy-pasteable banner.
-
-The proxy can also be run by hand for development:
-
-```bash
-npm run proxy:llm
-# zotero-ai-llm-proxy listening on http://127.0.0.1:11400
-#   /codex   → Codex CLI (multi-turn session_id resume)
-#   /claude  → Claude Code CLI (multi-turn --resume)
-#   /ollama  → http://localhost:11434
-```
-
-Environment overrides (all optional):
-
-- `LLM_PROXY_PORT` — default `11400`.
-- `OLLAMA_BASE_URL` — default `http://localhost:11434`.
-- `CODEX_DEFAULT_MODEL` — default `gpt-5.2-codex`.
-- `CLAUDE_BINARY` — explicit path to `claude` when not on `PATH`.
-- `CODEX_IDLE_TIMEOUT_MS` / `CODEX_HARD_TIMEOUT_MS` — default 60 s / 300 s.
-- `CLAUDE_IDLE_TIMEOUT_MS` / `CLAUDE_HARD_TIMEOUT_MS` — default 60 s / 300 s.
-
-Configure the Zotero plugin to use the proxy by setting an Ollama provider profile's **Base URL** to
-one of:
-
-- `http://127.0.0.1:11400/codex` — Codex backend
-- `http://127.0.0.1:11400/claude` — Claude backend
-- `http://127.0.0.1:11400/ollama` — passthrough
-
-(The preset dropdown writes these URLs for you.) The plugin appends `/api/chat` (and `/api/embed`
-for the Ollama route) itself.
-
-Smoke test the streaming wire format with `curl`:
-
-```bash
-curl -N -H 'content-type: application/json' \
-  -d '{"model":"gpt-5.2-codex","messages":[{"role":"user","content":"say hi in 3 words"}],"stream":true}' \
-  http://127.0.0.1:11400/codex/api/chat
-```
-
-The response is NDJSON: zero or more `{"message":{"role":"assistant","content":"…"},"done":false}`
-lines followed by a single `{…,"done":true,"done_reason":"stop"}` line. Errors surface as
-`{…,"done":true,"done_reason":"error","error":"…"}` so the plugin's popup renders them instead of
-silently completing with empty content.
-
-See [`scripts/llm-proxy/README.md`](scripts/llm-proxy/README.md) for the full configuration
-reference and troubleshooting tips, and
-[`docs/decisions/0001-llm-proxy-architecture.md`](docs/decisions/0001-llm-proxy-architecture.md) for
-the architectural rationale.
-
-## Development
+The plugin is installed as an XPI built from this repository:
 
 ```bash
 npm install
-pre-commit install
-npm run build
-npm run verify
-pre-commit run --all-files
+npm run build      # esbuild → addon/content/zotero-ai-explain.js
+npm run package    # zip addon/ + bundled llm-proxy/ → zotero-ai-explain.xpi
 ```
 
-The build emits the Zotero bootstrap bundle at `addon/content/zotero-ai-explain.js` as an IIFE that
-exposes `ZoteroAiExplain.startup` / `ZoteroAiExplain.shutdown`. The bundle is loaded into the
-plugin's bootstrap scope via `Services.scriptloader.loadSubScript`; Firefox 140 ESR refuses
-`ChromeUtils.importESModule` for non-trusted-scheme URLs, so the IIFE form is required.
+Then in Zotero: **Tools → Plugins → gear menu → Install Plugin From File…** and pick
+`zotero-ai-explain.xpi`. Restart Zotero if prompted.
 
-## Manual Verification
+If you intend to use the Codex or Claude backends, you also need **Node.js ≥ 22** installed on the
+machine — the bundled proxy runs under your system Node (see [Configuration](#configuration)).
 
-Use `docs/manual-verification/zotero.md` for the manual acceptance pass after building and packaging
-the `addon/` directory.
+## Configuration
 
-### Test with Ollama
+Open the plugin settings from **Tools → Zotero AI Explain Settings**. The dialog opens with a single
+**Preset** dropdown at the top: pick the preset that matches your install and it writes URLs,
+providers, and model names into every field for you. Manual edits flip the dropdown to **Custom**
+without discarding what you typed.
 
-```bash
-ollama serve
-ollama pull gemma4:e4b
-ollama pull embeddinggemma
-npm run build
-node scripts/package-xpi.mjs v0.1.3
-```
+| Preset               | What it does                                                          | What you need                                                             |
+| -------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| **Local Ollama**     | Chat + embeddings on your machine.                                    | [Ollama](https://ollama.com) installed; chat + embedding models pulled.   |
+| **Codex via Proxy**  | Chat via Codex CLI (your ChatGPT login); embed on Ollama.             | Codex CLI installed and `codex login` run; Ollama for embeddings.         |
+| **Claude via Proxy** | Chat via Claude Code CLI (your Claude subscription); embed on Ollama. | Claude Code CLI installed and `claude login` run; Ollama for embeddings.  |
+| **OpenAI Direct**    | Chat + embed against the OpenAI REST API.                             | An OpenAI API key.                                                        |
+| **Anthropic Direct** | Chat against the Anthropic API; embed on Ollama.                      | An Anthropic API key; Ollama for embeddings (Anthropic has no embed API). |
+| **Custom**           | Keep whatever you have configured.                                    | Whatever the previous configuration required.                             |
 
-Install `zotero-ai-explain.xpi` in Zotero, open the plugin settings, pick the **Local Ollama**
-preset, and run a manual smoke test.
+### Provider matrix
 
-### Local-only e2e tests
+Chat and embed backends are chosen **independently**. A common setup is `chat=codex-cli` (your
+ChatGPT login, via the proxy) with `embed=ollama` (free, local, private).
 
-`npm run test:e2e` exercises the plugin against a fake Ollama HTTP server and runs in CI on every
-commit. A second suite, `npm run test:e2e:local`, points the plugin at a real Ollama daemon so the
-streaming chat and embedding paths are validated against a live model at least once before each
-release. **CI never runs the local suite**; it auto-skips when Ollama is unreachable.
+| Backend          | Chat | Embed | API key |   Subscription / CLI auth   | Local?                               |
+| ---------------- | :--: | :---: | :-----: | :-------------------------: | ------------------------------------ |
+| `ollama`         | yes  |  yes  |   no    |             no              | yes (your machine)                   |
+| `codex-cli`      | yes  |  no   |   no    | ChatGPT (via `codex login`) | yes (via bundled proxy + Codex CLI)  |
+| `claude-cli`     | yes  |  no   |   no    | Claude (via `claude login`) | yes (via bundled proxy + Claude CLI) |
+| OpenAI           | yes  |  yes  |   yes   |             no              | no                                   |
+| `claude-api`     | yes  |  no   |   yes   |             no              | no                                   |
+| `gemini` (embed) |  no  |  yes  |   yes   |             no              | no                                   |
 
-Prerequisites:
+API keys are never stored as plaintext preferences — the plugin holds a **secret reference** and
+resolves the key at request time.
 
-```bash
-ollama serve                 # daemon listening on http://localhost:11434
-ollama pull gemma4:e4b       # chat model
-ollama pull embeddinggemma   # embedding model
-npm run build && npm run package
-npm run test:e2e:local
-```
+### The local LLM proxy
 
-Environment overrides (all optional):
+For the **Codex via Proxy**, **Claude via Proxy**, and **Anthropic Direct** presets, the bundled LLM
+proxy must be running. Click **Start** in the settings dialog's _Local LLM Proxy_ section and the
+plugin spawns it for you via Mozilla's `Subprocess.sys.mjs`. It auto-detects a Node binary
+(`/opt/homebrew/bin/node` first to match Apple Silicon, then `which node`, then a fallback list); if
+auto-detection fails the dialog reveals a **Node binary path** field. The child is sent SIGTERM
+(with a 3 s grace before SIGKILL) on plugin shutdown.
 
-- `OLLAMA_BASE_URL` — default `http://localhost:11434`.
-- `OLLAMA_CHAT_MODEL` — default `gemma4:e4b`.
-- `OLLAMA_EMBED_MODEL` — default `embeddinggemma`.
+For the **Local Ollama** preset you instead need `ollama serve` running on `http://localhost:11434`.
 
-If Ollama is unreachable or a required model is missing, every test in the suite is skipped with a
-clear `console.warn` explaining why. Contributors without a local Ollama install never see false
-negatives.
+See [`scripts/llm-proxy/README.md`](scripts/llm-proxy/README.md) for the proxy's full configuration
+reference, environment overrides, wire-format details, and troubleshooting.
 
-## Continuous Integration
+### Library indexing
 
-Three GitHub Actions workflows gate changes:
+The settings dialog's **Library Index** controls walk every item in the active library, extract
+title + abstract + child notes + per-page PDF text + non-PDF attachment text, chunk it, embed each
+chunk via the configured embedding provider, and persist the vectors to a per-`(provider, model)`
+JSON file under the Zotero data directory. Use **Index library** to start a crawl, **Pause** /
+**Resume** to control it, and **Clear index** (two-stage confirm) to delete the current index. The
+plugin also auto-reindexes incrementally as your library changes.
 
-| Workflow             | File                                       | Trigger                                                   | Runs on                                                                | What it validates                                                                                                                                                                                                                        |
-| -------------------- | ------------------------------------------ | --------------------------------------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CI`                 | `.github/workflows/ci.yml`                 | push to `main`, pull requests                             | `ubuntu-latest`                                                        | Typecheck, lint, format, unit tests, `npm audit`, pre-commit hooks. Fast required check (~2 min).                                                                                                                                        |
-| `Zotero E2E`         | `.github/workflows/e2e.yml`                | push to `main`, pull requests                             | `ubuntu-latest`                                                        | Real Zotero spawn + fake-Ollama e2e under Xvfb. Confirms the bootstrap, manifest, and harness still work on Linux. Required check (~5 min).                                                                                              |
-| `E2E Cross-Platform` | `.github/workflows/e2e-cross-platform.yml` | push to `main`, pull requests, manual `workflow_dispatch` | `ubuntu-latest`, `macos-latest`, `windows-latest` (`fail-fast: false`) | Full gate suite (typecheck → lint → unit → build → package → fake-Ollama e2e → real-Ollama e2e with `gemma3:1b` + `embeddinggemma`) against a real Zotero install on each OS. Release gate (~10–15 min/OS on cold cache; ~3–5 min warm). |
+## Usage
 
-The cross-platform workflow pins `ZOTERO_VERSION` and `OLLAMA_VERSION` at the top of the file for
-reproducibility. Bump both values together when adopting a new Zotero release, and re-validate
-locally first. The Ollama model blobs (~1.6 GB) are cached via `actions/cache@v4` keyed on OS +
-Ollama version + model names, so subsequent runs skip the slow pull unless one of those keys
-changes.
+1. **Explain a passage.** Open a PDF in the Zotero reader, select text, and choose **Explain with
+   AI** (or press **Cmd/Ctrl+Shift+E**). Read the streamed answer in the anchored popup.
+2. **Ask your own question about a passage.** Select text and choose **Ask a question** — type a
+   question; the selection is pinned as a sticky quote for the whole conversation.
+3. **Keep chatting.** Click **Continue in sidebar** to move the conversation into a sidebar pane.
+4. **Index your library.** Open settings, pick a preset, and click **Index library**.
+5. **Ask your library.** Press **Cmd/Ctrl+Shift+L** (or **Tools → Ask your library**), type a
+   question, and click the `[itemKey#chunkIndex]` citations in the answer to jump to the cited PDF
+   page.
 
-Because the cross-platform suite is materially slower than the linux-only `Zotero E2E` job, treat it
-as a release gate rather than a fast per-PR gate. To block every PR on it, add
-`cross-platform-e2e (ubuntu-latest)`, `cross-platform-e2e (macos-latest)`, and
-`cross-platform-e2e (windows-latest)` to the branch protection required-checks list for `main`. On
-failure, the workflow uploads `/tmp/zotero-e2e-latest.log`, the built XPI, and the Ollama daemon
-logs as an `e2e-cross-platform-<os>-failure` artifact (7-day retention).
+## Architecture
 
-## Architectural decisions
+Zotero AI Explain is composed of five user-visible surfaces and one bundled subprocess:
 
-The major design decisions made during the Phase 4 real-product-pipeline work are recorded as short
-ADRs under [`docs/decisions/`](docs/decisions/):
+- **Anchored popup** — floats above the reader selection at chrome-window coordinates; serves both
+  the "Explain with AI" auto-explanation and the "Ask a question" focused-input modes; streams
+  markdown with citation links.
+- **Sidebar chat** — a persistent pane the popup hands its conversation off to; shares the popup's
+  markdown stylesheet.
+- **Library indexing** — crawls the active library, extracts per-page PDF text via
+  `Zotero.PDFWorker.getFullText` plus metadata / notes / non-PDF attachments, chunks and embeds, and
+  persists per-`(provider, model)` JSON indexes (schema-versioned, with crash-safe migration and an
+  in-memory parse cache).
+- **"Ask your library" dialog** — embeds the question, cosine-ranks the persisted chunks (top K = 8;
+  auto-scoped to the open PDF when launched from a reader, library-wide from the Tools menu),
+  threads a grounded prompt, and renders chunk-scoped citations that jump the reader to the cited
+  page.
+- **Settings dialog** — preset dropdown + independent chat/embed selectors + live model discovery +
+  Library Index controls + Local LLM Proxy controls.
+- **Local LLM proxy** (bundled subprocess) — a Node HTTP service inside the XPI that speaks the
+  Ollama `/api/chat` wire protocol and routes to the Codex CLI, the Claude Code CLI, or a real
+  Ollama daemon.
+
+The major design decisions are recorded as short ADRs under [`docs/decisions/`](docs/decisions/):
 
 - [0001 — LLM proxy architecture](docs/decisions/0001-llm-proxy-architecture.md)
 - [0002 — Per-provider index files](docs/decisions/0002-per-provider-index-files.md)
 - [0003 — Provider profile abstraction](docs/decisions/0003-provider-profile-abstraction.md)
 - [0004 — Bootstrap chrome subprocess](docs/decisions/0004-bootstrap-chrome-subprocess.md)
 - [0005 — Library chat RAG design](docs/decisions/0005-library-chat-rag-design.md)
+- [0006 — Per-page PDF text extraction via `Zotero.PDFWorker`](docs/decisions/0006-pdf-worker-per-page-extraction.md)
+- [0007 — Schema-versioned write-new-then-swap index migration](docs/decisions/0007-schema-versioned-index-migration.md)
 
-## Project Layout
+## Development
+
+```bash
+npm install
+pre-commit install
+npm run build      # esbuild → addon/content/zotero-ai-explain.js
+npm run verify     # typecheck + lint + format + unit/integration tests
+npm run test:e2e   # real Zotero + fake Ollama end-to-end suite
+pre-commit run --all-files
+```
+
+The build emits the Zotero bootstrap bundle at `addon/content/zotero-ai-explain.js` as an IIFE that
+exposes `ZoteroAiExplain.startup` / `ZoteroAiExplain.shutdown`. The bundle is loaded into the
+plugin's bootstrap scope via `Services.scriptloader.loadSubScript`; Firefox ESR refuses
+`ChromeUtils.importESModule` for non-trusted-scheme URLs, so the IIFE form is required.
+
+### Tests
+
+| Command                  | What it runs                                                                |
+| ------------------------ | --------------------------------------------------------------------------- |
+| `npm run test`           | Unit + integration suite (fast; runs in CI on every commit).                |
+| `npm run test:e2e`       | Real Zotero spawn + fake-Ollama HTTP fixture end-to-end suite (runs in CI). |
+| `npm run test:e2e:local` | Real Zotero + a real Ollama daemon; **auto-skips** when Ollama is offline.  |
+
+The local-only e2e suite points the plugin at a real Ollama daemon so the streaming chat and
+embedding paths are validated against a live model before each release:
+
+```bash
+ollama serve
+ollama pull gemma4:e4b      # OLLAMA_CHAT_MODEL default; override via the env var
+ollama pull embeddinggemma  # OLLAMA_EMBED_MODEL default
+npm run build && npm run package
+npm run test:e2e:local
+```
+
+If Ollama is unreachable or a model is missing, every test in the suite skips with a clear
+`console.warn` — contributors without a local Ollama install never see false negatives.
+
+### Continuous integration
+
+Three GitHub Actions workflows gate changes:
+
+| Workflow             | File                                       | What it validates                                                                         |
+| -------------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `CI`                 | `.github/workflows/ci.yml`                 | Typecheck, lint, format, unit tests, `npm audit`, pre-commit hooks. Fast required check.  |
+| `Zotero E2E`         | `.github/workflows/e2e.yml`                | Real Zotero spawn + fake-Ollama e2e under Xvfb on Linux. Required check.                  |
+| `E2E Cross-Platform` | `.github/workflows/e2e-cross-platform.yml` | Full gate suite + real-Ollama e2e against a real Zotero install on Linux, macOS, Windows. |
+
+The cross-platform workflow pins `ZOTERO_VERSION` and `OLLAMA_VERSION` for reproducibility; treat it
+as a release gate rather than a fast per-PR gate.
+
+### Manual verification
+
+Use [`docs/manual-verification/zotero.md`](docs/manual-verification/zotero.md) for the human
+acceptance pass after building and packaging the `addon/` directory.
+
+## Project layout
 
 | Path       | Purpose                                                                   |
 | ---------- | ------------------------------------------------------------------------- |
@@ -305,3 +291,6 @@ ADRs under [`docs/decisions/`](docs/decisions/):
 | `docs/`    | Design specs, ADRs, manual verification, and supporting documentation.    |
 | `scripts/` | Build and packaging automation; bundled `llm-proxy` server.               |
 | `.forge/`  | Local Forge state is ignored; `.forge/learnings.jsonl` remains trackable. |
+
+</content>
+</invoke>

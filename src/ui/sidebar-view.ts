@@ -8,6 +8,7 @@ import {
   FG_MUTED,
   FIELD_TEXTAREA_STYLE,
   FONT_STACK,
+  MARKDOWN_CSS,
   STRIPE_BG,
   SURFACE_BG,
   TOOLBAR_BG,
@@ -36,6 +37,17 @@ export function renderSidebarConversation(input: {
     "style",
     `display: flex; flex-direction: column; height: 100%; font-family: ${FONT_STACK};`
   );
+
+  // AC-13: the sidebar ships no `<style>` of its own, so markdown bodies
+  // rendered by `renderMarkdown` would otherwise get only UA defaults.
+  // Mount the shared markdown stylesheet — scoped under
+  // `.zotero-ai-explain-sidebar__body` — so the sidebar and the popup
+  // render identical markdown typography. It travels into chrome with
+  // the element via `mountSidebar`, covering both the initial render
+  // and every streamed live-update delta (the runtime subscription
+  // reuses the same `__body` class).
+  const styleTag = document.createElement("style");
+  styleTag.textContent = MARKDOWN_CSS;
 
   // Header: selection quote + source label + close button. Pinned at the top
   // so the user always sees what they asked about as the conversation scrolls.
@@ -123,7 +135,7 @@ export function renderSidebarConversation(input: {
   applyFocusRing(send);
 
   form.append(followUp, send);
-  element.append(header, messages, form);
+  element.append(styleTag, header, messages, form);
 
   return element;
 }

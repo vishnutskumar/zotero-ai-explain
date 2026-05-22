@@ -2,6 +2,7 @@ import { createConversationStore } from "./conversation/conversation-store.js";
 import { createIndexStorage, type CreateIndexStorageDeps } from "./indexing/index-storage.js";
 import { createIndexingController } from "./indexing/indexing-controller.js";
 import type { LibraryCrawlerDeps } from "./indexing/library-crawler.js";
+import { openCitationInReader, type CitationReaderZotero } from "./platform/citation-open.js";
 import { runE2eDriver } from "./platform/e2e-driver.js";
 import type { SubprocessLike } from "./platform/proxy-lifecycle.js";
 import { dumpZoteroTokens } from "./platform/token-dump.js";
@@ -95,6 +96,13 @@ type ChromeIOUtils = {
   readonly write: (path: string, contents: Uint8Array) => Promise<number>;
   readonly remove: (path: string, options?: { ignoreAbsent?: boolean }) => Promise<void>;
   readonly exists: (path: string) => Promise<boolean>;
+  // Atomic move; backs `IndexStorage`'s migration `.tmp` → primary swap.
+  readonly move: (source: string, dest: string) => Promise<void>;
+  // Cheap file metadata probe; backs the AC-12 index-cache fingerprint.
+  // `size` is bytes; `lastModified` is epoch-ms (absent on some hosts).
+  readonly stat?: (
+    path: string
+  ) => Promise<{ readonly size?: number; readonly lastModified?: number }>;
 };
 
 /**
@@ -114,6 +122,13 @@ type ZoteroWithPrefs = ZoteroGlobal & {
   // the crawler degrades to title+abstract only.
   readonly FullText?: ZoteroLibrariesAndItems["FullText"];
   readonly File?: ZoteroLibrariesAndItems["File"];
+  // Phase 4 (per-page PDF text): the chrome-side PDF.js worker bridge.
+  // When present the crawler extracts per-page text via
+  // `Zotero.PDFWorker.getFullText` and stamps `sourceKind: "pdf-page"` +
+  // `pageIndex` on every chunk. Absent on hosts that stripped the module
+  // (tests, custom bundles); the crawler then falls back to reading the
+  // `.zotero-ft-cache` blob and stamps `sourceKind: "attachment"`.
+  readonly PDFWorker?: ZoteroLibrariesAndItems["PDFWorker"];
 };
 
 /**
@@ -159,15 +174,40 @@ function asStringPrefReader(prefs: ZoteroPrefs | undefined): StringPrefReader {
  * import (50 papers at once) would otherwise spawn 50 simultaneous
  * `start()` calls. The controller no-ops when not idle, so the
  * debounce is the cheap way to coalesce.
+ *
+ * E2E hermeticity (AC-8a): when the diagnostic e2e driver is active —
+ * signalled by a non-empty `extensions.zotero-ai-explain.e2e-trigger`
+ * pref — the auto-reindex observer is NOT registered. The driver's
+ * `runIndexFlow` drives the indexing controller deterministically
+ * (start → pause → resume → clear → re-index) and scrapes the
+ * controller status at precise points; an auto-reindex `start()`
+ * firing on its own debounce timer mid-flow would mutate the
+ * controller out from under those scrapes. Production installs never
+ * set `e2e-trigger`, so this gate is inert outside the e2e harness.
  */
-function attachAutoReindex(deps: {
+export function attachAutoReindex(deps: {
   readonly zotero: ZoteroGlobal;
   readonly indexingController: {
     readonly start: () => void;
     readonly getStatus: () => { state: string };
   };
   readonly debounceMs: number;
+  /**
+   * Value of the `extensions.zotero-ai-explain.e2e-trigger` pref.
+   * `undefined` (and the empty string) mean "not running under the
+   * e2e driver" → the observer registers normally. Any non-empty
+   * value disables auto-reindex for the session.
+   */
+  readonly e2eTriggerPref: string | undefined;
 }): () => void {
+  // Gate FIRST — before touching Zotero.Notifier — so the e2e harness
+  // gets a guaranteed no-op unsubscribe and zero observer registration.
+  if (deps.e2eTriggerPref !== undefined && deps.e2eTriggerPref.trim().length > 0) {
+    deps.zotero.debug(
+      "Zotero AI Explain: e2e-trigger pref set; auto-reindex disabled for the e2e session."
+    );
+    return () => undefined;
+  }
   type NotifierLike = {
     registerObserver?: (
       observer: {
@@ -258,6 +298,15 @@ function asStringPrefWriter(prefs: ZoteroPrefs | undefined): StringPrefWriter {
     }
   };
 }
+
+/**
+ * `openCitationInReader` + the `ResolvedCitation` / `CitationReaderZotero`
+ * types live in `./platform/citation-open.js`. They are re-exported here
+ * for back-compat with any caller still importing them from the bootstrap
+ * entrypoint; new code should import from the platform module directly.
+ */
+export { openCitationInReader } from "./platform/citation-open.js";
+export type { ResolvedCitation, CitationReaderZotero } from "./platform/citation-open.js";
 
 export type ZoteroBootstrapContext = {
   readonly pluginId: string;
@@ -350,6 +399,15 @@ function buildIndexStorageIo(zotero: ZoteroGlobal): CreateIndexStorageDeps["io"]
       // eslint-disable-next-line @typescript-eslint/require-await
       async exists() {
         return false;
+      },
+      async rename() {
+        // Swallow — no real filesystem to move within.
+      },
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async stat() {
+        // AC-12: the no-op fallback returns the "unstattable" sentinel
+        // so the index cache degrades to never-cache (never stale).
+        return null;
       }
     };
   }
@@ -372,6 +430,30 @@ function buildIndexStorageIo(zotero: ZoteroGlobal): CreateIndexStorageDeps["io"]
     },
     exists(path) {
       return utils.exists(path);
+    },
+    async rename(source, dest) {
+      // `IOUtils.move` is an atomic same-volume rename — the AC-5
+      // migration commit relies on this atomicity for crash safety.
+      await utils.move(source, dest);
+    },
+    async stat(path) {
+      // AC-12: cheap stat for the index-cache fingerprint. Resolves
+      // `null` when the file is absent OR the host's `IOUtils` lacks
+      // `stat` — either way the cache degrades to never-cache rather
+      // than risking a stale read.
+      if (typeof utils.stat !== "function") {
+        return null;
+      }
+      try {
+        const info = await utils.stat(path);
+        return {
+          size: typeof info.size === "number" ? info.size : 0,
+          ...(typeof info.lastModified === "number" ? { lastModified: info.lastModified } : {})
+        };
+      } catch {
+        // ENOENT (or any stat failure) → treat as absent.
+        return null;
+      }
     }
   };
 }
@@ -393,7 +475,15 @@ function resolveZoteroLibraries(zotero: ZoteroWithPrefs): ZoteroLibrariesAndItem
       // items. Both fields are optional — when absent the crawler still
       // indexes title+abstract.
       ...(zotero.FullText !== undefined ? { FullText: zotero.FullText } : {}),
-      ...(zotero.File !== undefined ? { File: zotero.File } : {})
+      ...(zotero.File !== undefined ? { File: zotero.File } : {}),
+      // Phase 4 (FINDING-1): thread Zotero.PDFWorker through so the
+      // PRODUCTION crawler takes the per-page PDF extraction path —
+      // emitting `sourceKind: "pdf-page"` chunks with `pageIndex` —
+      // instead of falling back to the `.zotero-ft-cache` blob (which
+      // stamps `sourceKind: "attachment"` and carries no page). Optional:
+      // a host that stripped `Zotero.PDFWorker` (tests, custom bundles)
+      // degrades to the cache-blob path with no crash.
+      ...(zotero.PDFWorker !== undefined ? { PDFWorker: zotero.PDFWorker } : {})
     };
   }
   zotero.debug(
@@ -842,7 +932,17 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
   maybeDumpTokens(zotero);
 
   const settings = loadOllamaSettings(zotero);
-  context.Zotero.debug(`Zotero AI Explain ollama config: baseUrl=${settings.baseUrl}`);
+  // AC-8b: log the SPLIT chat/embed URLs (the fields the provider and
+  // indexing controller actually consume) rather than only the legacy
+  // single `baseUrl`. `chatBaseUrl` falls through to the legacy
+  // `ollama-base-url` pref when no modern `chat-base-url` is set
+  // (`ollama-profile.ts:105`), so a legacy install still surfaces a
+  // meaningful chat URL here. `baseUrl` stays in the line as the
+  // legacy mirror for back-reference.
+  context.Zotero.debug(
+    `Zotero AI Explain ollama config: chatBaseUrl=${settings.chatBaseUrl} ` +
+      `embedBaseUrl=${settings.embedBaseUrl} (legacy baseUrl=${settings.baseUrl})`
+  );
   // Live profile read (fix codex review #5): the popup explain path
   // and library-chat path both invoke this to get the URL/model active
   // RIGHT NOW. Previously a startup snapshot was bound in and never
@@ -909,13 +1009,16 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
   // Phase 4: index storage is now per-(provider, model) so a user
   // switching from Ollama to OpenAI doesn't blend incompatible
   // dimensions into a single corrupt file.
+  const indexStorageIo = buildIndexStorageIo(context.Zotero);
+  const indexStorageDataDir = resolveDataDirectory(zotero);
+  const indexEmbedProvider = {
+    kind: providerProfile.embedProvider,
+    model: settings.embeddingModel
+  };
   const indexStorage = createIndexStorage({
-    zotero: { DataDirectory: resolveDataDirectory(zotero) },
-    io: buildIndexStorageIo(context.Zotero),
-    embedProvider: {
-      kind: providerProfile.embedProvider,
-      model: settings.embeddingModel
-    }
+    zotero: { DataDirectory: indexStorageDataDir },
+    io: indexStorageIo,
+    embedProvider: indexEmbedProvider
   });
   const embeddingProvider = buildEmbeddingProvider({
     fetch: fetchForAdapters,
@@ -923,17 +1026,22 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
     readProviderProfile,
     ollamaProvider
   });
+  const crawlerZotero = resolveZoteroLibraries(zotero);
+  // Crawler hits the EMBEDDING endpoint (Ollama `/api/embeddings`), so
+  // it must use `embedBaseUrl`. After the split-URL change, `baseUrl`
+  // semantically mirrors `chatBaseUrl` and would route embed traffic
+  // through the chat proxy — wrong destination, slow at best, broken
+  // at worst. For direct-API providers the `baseUrl` field is ignored
+  // by the adapter (we hard-code the canonical host).
+  const crawlerSettings = {
+    baseUrl: settings.embedBaseUrl,
+    embeddingModel: settings.embeddingModel
+  };
   const indexingController = createIndexingController({
     logger: context.Zotero,
-    zotero: resolveZoteroLibraries(zotero),
+    zotero: crawlerZotero,
     provider: embeddingProvider,
-    // Crawler hits the EMBEDDING endpoint (Ollama `/api/embeddings`), so
-    // it must use `embedBaseUrl`. After the split-URL change, `baseUrl`
-    // semantically mirrors `chatBaseUrl` and would route embed traffic
-    // through the chat proxy — wrong destination, slow at best, broken
-    // at worst. For direct-API providers the `baseUrl` field is
-    // ignored by the adapter (we hard-code the canonical host).
-    settings: { baseUrl: settings.embedBaseUrl, embeddingModel: settings.embeddingModel },
+    settings: crawlerSettings,
     storage: indexStorage
   });
   // Seed `previouslyIndexed` before the settings dialog opens.
@@ -1051,73 +1159,15 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
     embeddingProvider,
     indexStorage,
     embedSettings: { baseUrl: settings.embedBaseUrl, model: settings.embeddingModel },
-    openItem: (itemKey) => {
+    openItem: (citation) => {
       try {
-        type ZoteroLike = {
-          getActiveZoteroPane?: () => {
-            selectItems?: (ids: readonly number[]) => Promise<void> | void;
-          } | null;
-          Items?: {
-            getByLibraryAndKey?: (
-              libraryID: number,
-              key: string
-            ) =>
-              | {
-                  readonly id: number;
-                  readonly isRegularItem?: () => boolean;
-                  readonly getAttachments?: () => readonly number[];
-                }
-              | false
-              | null;
-            get?: (id: number) => {
-              readonly id: number;
-              readonly isPDFAttachment?: () => boolean;
-              readonly attachmentContentType?: string;
-            } | null;
-          };
-          Libraries?: { userLibraryID: number };
-          Reader?: { open?: (id: number) => Promise<void> | void };
-        };
-        const zoteroAny = zotero as unknown as ZoteroLike;
-        const userLibraryID = zoteroAny.Libraries?.userLibraryID ?? 1;
-        const item = zoteroAny.Items?.getByLibraryAndKey?.(userLibraryID, itemKey);
-        if (item === false || item === null || item === undefined) {
-          zotero.debug(`Zotero AI Explain: library-chat citation ${itemKey} not found`);
-          return;
-        }
-        // Resolve the best attachment to open: prefer a PDF child of a
-        // parent item; if `item` is already an attachment, use it; else
-        // we have nothing to open and fall back to selecting the row.
-        let attachmentId: number | null = null;
-        const isRegular = item.isRegularItem?.() === true;
-        if (isRegular && item.getAttachments !== undefined) {
-          for (const childId of item.getAttachments()) {
-            const att = zoteroAny.Items?.get?.(childId);
-            if (att === null || att === undefined) continue;
-            const isPdf =
-              att.isPDFAttachment?.() === true || att.attachmentContentType === "application/pdf";
-            if (isPdf) {
-              attachmentId = att.id;
-              break;
-            }
-          }
-        } else if (!isRegular) {
-          // The cited item is itself an attachment (rarer but possible).
-          attachmentId = item.id;
-        }
-        if (attachmentId !== null && zoteroAny.Reader?.open !== undefined) {
-          void zoteroAny.Reader.open(attachmentId);
-          return;
-        }
-        // Fallback: no PDF child or no Reader API — at least select the
-        // row so the user sees what was cited.
-        const pane = zoteroAny.getActiveZoteroPane?.();
-        if (pane?.selectItems !== undefined) {
-          void pane.selectItems([item.id]);
+        const result = openCitationInReader(citation, zotero as unknown as CitationReaderZotero);
+        if (result.outcome === "not-found") {
+          zotero.debug(`Zotero AI Explain: library-chat citation ${citation.itemKey} not found`);
         }
       } catch (err) {
         zotero.debug(
-          `Zotero AI Explain: openItem(${itemKey}) failed ${err instanceof Error ? err.message : String(err)}`
+          `Zotero AI Explain: openItem(${citation.itemKey}) failed ${err instanceof Error ? err.message : String(err)}`
         );
       }
     }
@@ -1185,7 +1235,13 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
   detachAutoReindex = attachAutoReindex({
     zotero: context.Zotero,
     indexingController,
-    debounceMs: 5_000
+    debounceMs: 5_000,
+    // AC-8a e2e hermeticity: disable auto-reindex when the diagnostic
+    // driver is active so it can't race the driver's deterministic
+    // index-flow scrapes. The pref is read through the same narrow
+    // `StringPrefReader` bridge the rest of bootstrap uses; `undefined`
+    // (production) leaves auto-reindex fully enabled.
+    e2eTriggerPref: asStringPrefReader(zotero.Prefs).get("extensions.zotero-ai-explain.e2e-trigger")
   });
 
   // First-run onboarding probe. Runs asynchronously so it never blocks
@@ -1216,7 +1272,18 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
     popupController,
     sidebarController,
     indexingController,
-    disclosure: describeDisclosureFor(readProviderProfile)
+    disclosure: describeDisclosureFor(readProviderProfile),
+    // AC-5 migration-resume harness: the raw pieces the diagnostic
+    // driver needs to build a fresh storage + controller on a spy io
+    // adapter. No effect in production (the driver flow is pref-gated).
+    migrationHarness: {
+      io: indexStorageIo,
+      dataDir: indexStorageDataDir.dir,
+      embedProvider: indexEmbedProvider,
+      crawlerZotero,
+      crawlerProvider: embeddingProvider,
+      crawlerSettings
+    }
   });
 }
 

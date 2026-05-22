@@ -71,20 +71,38 @@ describe("attachIndexControls", () => {
     expect(summary?.textContent ?? "").toContain("0 / 0 indexed");
     const start = view.querySelector<HTMLButtonElement>('[data-action="start-index"]');
     start?.click();
-    expect(summary?.textContent ?? "").toMatch(/Indexing/u);
+    // AC-14 Fix 3: an immediately-started run (`totalItems === 0`, before
+    // the first crawler `onProgress`) shows "Starting… scanning your
+    // library." rather than "Indexing 0 of 0." — the regex accepts both.
+    expect(summary?.textContent ?? "").toMatch(/Indexing|Starting/u);
     detach();
     view.remove();
   });
 
-  it("supports pause -> resume -> clear flow with visible status changes", () => {
+  it("supports pause -> resume -> clear flow with visible status changes", async () => {
     const { view, summary, detach } = setup();
     view.querySelector<HTMLButtonElement>('[data-action="start-index"]')?.click();
-    expect(summary?.textContent ?? "").toMatch(/Indexing/u);
+    expect(summary?.textContent ?? "").toMatch(/Indexing|Starting/u);
     view.querySelector<HTMLButtonElement>('[data-action="pause-index"]')?.click();
     expect(summary?.textContent ?? "").toContain("Paused");
     view.querySelector<HTMLButtonElement>('[data-action="resume-index"]')?.click();
-    expect(summary?.textContent ?? "").toMatch(/Indexing/u);
-    view.querySelector<HTMLButtonElement>('[data-action="clear-index"]')?.click();
+    expect(summary?.textContent ?? "").toMatch(/Indexing|Starting/u);
+    // AC-14 Fix 2: the Clear button is now a two-stage in-view confirm.
+    // The flow test's `clear` step is updated in lockstep with the
+    // two-stage confirm (the e2e-driver co-change pattern applies to the
+    // unit flow test too — plan "Regression guard").
+    const clearBtn = view.querySelector<HTMLButtonElement>('[data-action="clear-index"]');
+    clearBtn?.click(); // arm the confirm
+    clearBtn?.click(); // confirm → drives the real clear
+    // `controller.clear()` is async (it awaits the in-flight run); drain
+    // microtasks so the `cleared` reducer action lands before asserting
+    // the cleared-state summary. (Pre-AC-14 this assertion passed only
+    // because the running-state text itself contained "0 / 0 indexed";
+    // AC-14 Fix 3 changed that text to "Starting…", so the test must
+    // genuinely await the clear to observe the idle/cleared state.)
+    for (let i = 0; i < 16; i += 1) {
+      await Promise.resolve();
+    }
     expect(summary?.textContent ?? "").toContain("0 / 0 indexed");
     detach();
     view.remove();

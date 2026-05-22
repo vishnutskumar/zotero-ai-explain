@@ -8,6 +8,12 @@ export type ConversationStore = {
   createFromSelection(selection: SelectionContext, profile: ProviderProfile): Conversation;
   get(id: string): Conversation | null;
   appendUserMessage(id: string, content: string): void;
+  /**
+   * Append a `system` message. Used by the ask-question flow to seed a
+   * sticky-quote frame that rides every provider request for the
+   * conversation's lifetime.
+   */
+  appendSystemMessage(id: string, content: string): void;
   appendAssistantDelta(id: string, text: string): void;
   markStreaming(id: string): void;
   complete(id: string): void;
@@ -65,6 +71,9 @@ export function createConversationStore(): ConversationStore {
     },
     appendUserMessage(id, content) {
       appendMessage(id, { role: "user", content });
+    },
+    appendSystemMessage(id, content) {
+      appendMessage(id, { role: "system", content });
     },
     appendAssistantDelta(id, text) {
       update(id, (conversation) => {

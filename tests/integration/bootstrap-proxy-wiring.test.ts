@@ -338,6 +338,70 @@ describe("bootstrap proxy + embed-url wiring", () => {
     spy.mockRestore();
   });
 
+  it("threads Zotero.PDFWorker into the production crawler deps when the host exposes it", async () => {
+    // FINDING-1: production indexing must take the per-page PDF
+    // extraction path. That path is gated on `deps.zotero.PDFWorker`
+    // being present in the crawler deps — `resolveZoteroLibraries()` must
+    // forward `Zotero.PDFWorker` so the controller's crawler emits
+    // `sourceKind: "pdf-page"` chunks instead of `.zotero-ft-cache` blobs.
+    const pdfWorker = {
+      // eslint-disable-next-line @typescript-eslint/require-await
+      getFullText: async () => ({ text: "page one", extractedPages: 1, totalPages: 1 })
+    };
+    // Add Libraries/Items so `resolveZoteroLibraries` takes the real
+    // branch (the defensive stub would never carry PDFWorker), and expose
+    // PDFWorker on the same global.
+    const z = rig.context.Zotero as unknown as Record<string, unknown>;
+    z.Libraries = { userLibraryID: 1 };
+    z.Items = {
+      // eslint-disable-next-line @typescript-eslint/require-await
+      getAll: async () => [],
+      get: () => null
+    };
+    z.PDFWorker = pdfWorker;
+
+    const controllerModule = await import("../../src/indexing/indexing-controller.js");
+    const spy = vi.spyOn(controllerModule, "createIndexingController");
+
+    const bootstrap = await import("../../src/bootstrap.js");
+    await bootstrap.startup(rig.context);
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const crawlerZotero = spy.mock.calls[0]?.[0]?.zotero;
+    expect(crawlerZotero?.PDFWorker).toBe(pdfWorker);
+
+    setTimeout(() => rig.procs.list[0]?.finishExit(0), 0);
+    await bootstrap.shutdown(rig.context);
+    spy.mockRestore();
+  });
+
+  it("omits PDFWorker from the crawler deps when the host does not expose it", async () => {
+    // A host that stripped `Zotero.PDFWorker` (custom bundle) must still
+    // wire cleanly — the crawler degrades to the `.zotero-ft-cache` path.
+    const z = rig.context.Zotero as unknown as Record<string, unknown>;
+    z.Libraries = { userLibraryID: 1 };
+    z.Items = {
+      // eslint-disable-next-line @typescript-eslint/require-await
+      getAll: async () => [],
+      get: () => null
+    };
+    // No PDFWorker on the global.
+
+    const controllerModule = await import("../../src/indexing/indexing-controller.js");
+    const spy = vi.spyOn(controllerModule, "createIndexingController");
+
+    const bootstrap = await import("../../src/bootstrap.js");
+    await bootstrap.startup(rig.context);
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const crawlerZotero = spy.mock.calls[0]?.[0]?.zotero;
+    expect(crawlerZotero?.PDFWorker).toBeUndefined();
+
+    setTimeout(() => rig.procs.list[0]?.finishExit(0), 0);
+    await bootstrap.shutdown(rig.context);
+    spy.mockRestore();
+  });
+
   it("does not auto-start when the autostart pref is absent", async () => {
     // Without the autostart pref, wireProxyLifecycle constructs but
     // does NOT spawn. The Start button in the settings dialog is the

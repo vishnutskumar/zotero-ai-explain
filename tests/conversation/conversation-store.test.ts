@@ -10,8 +10,7 @@ const selection: SelectionContext = {
     itemKey: "I",
     itemTitle: "Paper",
     attachmentKey: "A",
-    pageLabel: "3",
-    location: "page=3"
+    pageLabel: "3"
   },
   anchor: null
 };

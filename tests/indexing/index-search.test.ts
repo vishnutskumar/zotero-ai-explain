@@ -14,11 +14,32 @@ function fakeStorage(file: IndexFile | null): IndexStorage {
     read() {
       return Promise.resolve(file);
     },
+    readWithMigration() {
+      return Promise.resolve({ file, migrationPending: false });
+    },
     readItemCount() {
       return Promise.resolve(file === null ? 0 : Object.keys(file.items).length);
     },
     write() {
       return Promise.resolve();
+    },
+    writeTmp() {
+      return Promise.resolve();
+    },
+    commitMigration() {
+      return Promise.resolve();
+    },
+    abandonMigration() {
+      return Promise.resolve();
+    },
+    writeMarker() {
+      return Promise.resolve();
+    },
+    removeMarker() {
+      return Promise.resolve();
+    },
+    hasMarker() {
+      return Promise.resolve(false);
     },
     clear() {
       return Promise.resolve();
@@ -32,7 +53,18 @@ function fakeStorage(file: IndexFile | null): IndexStorage {
 function makeIndex(
   items: Record<string, { title: string; chunks: { text: string; embedding: number[] }[] }>
 ): IndexFile {
-  return { items, indexedAt: new Date(0).toISOString() };
+  // Stamp the v0.3.0 required `sourceKind` (and `schemaVersion`) so the
+  // black-box test fixtures stay terse — these tests exercise cosine
+  // retrieval, not chunk provenance, so a uniform "metadata" kind is
+  // a faithful stand-in.
+  const stamped: IndexFile["items"] = {};
+  for (const [key, item] of Object.entries(items)) {
+    stamped[key] = {
+      title: item.title,
+      chunks: item.chunks.map((chunk) => ({ ...chunk, sourceKind: "metadata" as const }))
+    };
+  }
+  return { schemaVersion: 2, items: stamped, indexedAt: new Date(0).toISOString() };
 }
 
 describe("cosineSimilarity", () => {

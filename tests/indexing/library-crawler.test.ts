@@ -73,7 +73,6 @@ import type {
   EmbeddingProviderLike,
   IndexFile,
   IndexLibraryOptions,
-  IndexStorage,
   LibraryCrawlerDeps,
   ZoteroItemLike
 } from "./contracts.js";
@@ -218,18 +217,15 @@ function makeHarness(opts: {
     itemsById.set(child.id, child);
   }
 
-  const storage: IndexStorage = {
+  // The crawler consumes only the narrow `{read, write, clear, path}`
+  // storage subset — not the full `IndexStorage` migration surface.
+  const storage: LibraryCrawlerDeps["storage"] = {
     async read() {
       await Promise.resolve();
       if (opts.initialFile === undefined) return null;
       if (opts.initialFile === null) return null;
       storageReads.push(opts.initialFile);
       return opts.initialFile;
-    },
-    async readItemCount() {
-      await Promise.resolve();
-      if (opts.initialFile === undefined || opts.initialFile === null) return 0;
-      return Object.keys(opts.initialFile.items).length;
     },
     async write(file) {
       await Promise.resolve();
@@ -632,9 +628,10 @@ describe("indexLibrary — resume (FINDING-5)", () => {
       fakeItem({ id: 4, key: "D", title: "d" })
     ];
     const initialFile: IndexFile = {
+      schemaVersion: 2,
       items: {
-        A: { title: "a", chunks: [{ text: "a", embedding: [0.1] }] },
-        B: { title: "b", chunks: [{ text: "b", embedding: [0.2] }] }
+        A: { title: "a", chunks: [{ text: "a", embedding: [0.1], sourceKind: "metadata" }] },
+        B: { title: "b", chunks: [{ text: "b", embedding: [0.2], sourceKind: "metadata" }] }
       },
       indexedAt: "2026-05-17T00:00:00Z"
     };

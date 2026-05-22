@@ -86,8 +86,11 @@ describe("Zotero plugin load (e2e)", () => {
 
   it("registers the reader text-selection-popup command", () => {
     const handle = requireHandle(state);
+    // Matches both the legacy singular `registered reader command:` line and
+    // the current plural `registered reader commands:` line — the reader now
+    // registers Explain + Ask-a-question together via `addReaderCommands`.
     expect(handle.getLog()).toMatch(
-      /Zotero AI Explain registered reader command: Explain with AI/u
+      /Zotero AI Explain registered reader commands?: Explain with AI/u
     );
   });
 

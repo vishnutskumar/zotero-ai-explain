@@ -84,6 +84,9 @@ function createFakeUi(): { ui: ZoteroUiAdapter; lastDialogRoot: () => HTMLElemen
       }
       return () => undefined;
     },
+    addReaderCommands() {
+      return () => undefined;
+    },
     addReaderCommand() {
       return () => undefined;
     },

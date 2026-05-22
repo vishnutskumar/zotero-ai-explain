@@ -16,15 +16,17 @@ src/
     conversation-types.ts
   indexing/
     library-crawler.ts     # Walks Zotero.Items, chunks text, embeds, persists per-item
+    per-source-chunks.ts   # Per-source extraction (metadata / notes / PDF pages / attachments)
     indexing-controller.ts # State machine (idle → running → paused / complete / failed)
     indexing-status.ts     # Status reducer with honest cumulative progress counter
-    index-storage.ts       # Atomic JSON read/write under Zotero data dir
+    index-storage.ts       # Atomic JSON read/write + schemaVersion migration + in-memory cache
     index-path.ts          # Per-(provider, model) filename rules + legacy back-compat
-    index-search.ts        # Cosine top-K retrieval; throws on dimension mismatch
+    index-search.ts        # Cosine top-K retrieval (optional scopedItemKey); throws on dim mismatch
   platform/
-    zotero-runtime.ts          # Runtime dep graph, mounts UI, registers menus
-    zotero-ui-adapter.ts       # Reader command, anchored popup, sidebar mounts
+    zotero-runtime.ts          # Runtime dep graph, mounts UI, registers menus + reader commands
+    zotero-ui-adapter.ts       # Reader commands, anchored popup, sidebar mounts
     zotero-ui-types.ts         # Narrow types over Zotero chrome objects
+    citation-open.ts           # Resolves a library-chat citation click to Zotero.Reader.open
     e2e-driver.ts              # In-process driver used by the e2e suite
     proxy-lifecycle.ts         # Headless lifecycle controller for the llm-proxy child
     wire-proxy-lifecycle.ts    # Wires Subprocess + settings prefs + Node-binary auto-detect
@@ -49,15 +51,16 @@ src/
   selection/
     selection-context.ts, normalize-selection.ts
   ui/
-    anchored-popup-view.ts       # Selected-text explanation popup
+    anchored-popup-view.ts       # "Explain with AI" / "Ask a question" anchored popup
     popup-controller.ts
     sidebar-view.ts, sidebar-controller.ts
     library-chat-view.ts         # NotebookLM-style "Ask your library" dialog
+    citation-lookup.ts           # Parses [itemKey#chunkIndex] tokens; per-turn lookup table
     index-controls-view.ts       # Settings dialog's Library Index controls
     settings-view.ts             # Preset dropdown + provider selectors + proxy controls
     onboarding-view.ts           # First-run onboarding state machine
     markdown.ts                  # XSS-safe streaming markdown renderer
-    styles.ts                    # Shared style constants for the settings dialog
+    styles.ts                    # Shared style constants + MARKDOWN_CSS for popup + sidebar
     privacy-label.ts
 ```
 

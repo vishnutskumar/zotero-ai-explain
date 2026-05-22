@@ -338,7 +338,11 @@ describe("AC4: createIndexingController — start() spawns the crawler", () => {
 
   it("T2: start() reads storage so resume semantics inherit prior state", async () => {
     const h = makeHarness({
-      initialFile: { items: { a: { title: "A", chunks: [] } }, indexedAt: "2026-01-01T00:00:00Z" }
+      initialFile: {
+        schemaVersion: 2,
+        items: { a: { title: "A", chunks: [] } },
+        indexedAt: "2026-01-01T00:00:00Z"
+      }
     });
     h.controller.start();
     await flush();
@@ -422,9 +426,10 @@ describe("AC4: resume() — paused -> running", () => {
 
   it("T8: resume() re-reads storage so resumeFromItemKey reflects the persisted last key", async () => {
     const persisted: IndexFile = {
+      schemaVersion: 2,
       items: {
-        a: { title: "A", chunks: [{ text: "...", embedding: [0.1] }] },
-        b: { title: "B", chunks: [{ text: "...", embedding: [0.2] }] }
+        a: { title: "A", chunks: [{ text: "...", embedding: [0.1], sourceKind: "metadata" }] },
+        b: { title: "B", chunks: [{ text: "...", embedding: [0.2], sourceKind: "metadata" }] }
       },
       indexedAt: "2026-01-01T00:00:00Z"
     };
@@ -845,5 +850,206 @@ describe("AC4: clear() while a circuit breaker error is in flight", () => {
     expect(status.state).toBe("idle");
     expect(status.errorMessage).toBeUndefined();
     expect(h.storage.clear).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ----------------------------------------------------------------------
+// FINDING-4 (Phase 4b codex review, AC-5) — clear() must coordinate with
+// an in-flight migration. A `commitMigration` rename completing AFTER
+// `storage.clear()` would resurrect the index the user removed; a stale
+// `.migrating` marker left behind would re-trigger migration next launch.
+// ----------------------------------------------------------------------
+
+/**
+ * A migration-aware in-memory storage. Unlike the AC4 `FakeStorage` it
+ * carries the full migration surface (`readWithMigration`, `writeTmp`,
+ * `commitMigration`, marker methods) so the controller's `runMigration`
+ * runs end-to-end. `clear()` mirrors the production `IndexStorage.clear()`
+ * (FINDING-4): it removes the primary, the `.tmp`, AND the marker.
+ */
+function makeMigrationStorage(legacyPrimary: IndexFile | null): {
+  readonly storage: import("../../src/indexing/index-storage.js").IndexStorage;
+  readonly state: { primary: IndexFile | null; tmp: IndexFile | null; marker: boolean };
+  readonly opLog: string[];
+} {
+  const state: { primary: IndexFile | null; tmp: IndexFile | null; marker: boolean } = {
+    primary: legacyPrimary,
+    tmp: null,
+    marker: false
+  };
+  const opLog: string[] = [];
+  const storage: import("../../src/indexing/index-storage.js").IndexStorage = {
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async read() {
+      return state.primary;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async readWithMigration() {
+      const schemaVersion = state.primary?.schemaVersion ?? 1;
+      return {
+        file: state.primary,
+        migrationPending: state.marker || schemaVersion < 2
+      };
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async readItemCount() {
+      return state.primary === null ? 0 : Object.keys(state.primary.items).length;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async write(file) {
+      state.primary = file;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async writeTmp(file) {
+      opLog.push("writeTmp");
+      state.tmp = file;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async commitMigration() {
+      opLog.push("commitMigration");
+      if (state.tmp === null) throw new Error("no .tmp to commit");
+      state.primary = state.tmp;
+      state.tmp = null;
+      state.marker = false;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async abandonMigration() {
+      state.tmp = null;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async writeMarker() {
+      state.marker = true;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async removeMarker() {
+      state.marker = false;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async hasMarker() {
+      return state.marker;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async clear() {
+      // FINDING-4: production `IndexStorage.clear()` removes primary,
+      // meta, `.tmp`, AND the marker — mirror that here.
+      opLog.push("clear");
+      state.primary = null;
+      state.tmp = null;
+      state.marker = false;
+    },
+    path() {
+      return "/var/test-fixture/zotero-data/zotero-ai-explain-index.json";
+    }
+  };
+  return { storage, state, opLog };
+}
+
+function legacyV1File(): IndexFile {
+  // A legacy file with no `schemaVersion` — `readWithMigration` treats
+  // the absence as v1, so `migrationPending` is true.
+  return {
+    items: { LEG1: { title: "Legacy", chunks: [] } },
+    indexedAt: "2026-05-01T00:00:00.000Z"
+  } as unknown as IndexFile;
+}
+
+function makeMigrationController(
+  storage: import("../../src/indexing/index-storage.js").IndexStorage
+): { readonly controller: IndexingController } {
+  const controllerOpts = {
+    logger: { debug: (): void => undefined },
+    zotero: {
+      Libraries: { userLibraryID: 1 },
+      Items: {
+        // eslint-disable-next-line @typescript-eslint/require-await
+        getAll: async () => [] as const,
+        get: () => null
+      }
+    },
+    provider: {
+      // eslint-disable-next-line @typescript-eslint/require-await
+      embedTexts: async () => [[0.1]] as const
+    },
+    settings: { baseUrl: "http://localhost:11434", embeddingModel: "nomic-embed-text" },
+    storage,
+    scheduler: vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+  } as unknown as Parameters<typeof createIndexingController>[0];
+  return { controller: createIndexingController(controllerOpts) };
+}
+
+describe("FINDING-4: clear() coordinated with an active migration", () => {
+  it("a clear mid-migration leaves the index cleared — no commit resurrects it", async () => {
+    // A legacy v1 primary → hydrate() detects migrationPending and runs
+    // the migration. The mocked `indexLibrary` (the migration crawl) is
+    // held pending so the migration is genuinely in flight.
+    const { storage, state, opLog } = makeMigrationStorage(legacyV1File());
+    const { controller } = makeMigrationController(storage);
+
+    // hydrate() → readWithMigration → runMigration → writeMarker +
+    // abandonMigration + writeTmp(seed) + indexLibrary(migration crawl).
+    const hydratePromise = controller.hydrate();
+    await flush();
+    // The migration crawl is now the in-flight `indexLibrary` call.
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    const migrationCrawl = calls[0];
+    if (migrationCrawl === undefined) throw new Error("expected the migration crawl");
+    // The marker was written — a migration IS in flight.
+    expect(state.marker).toBe(true);
+
+    // User clears the index mid-migration.
+    const clearPromise = clearController(controller);
+    await flush();
+    // The migration crawl's abort signal must have fired so the crawl
+    // settles promptly rather than blocking clear().
+    expect(migrationCrawl.options.signal.aborted).toBe(true);
+
+    // Even if the crawl now resolves `{completed: true}`, the migration
+    // must NOT commit — `clear()` flagged cancellation.
+    migrationCrawl.resolve({ completed: true });
+    await clearPromise;
+    await hydratePromise;
+    await flush();
+
+    // Post-condition: the index is cleared and STAYS cleared. No commit
+    // renamed a stale `.tmp` back over the primary.
+    expect(state.primary).toBeNull();
+    expect(state.tmp).toBeNull();
+    expect(state.marker).toBe(false);
+    expect(opLog).not.toContain("commitMigration");
+    expect(controller.getStatus().state).toBe("idle");
+  });
+
+  it("after a clear-during-migration the next hydrate does NOT re-fire migration", async () => {
+    // The marker is the migration re-trigger. After clear() removes it,
+    // a fresh hydrate() sees `file === null` + no marker → fresh-install
+    // branch → migration is skipped, not re-run.
+    const { storage, state } = makeMigrationStorage(legacyV1File());
+    const { controller } = makeMigrationController(storage);
+
+    const hydratePromise = controller.hydrate();
+    await flush();
+    const migrationCrawl = calls[0];
+    if (migrationCrawl === undefined) throw new Error("expected the migration crawl");
+
+    const clearPromise = clearController(controller);
+    await flush();
+    migrationCrawl.resolve({ completed: true });
+    await clearPromise;
+    await hydratePromise;
+    await flush();
+
+    // A subsequent launch: readWithMigration sees null file + no marker.
+    const probe = await storage.readWithMigration();
+    expect(probe.file).toBeNull();
+    expect(state.marker).toBe(false);
+    // hydrate()'s fresh-install branch (file null + no marker) skips the
+    // migration — confirmed by the controller staying idle and spawning
+    // no new migration crawl.
+    const callsBefore = calls.length;
+    const secondHydrate = controller.hydrate();
+    await flush();
+    await secondHydrate;
+    expect(calls.length).toBe(callsBefore);
+    expect(controller.getStatus().state).toBe("idle");
   });
 });

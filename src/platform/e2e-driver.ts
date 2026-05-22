@@ -1,10 +1,25 @@
 import type { ConversationStore } from "../conversation/conversation-store.js";
-import type { IndexingController } from "../indexing/indexing-controller.js";
+import type { EmbedProviderKind } from "../indexing/index-path.js";
+import { createIndexStorage, type CreateIndexStorageDeps } from "../indexing/index-storage.js";
+import {
+  createIndexingController,
+  type IndexingController
+} from "../indexing/indexing-controller.js";
+import type { IndexFile, LibraryCrawlerDeps } from "../indexing/library-crawler.js";
 import type { OllamaSettings, StringPrefReader } from "../preferences/ollama-profile.js";
 import type { ProviderProfile } from "../providers/provider-types.js";
 import type { SelectionContext } from "../selection/selection-context.js";
+import { openCitationInReader } from "./citation-open.js";
+import type { RetrievedChunk } from "../indexing/index-search.js";
 import { renderAnchoredPopup } from "../ui/anchored-popup-view.js";
+import { buildCitationLookup, type CitationLookup } from "../ui/citation-lookup.js";
 import { attachIndexControls } from "../ui/index-controls-view.js";
+import {
+  buildLibraryPrompt,
+  renderLibraryChatView,
+  wireLibraryChatView,
+  type CitationClick
+} from "../ui/library-chat-view.js";
 import type { PopupController } from "../ui/popup-controller.js";
 import { renderSettingsView } from "../ui/settings-view.js";
 import type { SidebarController } from "../ui/sidebar-controller.js";
@@ -52,10 +67,35 @@ export type E2eDriverDeps = {
   readonly sidebarController: SidebarController;
   readonly indexingController: IndexingController;
   readonly disclosure: () => string;
+  /**
+   * AC-5 migration-resume harness wiring. Optional — only the
+   * `migration-resume` driver flow consumes it. Bootstrap supplies the
+   * raw pieces so the flow can build a fresh `IndexStorage` +
+   * `IndexingController` on a SPY io adapter and observe whether the
+   * primary index file is ever written in place during a migration.
+   * Absent in production / older harness builds (the flow then skips).
+   */
+  readonly migrationHarness?: {
+    readonly io: CreateIndexStorageDeps["io"];
+    readonly dataDir: string;
+    readonly embedProvider: { readonly kind: EmbedProviderKind; readonly model: string };
+    readonly crawlerZotero: LibraryCrawlerDeps["zotero"];
+    readonly crawlerProvider: LibraryCrawlerDeps["provider"];
+    readonly crawlerSettings: LibraryCrawlerDeps["settings"];
+  };
 };
 
 const TRIGGER_PREF = "extensions.zotero-ai-explain.e2e-trigger";
 const SAMPLE_PDF_PREF = "extensions.zotero-ai-explain.e2e-sample-pdf";
+// Optional multi-page PDF fixture path. The `pdfworker-smoke` flow imports
+// it (when set) to exercise the `\f` page-boundary split on a PDF with
+// `totalPages > 1`. Absent in the production case and in flows that only
+// need the single-page `sample.pdf`.
+const MULTIPAGE_PDF_PREF = "extensions.zotero-ai-explain.e2e-multipage-pdf";
+// Optional corrupt/non-PDF fixture path. The `pdfworker-smoke` flow imports
+// it (when set) and asserts `Zotero.PDFWorker.getFullText` REJECTS — the
+// adversarial case that proves the failure is surfaced, not swallowed.
+const CORRUPT_PDF_PREF = "extensions.zotero-ai-explain.e2e-corrupt-pdf";
 
 // ---------------------------------------------------------------------------
 // Module-scope state. The real-pdf-setup prelude populates these; downstream
@@ -124,6 +164,25 @@ type ZoteroGlobalWithApis = ZoteroGlobal & {
     close?(itemID: number): Promise<void> | void;
   };
   readonly Zotero_Tabs?: { close(tabID: string): void };
+  // Chrome-side PDF.js worker bridge (omni.ja
+  // `chrome/content/zotero/xpcom/pdfWorker/manager.js:644-680`). `getFullText`
+  // resolves to `{text, extractedPages, totalPages}`; page boundaries in
+  // `text` are `\f` characters (worker.js:107407-107419 — `\f` is pushed
+  // between pages, never after the final page, so an N-page PDF has N-1
+  // form-feeds). Rejects with an Error when the attachment is not a PDF or
+  // the worker fails to parse it (corrupt/encrypted file).
+  readonly PDFWorker?: {
+    getFullText(
+      itemID: number,
+      maxPages?: number | readonly number[],
+      isPriority?: boolean,
+      password?: string
+    ): Promise<{
+      readonly text: string;
+      readonly extractedPages: number;
+      readonly totalPages: number;
+    }>;
+  };
 };
 
 type Logger = (key: string, value: string) => void;
@@ -142,8 +201,10 @@ export async function runE2eDriver(deps: E2eDriverDeps): Promise<void> {
 
   try {
     // AC2 prelude — open a real PDF reader before any adversarial phase.
+    // Also runs for `pdfworker-smoke`: the smoke flow reuses the
+    // single-page attachment this prelude imports.
     let preludeReady = true;
-    if (trigger === "all" || trigger === "real-pdf-setup") {
+    if (trigger === "all" || trigger === "real-pdf-setup" || trigger === "pdfworker-smoke") {
       const { readyOk } = await runRealPdfSetupFlow(deps, log);
       preludeReady = readyOk;
     }
@@ -154,6 +215,21 @@ export async function runE2eDriver(deps: E2eDriverDeps): Promise<void> {
       return;
     }
 
+    // AC-0 planner gate — PDF.js entry-point smoke test. Runs in its own
+    // `pdfworker-smoke` phase (and as part of `all`) so AC-4 can rely on
+    // `Zotero.PDFWorker.getFullText` being reachable and correctly shaped.
+    if (trigger === "all" || trigger === "pdfworker-smoke") {
+      await runPdfWorkerSmokeFlow(deps, log);
+    }
+
+    // AC-5 silent index migration. Its own `migration-resume` phase: the
+    // flow seeds a legacy (pre-v2) index, runs `hydrate()`, and verifies
+    // the atomic write-new-then-swap completes without an in-place
+    // mutation of the primary file.
+    if (trigger === "all" || trigger === "migration-resume") {
+      await runMigrationResumeFlow(deps, log);
+    }
+
     if (trigger === "all" || trigger === "settings") {
       runSettingsFlow(deps, log);
     }
@@ -162,6 +238,12 @@ export async function runE2eDriver(deps: E2eDriverDeps): Promise<void> {
     }
     if (trigger === "all" || trigger === "explain") {
       await runExplainFlow(deps, log);
+    }
+    if (trigger === "all" || trigger === "ask-question") {
+      await runAskQuestionFlow(deps, log);
+    }
+    if (trigger === "all" || trigger === "citation-jump") {
+      await runCitationJumpFlow(deps, log);
     }
     if (trigger === "all" || trigger === "sidebar-followup") {
       await runSidebarFlow(deps, log);
@@ -319,6 +401,237 @@ async function waitForReaderIframe(
 }
 
 // ---------------------------------------------------------------------------
+// AC-0 PDF.js entry-point smoke test (planner gate before AC-4).
+//
+// Proves `Zotero.PDFWorker.getFullText(attachmentID)` is reachable from the
+// chrome process and returns the shape the plan's AC-4 work depends on:
+// `{text, extractedPages, totalPages}` with page boundaries delimited by
+// `\f` (omni.ja `pdfWorker/worker.js:107407-107419` — `\f` is pushed
+// between pages, never after the final page, so an N-page PDF has exactly
+// N-1 form-feeds and `text.split('\f').length === totalPages`).
+//
+// Emits, for the single-page `sample.pdf` imported by the prelude:
+//   e2e:pdfworker:totalPages=<N>
+//   e2e:pdfworker:extractedPages=<N>
+//   e2e:pdfworker:formFeedCount=<count of '\f'>
+//   e2e:pdfworker:splitLength=<text.split('\f').length>
+//   e2e:pdfworker:firstPagePrefix=<first 20 chars of text.split('\f')[0]>
+//   e2e:pdfworker:lastPagePrefix=<first 20 chars of the last page>
+// Adversarial coverage:
+//   - multi-page fixture (MULTIPAGE_PDF_PREF) → e2e:pdfworker:multipage:*
+//   - corrupt/non-PDF fixture (CORRUPT_PDF_PREF) → e2e:pdfworker:corrupt:rejected
+//
+// A `getFullText` rejection on the primary fixture is surfaced as
+// `e2e:pdfworker:error=<message>` rather than swallowed.
+// ---------------------------------------------------------------------------
+
+/** First 20 chars of a string, stripped of newlines/form-feeds so the value
+ *  survives a single `e2e:<key>=<value>` log line cleanly. */
+function pdfPrefix(text: string): string {
+  return text.slice(0, 20).replace(/[\n\r\f]/gu, " ");
+}
+
+async function importPdfAttachment(
+  zotero: ZoteroGlobalWithApis,
+  path: string,
+  title: string
+): Promise<number> {
+  const parent = new zotero.Item("book");
+  parent.setField("title", `E2E ${title} parent`);
+  const parentID = await parent.saveTx();
+  const attachment = await zotero.Attachments.importFromFile({
+    file: zotero.File.pathToFile(path),
+    parentItemID: parentID,
+    title
+  });
+  return attachment.id;
+}
+
+/**
+ * Extract a PDF's full text and emit the AC-0 signal keys under `keyPrefix`
+ * (`pdfworker` for the primary fixture, `pdfworker:multipage` for the
+ * multi-page one). `formFeedCount` and `splitLength` are cross-emitted on
+ * purpose: the test asserts both against `totalPages`, catching any
+ * `split('\f')` / form-feed-count discrepancy in this gate.
+ */
+async function logPdfFullText(
+  pdfWorker: NonNullable<ZoteroGlobalWithApis["PDFWorker"]>,
+  attachmentID: number,
+  keyPrefix: string,
+  log: Logger
+): Promise<void> {
+  const result = await pdfWorker.getFullText(attachmentID);
+  const pages = result.text.split("\f");
+  log(`${keyPrefix}:totalPages`, String(result.totalPages));
+  log(`${keyPrefix}:extractedPages`, String(result.extractedPages));
+  log(`${keyPrefix}:formFeedCount`, String((result.text.match(/\f/gu) ?? []).length));
+  log(`${keyPrefix}:splitLength`, String(pages.length));
+  log(`${keyPrefix}:firstPagePrefix`, pdfPrefix(pages[0] ?? ""));
+  log(`${keyPrefix}:lastPagePrefix`, pdfPrefix(pages.at(-1) ?? ""));
+}
+
+async function runPdfWorkerSmokeFlow(deps: E2eDriverDeps, log: Logger): Promise<void> {
+  log("phase", "pdfworker-smoke:start");
+  const zotero = deps.zotero as ZoteroGlobalWithApis;
+  const pdfWorker = zotero.PDFWorker;
+  if (pdfWorker === undefined || typeof pdfWorker.getFullText !== "function") {
+    // The planner gate fails hard: `Zotero.PDFWorker.getFullText` is the
+    // entire premise of AC-4. Surface it unambiguously.
+    log("pdfworker:error", "no-pdfworker-getfulltext-api");
+    log("phase", "pdfworker-smoke:done");
+    return;
+  }
+
+  // --- Primary case: single-page sample.pdf imported by the prelude. ---
+  const attachmentID = currentReaderAttachmentItemID;
+  if (attachmentID === null) {
+    log("pdfworker:error", "no-sample-attachment");
+    log("phase", "pdfworker-smoke:done");
+    return;
+  }
+  try {
+    await logPdfFullText(pdfWorker, attachmentID, "pdfworker", log);
+  } catch (err) {
+    // Surface the rejection — never swallow it.
+    log("pdfworker:error", err instanceof Error ? err.message : String(err));
+    log("phase", "pdfworker-smoke:done");
+    return;
+  }
+
+  // --- Adversarial: multi-page PDF exercises the `\f` page split. ---
+  const multipagePath = deps.prefs.get(MULTIPAGE_PDF_PREF)?.trim();
+  if (multipagePath !== undefined && multipagePath.length > 0) {
+    try {
+      const id = await importPdfAttachment(zotero, multipagePath, "multipage.pdf");
+      await logPdfFullText(pdfWorker, id, "pdfworker:multipage", log);
+    } catch (err) {
+      log("pdfworker:multipage:error", err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // --- Adversarial: corrupt/non-PDF fixture MUST make getFullText reject. ---
+  const corruptPath = deps.prefs.get(CORRUPT_PDF_PREF)?.trim();
+  if (corruptPath !== undefined && corruptPath.length > 0) {
+    try {
+      const id = await importPdfAttachment(zotero, corruptPath, "corrupt.pdf");
+      const result = await pdfWorker.getFullText(id);
+      // Reaching here means a corrupt PDF did NOT reject — a real defect.
+      log("pdfworker:corrupt:rejected", "false");
+      log("pdfworker:corrupt:unexpected-totalPages", String(result.totalPages));
+    } catch (err) {
+      log("pdfworker:corrupt:rejected", "true");
+      log("pdfworker:corrupt:error", err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  log("phase", "pdfworker-smoke:done");
+}
+
+// ---------------------------------------------------------------------------
+// AC-5 silent index migration (migration-resume flow). Seeds a legacy (pre-v2)
+// index, runs the canonical `hydrate()` entry point, and asserts the atomic
+// write-new-then-swap completes without an in-place mutation of the primary.
+//
+// Log-key contract (scraped by tests/e2e/migration-resume.e2e.test.ts):
+//   e2e:migration:pending-before / schema-before / ran / schema-after /
+//   marker-after / pending-after / primary-mutated-in-place
+//   e2e:phase=migration-resume:start | migration-resume:done
+// ---------------------------------------------------------------------------
+
+/** A legacy (pre-v2) IndexFile — deliberately omits `schemaVersion`. */
+function legacyMigrationFixture(): IndexFile {
+  return {
+    items: {
+      LEGACYE2E: {
+        title: "Legacy E2E Paper",
+        chunks: [{ text: "legacy chunk body", embedding: [0.1, 0.2, 0.3] }]
+      }
+    },
+    indexedAt: "2026-05-01T00:00:00.000Z"
+  } as unknown as IndexFile;
+}
+
+async function runMigrationResumeFlow(deps: E2eDriverDeps, log: Logger): Promise<void> {
+  log("phase", "migration-resume:start");
+  const harness = deps.migrationHarness;
+  if (harness === undefined) {
+    // Older bootstrap build without the migration harness wiring. The
+    // C1-C5 crash machine is covered by tests/indexing/migration.test.ts;
+    // the e2e suite skips this flow rather than fail.
+    log("migration:error", "no-migration-harness");
+    log("phase", "migration-resume:done");
+    return;
+  }
+
+  // Wrap the io adapter so we can observe whether ANY write targets the
+  // primary index path directly — the atomic-migration invariant is
+  // that only `rename` ever mutates the primary.
+  let primaryWritePath: string | null = null;
+  let seedComplete = false;
+  let primaryWrittenInPlace = false;
+  const spyIo: CreateIndexStorageDeps["io"] = {
+    readString: (p) => harness.io.readString(p),
+    async writeString(p, contents) {
+      if (seedComplete && p === primaryWritePath) {
+        // A direct write to the primary AFTER the seed would violate
+        // the write-new-then-swap invariant.
+        primaryWrittenInPlace = true;
+      }
+      await harness.io.writeString(p, contents);
+    },
+    remove: (p) => harness.io.remove(p),
+    exists: (p) => harness.io.exists(p),
+    rename: (src, dst) => harness.io.rename(src, dst),
+    // AC-12: forward `stat` to the harness io adapter so the in-memory
+    // index cache's fingerprint works under the e2e harness.
+    stat: (p) => harness.io.stat(p)
+  };
+
+  const storage = createIndexStorage({
+    zotero: { DataDirectory: { dir: harness.dataDir } },
+    io: spyIo,
+    embedProvider: harness.embedProvider
+  });
+  primaryWritePath = storage.path();
+
+  try {
+    // (a) Seed a legacy v1 index at the active path — simulates an
+    //     index left by a v0.2.0 install.
+    await storage.write(legacyMigrationFixture());
+    seedComplete = true;
+
+    // Probe BEFORE: a legacy file (no schemaVersion) is migration-pending.
+    const before = await storage.readWithMigration();
+    log("migration:pending-before", String(before.migrationPending));
+    log("migration:schema-before", String(before.file?.schemaVersion ?? "legacy"));
+
+    // (c) Build a controller on this storage and invoke `hydrate()` —
+    //     the canonical migration entry point. (d) `hydrate()` awaits
+    //     `runMigration()` internally.
+    const controller = createIndexingController({
+      logger: deps.zotero,
+      zotero: harness.crawlerZotero,
+      provider: harness.crawlerProvider,
+      settings: harness.crawlerSettings,
+      storage
+    });
+    await controller.hydrate();
+    log("migration:ran", String(before.migrationPending));
+
+    // Probe AFTER: the primary must be at the current schema version,
+    // the marker gone, and a fresh probe must NOT re-fire (Adv-2).
+    const after = await storage.readWithMigration();
+    log("migration:schema-after", String(after.file?.schemaVersion ?? "missing"));
+    log("migration:marker-after", String(await storage.hasMarker()));
+    log("migration:pending-after", String(after.migrationPending));
+    log("migration:primary-mutated-in-place", String(primaryWrittenInPlace));
+  } catch (err) {
+    log("migration:error", err instanceof Error ? err.message : String(err));
+  }
+  log("phase", "migration-resume:done");
+}
+
+// ---------------------------------------------------------------------------
 // Real-PDF teardown (FINDING-17). Closes the reader tab so the next test run
 // starts with a clean profile (even though the profile is wiped on afterAll).
 // ---------------------------------------------------------------------------
@@ -374,23 +687,32 @@ function runSettingsFlow(deps: E2eDriverDeps, log: Logger): void {
     indexStatus: deps.indexingController.getStatus()
   });
   const detach = attachIndexControls(view, deps.indexingController);
-  deps.ui.openDialog("Zotero AI Explain", view);
+  const dialogHandle = deps.ui.openDialog("Zotero AI Explain", view);
   const document = getDocument(deps.zotero);
+  // The backdrop element is not reachable from `view` (it is a sibling
+  // of the dialog created by `openDialog`), so it stays a document-level
+  // query. The dialog-content checks below scope to `view` — the live
+  // element this flow mounted — so an un-closed prior dialog can never
+  // satisfy them.
   const backdrop = document?.querySelector(".zotero-ai-dialog-backdrop");
-  const dialog = document?.querySelector(".zotero-ai-dialog");
-  const present =
-    backdrop !== null && backdrop !== undefined && dialog !== null && dialog !== undefined;
-  log("settings:backdrop-present", String(backdrop !== null && backdrop !== undefined));
-  log("settings:dialog-present", String(dialog !== null && dialog !== undefined));
+  const dialog = view.closest(".zotero-ai-dialog");
+  const backdropPresent = backdrop !== null && backdrop !== undefined;
+  const dialogPresent = dialog !== null;
+  const present = backdropPresent && dialogPresent;
+  log("settings:backdrop-present", String(backdropPresent));
+  log("settings:dialog-present", String(dialogPresent));
   log("settings:dialog-rendered", String(present));
-  const baseUrlInput = document?.querySelector<HTMLInputElement>('[name="baseUrl"]');
+  const baseUrlInput = view.querySelector<HTMLInputElement>('[name="baseUrl"]');
   log("settings:baseUrl-value", baseUrlInput?.value ?? "<missing>");
   log("settings:base-url-input", baseUrlInput?.value ?? "<missing>");
-  const chatInput = document?.querySelector<HTMLInputElement>('[name="chatModel"]');
+  const chatInput = view.querySelector<HTMLInputElement>('[name="chatModel"]');
   log("settings:chatModel-value", chatInput?.value ?? "<missing>");
-  // Close the dialog so subsequent flows have a clean DOM.
-  const close = document?.querySelector<HTMLButtonElement>('[data-action="close-dialog"]');
-  close?.click();
+  // Close THIS dialog via its own handle. A global
+  // `querySelector('[data-action="close-dialog"]')` closes whichever
+  // dialog is first in DOM order — if the first-run onboarding dialog is
+  // still open it absorbs the close-click, leaving this dialog mounted
+  // and its (now detached) controls reachable by later global queries.
+  dialogHandle.close();
   detach();
   log("phase", "settings:done");
 }
@@ -402,12 +724,22 @@ async function runIndexFlow(deps: E2eDriverDeps, log: Logger): Promise<void> {
     indexStatus: deps.indexingController.getStatus()
   });
   const detach = attachIndexControls(view, deps.indexingController);
-  deps.ui.openDialog("Zotero AI Explain", view);
-  const document = getDocument(deps.zotero);
-  const summary = document?.querySelector<HTMLElement>(".zotero-ai-index-controls__summary");
+  // Capture the dialog handle and close it via `handle.close()` at the
+  // end. A global `document.querySelector('[data-action="close-dialog"]')`
+  // closes whichever dialog appears FIRST in DOM order — when the
+  // first-run onboarding dialog ("Set up Ollama") is still open, that
+  // close-click hits the onboarding dialog and leaves THIS dialog
+  // mounted. Stale dialogs then accumulate, and a later global
+  // `querySelector('[data-action="start-index"]')` returns the first
+  // (detached-handler) button — clicking it is a silent no-op.
+  const dialog = deps.ui.openDialog("Zotero AI Explain", view);
+  // Scope every control lookup to `view` — the live dialog content this
+  // flow just mounted — so a stale prior dialog's buttons can never be
+  // picked up by a global document query.
+  const summary = view.querySelector<HTMLElement>(".zotero-ai-index-controls__summary");
   log("index:summary-before", summary?.textContent ?? "<missing>");
 
-  const startBtn = document?.querySelector<HTMLButtonElement>('[data-action="start-index"]');
+  const startBtn = view.querySelector<HTMLButtonElement>('[data-action="start-index"]');
   startBtn?.click();
   log("index:started", "true");
   log("index:summary-after-start", summary?.textContent ?? "<missing>");
@@ -423,7 +755,7 @@ async function runIndexFlow(deps: E2eDriverDeps, log: Logger): Promise<void> {
   // observable transition deterministic, the loop below polls until we
   // see either `paused` (success) or `complete` (race won by crawler),
   // then logs the snapshot accordingly.
-  const pauseBtn = document?.querySelector<HTMLButtonElement>('[data-action="pause-index"]');
+  const pauseBtn = view.querySelector<HTMLButtonElement>('[data-action="pause-index"]');
   pauseBtn?.click();
   await waitFor(
     () => {
@@ -436,7 +768,7 @@ async function runIndexFlow(deps: E2eDriverDeps, log: Logger): Promise<void> {
   log("index:summary-after-pause", summary?.textContent ?? "<missing>");
   log("index:status-after-pause", deps.indexingController.getStatus().state);
 
-  const resumeBtn = document?.querySelector<HTMLButtonElement>('[data-action="resume-index"]');
+  const resumeBtn = view.querySelector<HTMLButtonElement>('[data-action="resume-index"]');
   resumeBtn?.click();
   log("index:summary-after-resume", summary?.textContent ?? "<missing>");
   log("index:status-after-resume", deps.indexingController.getStatus().state);
@@ -451,8 +783,12 @@ async function runIndexFlow(deps: E2eDriverDeps, log: Logger): Promise<void> {
     50
   );
 
-  const clearBtn = document?.querySelector<HTMLButtonElement>('[data-action="clear-index"]');
-  clearBtn?.click();
+  const clearBtn = view.querySelector<HTMLButtonElement>('[data-action="clear-index"]');
+  // AC-14 Fix 2: the Clear button is a two-stage in-view confirm. The
+  // first click only ARMS the confirm (relabels to "Confirm clear"); the
+  // second click on the relabelled button drives the real `clear()`.
+  clearBtn?.click(); // arm the confirm
+  clearBtn?.click(); // confirm → dispatches the real clear()
   // clear() returns a Promise<void>; the view glue fire-and-forgets. Give
   // the storage flush + reducer transition a moment to settle so the
   // summary text reflects the cleared state.
@@ -468,8 +804,7 @@ async function runIndexFlow(deps: E2eDriverDeps, log: Logger): Promise<void> {
   log("index:final-status", deps.indexingController.getStatus().state);
   log("index:final-summary", summary?.textContent ?? "<missing>");
 
-  const close = document?.querySelector<HTMLButtonElement>('[data-action="close-dialog"]');
-  close?.click();
+  dialog.close();
   detach();
   log("phase", "index:done");
 }
@@ -489,7 +824,7 @@ async function runExplainFlow(deps: E2eDriverDeps, log: Logger): Promise<void> {
       itemTitle: "E2E Source",
       attachmentKey: "e2e-attach",
       pageLabel: "1",
-      location: "page=1"
+      pageIndex: 0
     },
     anchor: null
   };
@@ -534,6 +869,386 @@ async function runExplainFlow(deps: E2eDriverDeps, log: Logger): Promise<void> {
   popupUnsubscribe();
   popupUnmount();
   log("phase", "explain:done");
+}
+
+/**
+ * AC-1: exercise the "Ask a question" reader command end-to-end.
+ *
+ * Two complementary paths (mirroring runExplainFlow + runAnchoredExplainFlow):
+ *   - Real-reader path: dispatch a `renderTextSelectionPopup` event, find
+ *     the "Ask a question" command button, click it, and inspect the
+ *     anchored popup it mounts (quote block, focused textarea, no
+ *     auto-stream). Also dispatches an EMPTY-selection event to confirm
+ *     the command is hidden.
+ *   - Store path: drive an ask-question conversation directly through
+ *     `deps.store` + `deps.popupController`, replicating `startAskQuestion`'s
+ *     framing, so the framed first turn and the turn-5 system frame are
+ *     inspectable (the runtime-created conversation id is not otherwise
+ *     observable from the driver).
+ */
+async function runAskQuestionFlow(deps: E2eDriverDeps, log: Logger): Promise<void> {
+  log("phase", "ask-question:start");
+
+  // ---- Real-reader path: command presence + popup behaviour ----
+  const askSelectionText = "Ask-question selected passage.";
+  const { iframeDoc, buttonHost } = dispatchRealReaderEvent(deps, log, {
+    phase: "ask-question",
+    selectionText: askSelectionText,
+    buttonContainerStyle: "position: absolute; left: 70px; top: 200px;"
+  });
+  if (iframeDoc === null || buttonHost === null) {
+    log("phase", "ask-question:done");
+    return;
+  }
+  const askButton = buttonHost.querySelector<HTMLElement>("button[data-action='ask-question']");
+  log("ask-question:command-present", String(askButton !== null));
+  if (askButton === null) {
+    log("ask-question:error", "no-ask-button-captured");
+    buttonHost.remove();
+    log("phase", "ask-question:done");
+    return;
+  }
+  askButton.click();
+  const chromeDoc = getDocument(deps.zotero);
+  if (chromeDoc === null) {
+    log("ask-question:error", "no-chrome-doc");
+    buttonHost.remove();
+    log("phase", "ask-question:done");
+    return;
+  }
+  const wrapper = await waitForPopup(chromeDoc, 5000);
+  log("ask-question:popup-mounted", String(wrapper !== null));
+  if (wrapper === null) {
+    buttonHost.remove();
+    log("phase", "ask-question:done");
+    return;
+  }
+  const quoteBlock = wrapper.querySelector<HTMLElement>(".zotero-ai-explain-popup__quote");
+  log("ask-question:quote-block-text", (quoteBlock?.textContent ?? "").trim());
+  const askTextarea = findFollowUpTextarea(wrapper);
+  // The textarea is focused on mount via requestAnimationFrame; give the
+  // frame a tick to run before sampling document.activeElement.
+  await waitForCondition(() => chromeDoc.activeElement === askTextarea, 2000, chromeDoc);
+  log("ask-question:textarea-focused", String(chromeDoc.activeElement === askTextarea));
+  // No auto-explain: opening an ask-question popup must not stream an
+  // assistant turn. The body stays empty and no assistant turn appears.
+  const autoStreamed =
+    (wrapper.querySelector<HTMLElement>(".zotero-ai-explain-popup__body")?.textContent ?? "").trim()
+      .length > 0 || wrapper.querySelector("[data-role='assistant']") !== null;
+  log("ask-question:auto-streamed", String(autoStreamed));
+
+  // Empty-textarea submit must be a rejected no-op — no assistant turn,
+  // no streaming. Submit with an empty textarea and confirm nothing ran.
+  let emptySubmitRejected = true;
+  if (askTextarea !== null) {
+    askTextarea.value = "";
+    const form = askTextarea.closest<HTMLFormElement>("form");
+    if (form !== null) {
+      const win = chromeDoc.defaultView;
+      const EventCtor = win?.Event ?? globalThis.Event;
+      form.dispatchEvent(new EventCtor("submit", { bubbles: true, cancelable: true }));
+    }
+    await waitFor(() => false, 300, 50);
+    const liveWrapper = findPopupWrapper(chromeDoc);
+    emptySubmitRejected =
+      liveWrapper === null ||
+      ((
+        liveWrapper.querySelector<HTMLElement>(".zotero-ai-explain-popup__body")?.textContent ?? ""
+      ).trim().length === 0 &&
+        liveWrapper.querySelector("[data-role='assistant']") === null);
+  }
+  log("ask-question:empty-submit-rejected", String(emptySubmitRejected));
+  findPopupWrapper(chromeDoc)?.remove();
+  buttonHost.remove();
+
+  // ---- Empty selection hides the command ----
+  const emptyEvent = dispatchRealReaderEvent(deps, log, {
+    phase: "ask-question-empty",
+    selectionText: "",
+    buttonContainerStyle: "position: absolute; left: 70px; top: 260px;"
+  });
+  const emptyHost = emptyEvent.buttonHost;
+  const hiddenWhenNoSelection =
+    (emptyHost?.querySelector("button[data-action='ask-question']") ?? null) === null;
+  log("ask-question:hidden-when-no-selection", String(hiddenWhenNoSelection));
+  emptyHost?.remove();
+
+  // ---- Store path: framed first turn + sticky-quote system frame ----
+  const selection: SelectionContext = {
+    quote: askSelectionText,
+    source: {
+      itemKey: "e2e-ask-item",
+      itemTitle: "E2E Ask Source",
+      attachmentKey: "e2e-ask-attach",
+      pageLabel: "1"
+    },
+    anchor: null
+  };
+  const conversation = deps.store.createFromSelection(selection, deps.profile());
+  // Sticky-quote system frame seeded at conversation creation — rides
+  // every turn (mirrors startAskQuestion).
+  deps.store.appendSystemMessage(
+    conversation.id,
+    `The user is asking about this quoted passage: "${selection.quote}"`
+  );
+  // First turn: framed `Quote: "..."\n\nQuestion: ...`.
+  await deps.popupController.sendFollowUp(
+    conversation.id,
+    `Quote: "${selection.quote}"\n\nQuestion: First question about the passage?`
+  );
+  const afterFirst = deps.store.get(conversation.id);
+  const firstTurn = afterFirst?.messages.find((m) => m.role === "user")?.content ?? "<missing>";
+  log("ask-question:first-turn", firstTurn.replace(/[\n\r]/gu, " "));
+
+  // Drive to turn 5 (four more Q&A turns) and confirm the system frame
+  // still carries the quote.
+  for (let turn = 2; turn <= 5; turn += 1) {
+    await deps.popupController.sendFollowUp(conversation.id, `Follow-up question ${String(turn)}?`);
+  }
+  const afterFive = deps.store.get(conversation.id);
+  const systemFrame = afterFive?.messages.find((m) => m.role === "system")?.content ?? "";
+  const userTurnCount = afterFive?.messages.filter((m) => m.role === "user").length ?? 0;
+  log(
+    "ask-question:turn5-has-quote",
+    String(userTurnCount >= 5 && systemFrame.includes(selection.quote))
+  );
+
+  log("phase", "ask-question:done");
+}
+
+// ---------------------------------------------------------------------------
+// AC-7 / AC-9 citation jump-to-page (`citation-jump` flow). Builds a
+// library-chat turn whose retrieved chunks include TWO chunks from the SAME
+// parent item but DIFFERENT pages, renders the assistant answer through the
+// production `renderLibraryChatView` + `wireLibraryChatView`, clicks each
+// citation, and observes the resulting `Zotero.Reader.open` calls.
+//
+// `Zotero.Reader.open` is wrapped so the flow can inspect the ACTUAL argument
+// shape — AC-7 requires `pageIndex` to ride as the SECOND POSITIONAL arg
+// (`open(attachmentId, { pageIndex })`), NOT nested under `{ location: ... }`.
+//
+// Log-key contract (scraped by tests/e2e/pdf-citation-jump.e2e.test.ts):
+//   e2e:citation-jump:chunk0-page / chunk0-arg-shape / chunk1-page /
+//   same-tab-navigated / reader-tab-count / nolocation-open /
+//   nolocation-page-arg / hallucinated-routed-to-chunk0 /
+//   prompt-has-distinct-labels
+//   e2e:phase=citation-jump:start | citation-jump:done
+// ---------------------------------------------------------------------------
+
+/** Minimal item shape the citation-jump flow reads off `Zotero.Items.get`. */
+type CitationJumpItem = {
+  readonly id: number;
+  readonly key: string;
+  readonly parentItemID?: number | false;
+};
+
+/**
+ * A captured `Zotero.Reader.open` call. `argShape` is `positional` when the
+ * second argument is `{ pageIndex }`, `nested-location` when it is
+ * `{ location: ... }`, and `none` when there is no second argument.
+ */
+type CapturedReaderOpen = {
+  readonly attachmentId: number;
+  readonly pageIndex: number | undefined;
+  readonly argShape: "positional" | "nested-location" | "none";
+};
+
+/** Classify the second positional argument of a `Reader.open` call. */
+function classifyReaderOpenArg(location: unknown): CapturedReaderOpen["argShape"] {
+  if (location === undefined || location === null) {
+    return "none";
+  }
+  if (typeof location === "object" && "location" in location) {
+    return "nested-location";
+  }
+  if (typeof location === "object" && "pageIndex" in location) {
+    return "positional";
+  }
+  return "none";
+}
+
+async function runCitationJumpFlow(deps: E2eDriverDeps, log: Logger): Promise<void> {
+  log("phase", "citation-jump:start");
+
+  const attachmentID = currentReaderAttachmentItemID;
+  if (attachmentID === null) {
+    log("citation-jump:error", "no-sample-attachment");
+    log("phase", "citation-jump:done");
+    return;
+  }
+  const zotero = deps.zotero as ZoteroGlobalWithApis & {
+    readonly Items: { get(id: number): CitationJumpItem | null };
+  };
+
+  // Resolve the cited item's 8-char Zotero key. `openCitationInReader`
+  // looks the item up by key, so the citation tokens must carry the
+  // PARENT item's key (the PDF rides as its child attachment).
+  let citedItemKey: string | null = null;
+  let attachmentKey: string | null = null;
+  try {
+    const attachmentItem = zotero.Items.get(attachmentID);
+    attachmentKey = attachmentItem?.key ?? null;
+    const parentID = attachmentItem?.parentItemID;
+    if (typeof parentID === "number") {
+      citedItemKey = zotero.Items.get(parentID)?.key ?? null;
+    } else {
+      // No parent — the attachment is itself the cited item.
+      citedItemKey = attachmentKey;
+    }
+  } catch (err) {
+    log("citation-jump:error", err instanceof Error ? err.message : String(err));
+    log("phase", "citation-jump:done");
+    return;
+  }
+  if (citedItemKey === null || !/^[A-Z0-9]{8}$/u.test(citedItemKey)) {
+    log("citation-jump:error", `bad-item-key:${citedItemKey ?? "null"}`);
+    log("phase", "citation-jump:done");
+    return;
+  }
+
+  // Wrap `Zotero.Reader.open` so the flow observes the actual call shape.
+  // The wrapper forwards to the real implementation so the reader still
+  // navigates — AC-7's "second click navigates the same tab" depends on
+  // the genuine `Reader.open` behavior.
+  const reader = zotero.Reader as unknown as {
+    open: (id: number, location?: unknown) => unknown;
+    readonly _readers: readonly { readonly itemID: number }[];
+  };
+  const realOpen = reader.open.bind(reader);
+  const captured: CapturedReaderOpen[] = [];
+  const wrappedReader = {
+    open: (id: number, location?: unknown) => {
+      const argShape = classifyReaderOpenArg(location);
+      const pageIndex =
+        argShape === "positional" && typeof location === "object" && location !== null
+          ? (location as { pageIndex?: number }).pageIndex
+          : undefined;
+      captured.push({ attachmentId: id, pageIndex, argShape });
+      return realOpen(id, location);
+    }
+  };
+  // `openCitationInReader` only reads `Reader.open` / `Items` / `Libraries`.
+  const citationZotero = {
+    Items: zotero.Items as unknown as Parameters<typeof openCitationInReader>[1]["Items"],
+    Libraries: (zotero as unknown as { Libraries?: { userLibraryID: number } }).Libraries,
+    Reader: wrappedReader
+  } as unknown as Parameters<typeof openCitationInReader>[1];
+
+  // Two chunks of the SAME parent item on DIFFERENT pages (AC-9 collision).
+  const chunk0Page = 2;
+  const chunk1Page = 17;
+  const retrieved: readonly RetrievedChunk[] = [
+    {
+      itemKey: citedItemKey,
+      title: "E2E Sample PDF",
+      text: "Chunk zero body on an early page.",
+      score: 0.99,
+      chunkIndex: 0,
+      pageIndex: chunk0Page,
+      sourceKind: "pdf-page",
+      ...(attachmentKey !== null ? { attachmentKey } : {})
+    },
+    {
+      itemKey: citedItemKey,
+      title: "E2E Sample PDF",
+      text: "Chunk one body on a much later page.",
+      score: 0.95,
+      chunkIndex: 1,
+      pageIndex: chunk1Page,
+      sourceKind: "pdf-page",
+      ...(attachmentKey !== null ? { attachmentKey } : {})
+    }
+  ];
+
+  // (a) The prompt must label the two same-item chunks distinctly.
+  const prompt = buildLibraryPrompt({ question: "What does the sample cover?", chunks: retrieved });
+  const label0 = `[${citedItemKey}#0]`;
+  const label1 = `[${citedItemKey}#1]`;
+  const distinctLabels = prompt.includes(label0) && prompt.includes(label1) && label0 !== label1;
+  log("citation-jump:prompt-has-distinct-labels", String(distinctLabels));
+
+  const lookup: CitationLookup = buildCitationLookup(retrieved);
+
+  // Render the assistant answer through the production view + wiring so
+  // the click delegate, the data-attribute stamping, and the citation
+  // payload all run exactly as they do for a real chat turn.
+  const onCitationClick = (citation: CitationClick): void => {
+    openCitationInReader(citation, citationZotero);
+  };
+  const renderAndClick = (assistantContent: string, turnLookup: CitationLookup): void => {
+    const view = renderLibraryChatView({
+      messages: [{ role: "assistant", content: assistantContent }],
+      status: "completed",
+      errorMessage: null,
+      hasIndex: true,
+      citationLookups: new Map<number, CitationLookup>([[0, turnLookup]])
+    });
+    const detach = wireLibraryChatView({
+      view,
+      onSubmit: () => Promise.resolve(),
+      onReset: () => undefined,
+      onCitationClick
+    });
+    for (const link of Array.from(view.querySelectorAll<HTMLAnchorElement>("a[data-item-key]"))) {
+      link.click();
+    }
+    detach();
+  };
+
+  // (b) Click the chunk-#0 citation; (c) click the chunk-#1 citation in the
+  // SAME already-open reader. Both citations rendered in one turn so both
+  // clicks land before any assertion.
+  renderAndClick(`Claim zero ${label0}. Claim one ${label1}.`, lookup);
+  // Let the two `Reader.open` navigations settle before counting tabs.
+  await waitFor(() => false, 400, 100);
+
+  const chunk0Call = captured.find((c) => c.pageIndex === chunk0Page);
+  const chunk1Call = captured.find((c) => c.pageIndex === chunk1Page);
+  log("citation-jump:chunk0-page", String(chunk0Call?.pageIndex ?? "undefined"));
+  log("citation-jump:chunk0-arg-shape", chunk0Call?.argShape ?? "none");
+  log("citation-jump:chunk1-page", String(chunk1Call?.pageIndex ?? "undefined"));
+
+  // Both clicks targeted the same attachment — the reader must have
+  // navigated its existing tab, not spawned a duplicate.
+  const sameAttachment =
+    chunk0Call !== undefined && chunk0Call.attachmentId === chunk1Call?.attachmentId;
+  const readerTabCount = reader._readers.filter((r) => r.itemID === attachmentID).length;
+  log("citation-jump:same-tab-navigated", String(sameAttachment && readerTabCount === 1));
+  log("citation-jump:reader-tab-count", String(readerTabCount));
+
+  // (d) A citation whose chunk has NO pageIndex opens with no location arg.
+  const noPageChunk: RetrievedChunk = {
+    itemKey: citedItemKey,
+    title: "E2E Sample PDF",
+    text: "Metadata chunk with no page.",
+    score: 0.9,
+    chunkIndex: 0,
+    sourceKind: "metadata"
+  };
+  const noPageLookup = buildCitationLookup([noPageChunk]);
+  captured.length = 0;
+  renderAndClick(`Legacy-style claim [${citedItemKey}#0].`, noPageLookup);
+  const noPageCall = captured.at(-1);
+  log("citation-jump:nolocation-open", String(noPageCall?.argShape === "none"));
+  log(
+    "citation-jump:nolocation-page-arg",
+    noPageCall?.pageIndex === undefined ? "absent" : String(noPageCall.pageIndex)
+  );
+
+  // (e) A hallucinated [WRONGKEY#0] token must NOT route to chunk-0's true
+  // source. WRONGKEY is a well-formed 8-char key absent from the lookup.
+  const wrongKey = "WRONGKEY";
+  captured.length = 0;
+  renderAndClick(`Hallucinated cite [${wrongKey}#0].`, lookup);
+  const hallucinatedCall = captured.at(-1);
+  // The fallback resolves WRONGKEY (not in the library) -> `openCitationInReader`
+  // returns `not-found`, so no `Reader.open` runs. It must NEVER open the
+  // real cited attachment at chunk-0's page.
+  const routedToChunk0 =
+    hallucinatedCall?.attachmentId === attachmentID && hallucinatedCall.pageIndex === chunk0Page;
+  log("citation-jump:hallucinated-routed-to-chunk0", String(routedToChunk0));
+
+  log("phase", "citation-jump:done");
 }
 
 async function runSidebarFlow(deps: E2eDriverDeps, log: Logger): Promise<void> {
@@ -1042,31 +1757,29 @@ async function runScrollFlow(deps: E2eDriverDeps, log: Logger): Promise<void> {
   await waitForCondition(() => false, 300, chromeDoc);
   // Production CSS layers:
   //   wrapper (.zotero-ai-popup-wrapper)   — outer, max-height: 60vh,
-  //                                          display: flex; flex-direction: column
-  //   body-wrapper (.zotero-ai-popup-wrapper__body) — overflow: auto,
-  //                                          flex: 1 1 auto
+  //                                          overflow-y: auto (THE scroll
+  //                                          container), display: flex;
+  //                                          flex-direction: column
+  //   body-wrapper (.zotero-ai-popup-wrapper__body) — overflow-y: auto,
+  //                                          flex: 0 0 auto (keeps its
+  //                                          intrinsic content height)
   //   section + inner body — explain-popup content
   //
-  // In Zotero 9 chrome the flex grow inside the wrapper doesn't expand
-  // the body-wrapper to fill the wrapper's max-height, so the
-  // body-wrapper itself reports clientHeight == scrollHeight (no
-  // internal overflow). The visible scroll affordance comes from the
-  // outer wrapper, whose `max-height: 60vh` clamps the rendered height
-  // while the children's intrinsic size pushes scrollHeight far higher.
-  // For the AC3 assertion we report scrollHeight/clientHeight of the
-  // outer wrapper (the actual scrolling container in real chrome) and
-  // overflow-y of the body-wrapper (which carries the production CSS
-  // intent — `auto`).
+  // The body-wrapper is `flex: 0 0 auto`, so it does NOT shrink to fit the
+  // wrapper — its intrinsic height carries the full response. The wrapper
+  // clamps to `max-height: 60vh` and, because `overflow-y: auto`, scrolls:
+  // `wrapper.scrollHeight` (full content) exceeds `wrapper.clientHeight`
+  // (the 60vh-clamped box). For the AC3 assertion we report
+  // scrollHeight/clientHeight of the outer wrapper (the actual scrolling
+  // container) and overflow-y of the body-wrapper (which also carries the
+  // production CSS intent — `auto`).
   const win = chromeDoc.defaultView;
   const bodyContainer =
     wrapper.querySelector<HTMLElement>(".zotero-ai-popup-wrapper__body") ?? wrapper;
   const bodyOverflowY = (win?.getComputedStyle(bodyContainer).overflowY ?? "").toLowerCase();
   // Use the OUTER wrapper's scroll geometry — that's the surface a user
   // perceives as scrollable when the content exceeds the popup's
-  // max-height. (FINDING note for the orchestrator: if the popup CSS
-  // is later refactored so the body-wrapper truly scrolls within its
-  // flex slot, this measurement still holds — the wrapper's
-  // scrollHeight stays > clientHeight for any overflowing content.)
+  // max-height.
   const scrollable = wrapper.scrollHeight > wrapper.clientHeight;
   log("scroll:scrollHeight", String(wrapper.scrollHeight));
   log("scroll:clientHeight", String(wrapper.clientHeight));
@@ -1239,15 +1952,18 @@ function runHonestIndexingFlow(deps: E2eDriverDeps, log: Logger): void {
     indexStatus: deps.indexingController.getStatus()
   });
   const detach = attachIndexControls(view, deps.indexingController);
-  deps.ui.openDialog("Zotero AI Explain", view);
-  const document = getDocument(deps.zotero);
-  const dialog = document?.querySelector<HTMLElement>(".zotero-ai-dialog");
+  const dialogHandle = deps.ui.openDialog("Zotero AI Explain", view);
+  // Scope to the dialog this flow mounted (the ancestor `.zotero-ai-dialog`
+  // of `view`) rather than a global query that could match a stale prior
+  // dialog still in the DOM.
+  const dialog = view.closest<HTMLElement>(".zotero-ai-dialog");
   const text = dialog?.textContent ?? "";
   log("honest-indexing:dialog-present", String(dialog !== null));
   log("honest-indexing:contains-phase2", String(/Phase ?2/iu.test(text)));
   log("honest-indexing:contains-not-yet-implemented", String(/not yet implemented/iu.test(text)));
-  const close = document?.querySelector<HTMLButtonElement>('[data-action="close-dialog"]');
-  close?.click();
+  // Close THIS dialog via its own handle — see runIndexFlow for why a
+  // global close-dialog query is unsafe when other dialogs are open.
+  dialogHandle.close();
   detach();
   log("phase", "honest-indexing:done");
 }

@@ -34,6 +34,12 @@
  * AC3 (L527-684, L976-1014).
  */
 
+import {
+  extractPerSourceChunks,
+  type PerSourceAccess,
+  type PerSourceChunk
+} from "./per-source-chunks.js";
+
 /** Default chunk size — approximately the 2 KB the plan calls out. */
 export const DEFAULT_CHUNK_BYTES = 2048;
 
@@ -61,6 +67,13 @@ export type ZoteroItemLike = {
   getAttachments?(includeTrashed?: boolean): readonly number[];
   isAttachment(): boolean;
   isAnnotation(): boolean;
+  // Phase 4 (per-page PDF text): MIME type of an attachment item
+  // (`application/pdf`, `application/epub+zip`, `text/html`, …). Used by
+  // `extractPerSourceChunks` to route an attachment to the PDF-worker
+  // path vs. the cached-fulltext path. Absent on non-attachment items
+  // and on stripped-down hosts / test fixtures — the per-source helper
+  // then probes `Zotero.PDFWorker` directly.
+  readonly attachmentContentType?: string;
 };
 
 /**
@@ -96,6 +109,26 @@ export type ZoteroFullTextAccess = {
   };
 };
 
+/**
+ * Narrow view of `Zotero.PDFWorker` — the chrome-side PDF.js worker
+ * bridge. `getFullText` resolves to per-page text where page boundaries
+ * are `\f` form-feed characters (an N-page PDF has exactly N-1
+ * form-feeds). Rejects when the attachment is not a PDF or the worker
+ * fails to parse it (corrupt / password-protected file).
+ */
+export type ZoteroPdfWorker = {
+  getFullText(
+    itemID: number,
+    maxPages?: number | readonly number[],
+    isPriority?: boolean,
+    password?: string
+  ): Promise<{
+    readonly text: string;
+    readonly extractedPages: number;
+    readonly totalPages: number;
+  }>;
+};
+
 export type ExtractItemTextOptions = {
   readonly zotero?: ZoteroFullTextAccess;
   /**
@@ -111,12 +144,43 @@ export type ExtractItemTextOptions = {
 
 export const DEFAULT_FULLTEXT_MAX_CHARS = 50_000;
 
+/**
+ * Current IndexFile schema version (v0.3.0). Legacy files written by
+ * v0.2.0 and earlier have no `schemaVersion` field and are treated as
+ * version 1 by all readers. Bumping this constant signals to
+ * `readWithMigration()` that a one-time atomic migration is due.
+ */
+export const CURRENT_SCHEMA_VERSION = 2;
+
+/**
+ * Descriptive provenance for an indexed chunk. `pdf-page` chunks carry a
+ * `pageIndex`; `metadata`/`note` chunks never do; `epub`/`snapshot`/
+ * `attachment` chunks carry an `attachmentKey` but no `pageIndex`.
+ */
+export type SourceKind = "pdf-page" | "metadata" | "note" | "epub" | "snapshot" | "attachment";
+
+export type IndexedItemChunk = {
+  readonly text: string;
+  readonly embedding: readonly number[];
+  /** REQUIRED (v0.3.0) — describes where the chunk's text came from. */
+  readonly sourceKind: SourceKind;
+  /** PDF-page chunks only; 0-indexed page number. undefined-absent. */
+  readonly pageIndex?: number;
+  /** PDF/EPUB/snapshot/attachment chunks; the source attachment's key. */
+  readonly attachmentKey?: string;
+};
+
 export type IndexedItem = {
   readonly title: string;
-  readonly chunks: readonly { readonly text: string; readonly embedding: readonly number[] }[];
+  readonly chunks: readonly IndexedItemChunk[];
 };
 
 export type IndexFile = {
+  /**
+   * Schema version. `CURRENT_SCHEMA_VERSION` for v0.3.0 crawls; legacy
+   * files have no field and are treated as version 1 by readers.
+   */
+  readonly schemaVersion: number;
   readonly items: Record<string, IndexedItem>;
   readonly indexedAt: string;
 };
@@ -134,6 +198,12 @@ export type LibraryCrawlerDeps = {
     // only, matching pre-Phase 4 behavior).
     readonly FullText?: ZoteroFullTextAccess["FullText"];
     readonly File?: ZoteroFullTextAccess["File"];
+    // Phase 4 (per-page PDF text): the chrome-side PDF.js worker bridge.
+    // When present the crawler extracts per-page text via
+    // `getFullText` instead of reading the `.zotero-ft-cache` blob.
+    // Absent on hosts that stripped the module; the crawler then falls
+    // back to `readAttachmentFullText`.
+    readonly PDFWorker?: ZoteroPdfWorker;
   };
   readonly provider: {
     embedTexts(request: {
@@ -196,7 +266,7 @@ export class EmbedCircuitBreakerError extends Error {
   }
 }
 
-function readNoteBodies(item: ZoteroItemLike): readonly string[] {
+export function readNoteBodies(item: ZoteroItemLike): readonly string[] {
   // getNotes() returns CHILD note item IDs. Calling item.getNote() on a
   // PARENT item (article/preprint/book) THROWS at runtime ("getNote()
   // can only be called on notes and attachments"). Child-note bodies
@@ -230,7 +300,7 @@ function readNoteBodies(item: ZoteroItemLike): readonly string[] {
  * Synchronous: relies on `Zotero.File.getContents` (sync in Zotero 9)
  * or `Zotero.FullText.getItemContent` (sync; preferred when present).
  */
-function readAttachmentFullText(
+export function readAttachmentFullText(
   attachment: ZoteroItemLike,
   access: ZoteroFullTextAccess,
   maxChars: number
@@ -462,6 +532,7 @@ export async function indexLibrary(
   const total = items.length;
 
   let currentFile: IndexFile = initialFile ?? {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
     items: {},
     indexedAt: new Date().toISOString()
   };
@@ -509,24 +580,32 @@ export async function indexLibrary(
       continue;
     }
 
-    // Build the FullText access object once per loop iteration — the
+    // Build the per-source access object once per loop iteration — the
     // zotero deps object already carries `Items`, and the optional
-    // `FullText`/`File` properties make this a safe widening that
-    // narrows to "title + abstract only" when the host is a test stub.
-    const access: ZoteroFullTextAccess = {
+    // `FullText`/`File`/`PDFWorker` properties make this a safe widening
+    // that narrows to "title + abstract only" when the host is a test
+    // stub without the PDF worker.
+    const access: PerSourceAccess = {
       Items: deps.zotero.Items,
       ...(deps.zotero.FullText !== undefined ? { FullText: deps.zotero.FullText } : {}),
-      ...(deps.zotero.File !== undefined ? { File: deps.zotero.File } : {})
+      ...(deps.zotero.File !== undefined ? { File: deps.zotero.File } : {}),
+      ...(deps.zotero.PDFWorker !== undefined ? { PDFWorker: deps.zotero.PDFWorker } : {})
     };
 
-    let text: string;
-    let baseText: string;
+    // Phase 4: iterate the per-source generator (metadata, notes, PDF
+    // pages, non-PDF attachments) so each chunk carries its provenance
+    // (`sourceKind` / `pageIndex` / `attachmentKey`). A `getFullText`
+    // rejection on a corrupt PDF is contained inside the generator — it
+    // skips that attachment and continues, so a bad PDF never counts
+    // the whole item as failed.
+    let sources: PerSourceChunk[];
     try {
-      baseText = extractItemText(item);
-      text = extractItemText(item, {
-        zotero: access,
+      sources = [];
+      for await (const source of extractPerSourceChunks(item, access, {
         fullTextMaxChars: DEFAULT_FULLTEXT_MAX_CHARS
-      });
+      })) {
+        sources.push(source);
+      }
     } catch {
       // Defensive: if a single item's metadata read throws (e.g. an
       // unexpected Zotero item type that rejects one of the field/note
@@ -537,7 +616,23 @@ export async function indexLibrary(
       deps.onProgress(indexed, failed, total, skippedNoText);
       continue;
     }
-    if (text.length === 0) {
+
+    // Chunk each source independently, stamping its provenance on every
+    // resulting chunk. Whitespace-only pages (blank PDF pages) chunk to
+    // `[]` and contribute nothing.
+    const sourceChunks: PerSourceChunk[] = [];
+    for (const source of sources) {
+      for (const chunk of chunkText(source.text, DEFAULT_CHUNK_BYTES)) {
+        sourceChunks.push({
+          text: chunk,
+          sourceKind: source.sourceKind,
+          ...(source.pageIndex !== undefined ? { pageIndex: source.pageIndex } : {}),
+          ...(source.attachmentKey !== undefined ? { attachmentKey: source.attachmentKey } : {})
+        });
+      }
+    }
+
+    if (sourceChunks.length === 0) {
       // Empty items are skipped without counting as failures (P3 in the
       // test fault-localization). Most commonly these are standalone
       // attachments / annotations without a populated title or abstract
@@ -553,18 +648,17 @@ export async function indexLibrary(
       deps.onProgress(indexed, failed, total, skippedNoText);
       continue;
     }
-    // If extractItemText only succeeded because of attachment fulltext
-    // (the base title+abstract surface was empty), count it as an
-    // attachment-driven index. For top-level bibliographic items that
-    // ALSO have attachment text, count them too — the user's mental
-    // model is "did the PDF contribute?".
-    const attachmentTextContributed = text.length > baseText.length;
+    // An item is "attachment-driven" when at least one chunk came from
+    // an attachment (PDF/EPUB/snapshot/other) rather than metadata/note
+    // — the user's mental model is "did the PDF contribute?".
+    const attachmentTextContributed = sourceChunks.some(
+      (chunk) => chunk.attachmentKey !== undefined
+    );
 
-    const chunks = chunkText(text, DEFAULT_CHUNK_BYTES);
-    const accumulated: { text: string; embedding: readonly number[] }[] = [];
+    const accumulated: IndexedItemChunk[] = [];
     let itemFailed = false;
 
-    for (const chunk of chunks) {
+    for (const chunk of sourceChunks) {
       await deps.scheduler();
 
       // Point (a): pause check BEFORE the in-flight embed call.
@@ -578,7 +672,7 @@ export async function indexLibrary(
         const result = await deps.provider.embedTexts({
           baseUrl: deps.settings.baseUrl,
           model: deps.settings.embeddingModel,
-          texts: [chunk],
+          texts: [chunk.text],
           signal: deps.abortController.signal
         });
         embedding = result[0];
@@ -614,7 +708,13 @@ export async function indexLibrary(
         break;
       }
 
-      accumulated.push({ text: chunk, embedding });
+      accumulated.push({
+        text: chunk.text,
+        embedding,
+        sourceKind: chunk.sourceKind,
+        ...(chunk.pageIndex !== undefined ? { pageIndex: chunk.pageIndex } : {}),
+        ...(chunk.attachmentKey !== undefined ? { attachmentKey: chunk.attachmentKey } : {})
+      });
     }
 
     if (itemFailed) {
@@ -627,6 +727,7 @@ export async function indexLibrary(
     consecutiveFailures = 0;
     const title = (item.getField("title") ?? "").trim();
     currentFile = {
+      schemaVersion: CURRENT_SCHEMA_VERSION,
       items: {
         ...currentFile.items,
         [item.key]: { title, chunks: accumulated }

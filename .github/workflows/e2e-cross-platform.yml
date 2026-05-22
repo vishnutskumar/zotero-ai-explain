@@ -25,6 +25,8 @@ name: E2E Cross-Platform
 on:
   push:
     branches: [main]
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -43,7 +45,11 @@ env:
   # when Zotero 8 ships and re-validate.
   ZOTERO_VERSION: "7.0.21"
   # Pin Ollama for cache stability — the model cache key includes this.
-  OLLAMA_VERSION: "0.5.7"
+  # 0.5.13 first added gemma3 family support; 0.6.6 is a stable point
+  # release (no prerelease/draft, published 2025-04-17) used to pull
+  # gemma3:1b on all three OSes. Bumping this value auto-invalidates the
+  # ollama-models-<os>-v<version>-... cache key below.
+  OLLAMA_VERSION: "0.6.6"
   # Tiny models keep CI fast and fit comfortably in actions/cache.
   OLLAMA_CHAT_MODEL: "gemma3:1b"
   OLLAMA_EMBED_MODEL: "embeddinggemma"

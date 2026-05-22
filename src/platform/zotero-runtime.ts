@@ -32,8 +32,10 @@ import { attachIndexControls } from "../ui/index-controls-view.js";
 import {
   buildLibraryPrompt,
   renderLibraryChatView,
-  wireLibraryChatView
+  wireLibraryChatView,
+  type CitationClick
 } from "../ui/library-chat-view.js";
+import { buildCitationLookup } from "../ui/citation-lookup.js";
 import { renderMarkdown } from "../ui/markdown.js";
 import type { PopupController } from "../ui/popup-controller.js";
 import { discoverModels, type DiscoveryFetch } from "../preferences/model-discovery.js";
@@ -146,15 +148,18 @@ export type ProxyRuntimeHandle = {
  *   - `indexStorage` exposes the persisted IndexFile.
  *   - `embedSettings` carries the `baseUrl`/`model` the embedding
  *     provider needs for `embedTexts(...)`.
- *   - `openItem(itemKey)` is invoked when the user clicks a citation
- *     link. Production wires it to `Zotero.getActiveZoteroPane().selectItems`.
+ *   - `openItem(citation)` is invoked when the user clicks a citation
+ *     link. It receives the RESOLVED citation — `itemKey` plus the
+ *     chunk-scoped `attachmentKey`/`pageIndex` when the click hit a
+ *     lookup entry. Production wires it to `Zotero.Reader.open`, jumping
+ *     straight to `pageIndex` when one is present.
  */
 export type LibraryChatDeps = {
   readonly provider: ModelProvider;
   readonly embeddingProvider: EmbeddingProvider;
   readonly indexStorage: IndexStorage;
   readonly embedSettings: { readonly baseUrl: string; readonly model: string };
-  readonly openItem: (itemKey: string) => void;
+  readonly openItem: (citation: CitationClick) => void;
 };
 
 /** Number of top-ranked chunks to include as context in the prompt. */
@@ -174,8 +179,7 @@ function blankSelection(question: string): SelectionContext {
       itemKey: null,
       itemTitle: null,
       attachmentKey: null,
-      pageLabel: null,
-      location: null
+      pageLabel: null
     },
     anchor: null
   };
@@ -264,9 +268,25 @@ export function createZoteroRuntime(deps: {
   let currentProviderProfile: ProviderProfileSettings | undefined = deps.providerProfile;
   const fetchImpl: RuntimeFetch | undefined = deps.fetch ?? globalThis.fetch;
 
+  /**
+   * Resolve the human page reference for a selection: the reader's
+   * `pageLabel` verbatim when present, otherwise the 1-based
+   * `pageIndex + 1`. `pageIndex: 0` yields "1" — a valid first page,
+   * checked via `typeof === "number"` so it is never dropped as falsy.
+   * Returns `undefined` when the selection carries no page at all.
+   */
+  function resolvePageReference(source: SelectionContext["source"]): string | undefined {
+    const label = source.pageLabel?.trim();
+    if (label !== undefined && label.length > 0) {
+      return label;
+    }
+    const pageIndex = source.pageIndex;
+    return typeof pageIndex === "number" ? String(pageIndex + 1) : undefined;
+  }
+
   function describeSource(selection: SelectionContext): string {
     const title = selection.source.itemTitle?.trim();
-    const page = selection.source.pageLabel?.trim();
+    const page = resolvePageReference(selection.source);
     if (title && page) {
       return `${title}, p. ${page}`;
     }
@@ -277,6 +297,65 @@ export function createZoteroRuntime(deps: {
       return `p. ${page}`;
     }
     return "Unknown source";
+  }
+
+  /**
+   * AC-2: render the PDF-identity prompt frame for a reader-triggered
+   * selection. The plan (L409-420) requires `itemKey`, `itemTitle`,
+   * `attachmentKey`, `pageIndex` and the `pageLabel ?? String(pageIndex + 1)`
+   * page reference to reach the LLM "in the prompt frame" — they are
+   * captured on `selection.source` but were never put into the actual
+   * provider messages.
+   *
+   * Returns `null` when the selection carries no identity at all (a
+   * non-reader selection, or a reader event whose params were all
+   * missing) so the caller can simply skip the frame — the explain /
+   * ask-question request then degrades gracefully to quote-only, exactly
+   * as before this fix.
+   */
+  function describeSourceFrame(selection: SelectionContext): string | null {
+    const source = selection.source;
+    const title = source.itemTitle?.trim();
+    const itemKey = typeof source.itemKey === "string" ? source.itemKey.trim() : "";
+    const attachmentKey =
+      typeof source.attachmentKey === "string" ? source.attachmentKey.trim() : "";
+    const page = resolvePageReference(source);
+
+    const lines: string[] = [];
+    if (title !== undefined && title.length > 0) {
+      lines.push(`Document: ${title}`);
+    }
+    if (page !== undefined) {
+      lines.push(`Page: ${page}`);
+    }
+    if (itemKey.length > 0) {
+      lines.push(`Zotero item key: ${itemKey}`);
+    }
+    if (attachmentKey.length > 0) {
+      lines.push(`Zotero attachment key: ${attachmentKey}`);
+    }
+    if (lines.length === 0) {
+      return null;
+    }
+    return `The selected text comes from this source:\n${lines.join("\n")}`;
+  }
+
+  /**
+   * AC-3: stamp the request-scoped RAG scope onto a reader-triggered
+   * selection. When the reader resolved a parent item key, in-PDF RAG
+   * retrieval is scoped to that item; non-PDF readers (and shortcut
+   * selections that resolved no item) leave `scopedItemKey` undefined so
+   * retrieval stays library-wide. Idempotent — re-applying is a no-op.
+   */
+  function withReaderScope(selection: SelectionContext): SelectionContext {
+    const itemKey = selection.source.itemKey;
+    if (typeof itemKey !== "string" || itemKey.length === 0) {
+      return selection;
+    }
+    return {
+      ...selection,
+      source: { ...selection.source, scopedItemKey: itemKey }
+    };
   }
 
   function firstAssistantMessage(conversation: Conversation): ChatMessage | undefined {
@@ -294,8 +373,91 @@ export function createZoteroRuntime(deps: {
     return conversation.messages.slice(firstAssistantIndex + 1);
   }
 
-  function startExplain(selection: SelectionContext): void {
+  /**
+   * Render a conversation update into an anchored popup's DOM. Shared by
+   * the explain and ask-question flows — both render the first assistant
+   * turn into the body, follow-up turns into the turns container, and
+   * manage the loading + error affordances identically.
+   */
+  function renderPopupConversation(
+    updated: Conversation,
+    refs: {
+      readonly body: HTMLElement;
+      readonly loading: HTMLElement | null;
+      readonly errorBlock: HTMLElement | null;
+      readonly errorMessageEl: HTMLElement | null;
+      readonly turnsContainer: HTMLElement | null;
+    }
+  ): void {
+    const firstAssistant = firstAssistantMessage(updated);
+    const followTurns = followUpTurns(updated);
+    // Loading indicator visibility: shown whenever the stream is running
+    // AND the currently-streaming turn has not yet produced text.
+    const streaming = updated.status === "streaming";
+    const failed = updated.status === "failed" && updated.errorMessage !== null;
+    const trailingAssistantPending = (() => {
+      if (followTurns.length === 0) {
+        return (firstAssistant?.content.length ?? 0) === 0;
+      }
+      const last = followTurns[followTurns.length - 1];
+      if (last === undefined) return false;
+      if (last.role !== "assistant") return true;
+      return last.content.length === 0;
+    })();
+    if (refs.loading !== null) {
+      refs.loading.hidden = !(streaming && trailingAssistantPending);
+    }
+    if (refs.errorBlock !== null && refs.errorMessageEl !== null) {
+      if (failed) {
+        refs.errorMessageEl.textContent = updated.errorMessage;
+        refs.errorBlock.hidden = false;
+      } else {
+        refs.errorBlock.hidden = true;
+        refs.errorMessageEl.textContent = "";
+      }
+    }
+    // The error block owns the failure UX — keep the body free of an
+    // "Error:" prefix so a retry leaves a clean tree behind.
+    if (firstAssistant !== undefined && firstAssistant.content.length > 0) {
+      renderMarkdown(refs.body, firstAssistant.content);
+    } else {
+      renderMarkdown(refs.body, "");
+    }
+    const turnsContainer = refs.turnsContainer;
+    if (turnsContainer !== null) {
+      const fragments = followTurns.map((message) => {
+        const article = turnsContainer.ownerDocument.createElement("article");
+        article.className = `zotero-ai-explain-popup__turn`;
+        article.dataset.role = message.role;
+        article.setAttribute(
+          "style",
+          "margin: 0; font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;"
+        );
+        const attribution = turnsContainer.ownerDocument.createElement("span");
+        attribution.className = "zotero-ai-explain-popup__turn-role";
+        attribution.textContent = `${message.role}: `;
+        const turnBody = turnsContainer.ownerDocument.createElement("div");
+        turnBody.className = "zotero-ai-explain-popup__turn-body";
+        renderMarkdown(turnBody, message.content);
+        article.append(attribution, turnBody);
+        return article;
+      });
+      turnsContainer.replaceChildren(...fragments);
+    }
+  }
+
+  function startExplain(rawSelection: SelectionContext): void {
+    const selection = withReaderScope(rawSelection);
     const conversation = deps.store.createFromSelection(selection, deps.profile());
+    // AC-2: seed the PDF-identity prompt frame as a leading system
+    // message so the model sees the document title + page reference +
+    // Zotero keys alongside the quote. Skipped when the selection has no
+    // identity (a non-reader selection) — the request then degrades to
+    // quote-only exactly as before.
+    const sourceFrame = describeSourceFrame(selection);
+    if (sourceFrame !== null) {
+      deps.store.appendSystemMessage(conversation.id, sourceFrame);
+    }
     deps.store.appendUserMessage(conversation.id, `Explain this: ${selection.quote}`);
 
     const popup = renderAnchoredPopup({
@@ -455,66 +617,13 @@ export function createZoteroRuntime(deps: {
       if (body === null) {
         return;
       }
-      const firstAssistant = firstAssistantMessage(updated);
-      const followTurns = followUpTurns(updated);
-      // Loading indicator visibility: shown whenever the stream is
-      // running AND the currently-streaming turn has not yet produced
-      // text. For the FIRST turn that's `firstAssistant.content === ""`;
-      // for follow-ups it's "the last message is the user's submission"
-      // (no assistant turn appended yet) OR the trailing assistant turn
-      // is still empty. This matches the user's mental model: any time
-      // they're waiting on a response, a loading indicator is visible.
-      const streaming = updated.status === "streaming";
-      const failed = updated.status === "failed" && updated.errorMessage !== null;
-      const trailingAssistantPending = (() => {
-        if (followTurns.length === 0) {
-          return (firstAssistant?.content.length ?? 0) === 0;
-        }
-        const last = followTurns[followTurns.length - 1];
-        if (last === undefined) return false;
-        if (last.role !== "assistant") return true;
-        return last.content.length === 0;
-      })();
-      if (loading !== null) {
-        loading.hidden = !(streaming && trailingAssistantPending);
-      }
-      if (errorBlock !== null && errorMessageEl !== null) {
-        if (failed) {
-          errorMessageEl.textContent = updated.errorMessage;
-          errorBlock.hidden = false;
-        } else {
-          errorBlock.hidden = true;
-          errorMessageEl.textContent = "";
-        }
-      }
-      // Render the first assistant turn in the body. The error block
-      // above owns the failure UX — keep the body free of the "Error:"
-      // prefix so a retry leaves a clean tree behind.
-      if (firstAssistant !== undefined && firstAssistant.content.length > 0) {
-        renderMarkdown(body, firstAssistant.content);
-      } else {
-        renderMarkdown(body, "");
-      }
-      if (turnsContainer !== null) {
-        const fragments = followTurns.map((message) => {
-          const article = turnsContainer.ownerDocument.createElement("article");
-          article.className = `zotero-ai-explain-popup__turn`;
-          article.dataset.role = message.role;
-          article.setAttribute(
-            "style",
-            "margin: 0; font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;"
-          );
-          const attribution = turnsContainer.ownerDocument.createElement("span");
-          attribution.className = "zotero-ai-explain-popup__turn-role";
-          attribution.textContent = `${message.role}: `;
-          const turnBody = turnsContainer.ownerDocument.createElement("div");
-          turnBody.className = "zotero-ai-explain-popup__turn-body";
-          renderMarkdown(turnBody, message.content);
-          article.append(attribution, turnBody);
-          return article;
-        });
-        turnsContainer.replaceChildren(...fragments);
-      }
+      renderPopupConversation(updated, {
+        body,
+        loading,
+        errorBlock,
+        errorMessageEl,
+        turnsContainer
+      });
     });
 
     cleanup.push(cleanupExplain);
@@ -522,6 +631,121 @@ export function createZoteroRuntime(deps: {
     void dismissPopup;
 
     void deps.popupController.explain(conversation.id);
+  }
+
+  /**
+   * Build the sticky-quote system frame for an ask-question conversation.
+   * Re-applied as `messages[0]` for the conversation's whole lifetime so
+   * every provider request stays anchored to the user's selection.
+   */
+  function quoteSystemFrame(quote: string): string {
+    return `The user is asking about this quoted passage: "${quote}"`;
+  }
+
+  /**
+   * AC-1: "Ask a question" reader command. Opens the anchored popup with
+   * the selection preloaded as a quote block and the textarea focused;
+   * unlike `startExplain` it does NOT auto-stream. The first submitted
+   * turn is framed `Quote: "<selection>"\n\nQuestion: <user-question>`;
+   * the sticky-quote system message rides every later turn.
+   */
+  function startAskQuestion(rawSelection: SelectionContext): void {
+    const selection = withReaderScope(rawSelection);
+    const conversation = deps.store.createFromSelection(selection, deps.profile());
+    // Seed the sticky-quote system frame. It is `messages[0]` for the
+    // conversation's lifetime, so it rides every provider request.
+    deps.store.appendSystemMessage(conversation.id, quoteSystemFrame(selection.quote));
+    // AC-2: seed the PDF-identity prompt frame as a second system message
+    // so every ask-question turn carries the document title + page
+    // reference + Zotero keys. Skipped when the selection has no identity.
+    const sourceFrame = describeSourceFrame(selection);
+    if (sourceFrame !== null) {
+      deps.store.appendSystemMessage(conversation.id, sourceFrame);
+    }
+
+    const popup = renderAnchoredPopup({
+      disclosure: deps.disclosure(),
+      anchor: selection.anchor,
+      text: "",
+      mode: "ask-question",
+      quote: selection.quote
+    });
+    const body = popup.querySelector<HTMLElement>(".zotero-ai-explain-popup__body");
+    const loading = popup.querySelector<HTMLElement>(".zotero-ai-explain-popup__loading");
+    const errorBlock = popup.querySelector<HTMLElement>(".zotero-ai-explain-popup__error");
+    const errorMessageEl = popup.querySelector<HTMLElement>(
+      ".zotero-ai-explain-popup__error-message"
+    );
+    const turnsContainer = popup.querySelector<HTMLElement>(".zotero-ai-explain-popup__turns");
+
+    let popupUnmount: Unsubscribe | null = null;
+    let popupUnsubscribe: Unsubscribe | null = null;
+
+    const cleanupAsk = (): void => {
+      popupUnsubscribe?.();
+      popupUnmount?.();
+    };
+
+    // The first submitted question is framed with the quote; later turns
+    // are plain (the sticky-quote system message keeps them anchored).
+    let firstTurnSent = false;
+
+    const followForm = popup.querySelector<HTMLFormElement>(".zotero-ai-explain-popup__form");
+    const followTextarea = popup.querySelector<HTMLTextAreaElement>(
+      '.zotero-ai-explain-popup__form [name="followUp"]'
+    );
+    followForm?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const raw = followTextarea?.value ?? "";
+      // Empty-textarea submit is a rejected no-op — matches library-chat's
+      // empty-input behavior. `sendFollowUp` also trims/rejects, but we
+      // bail here so the first-turn framing only consumes a real question.
+      if (raw.trim().length === 0) {
+        return;
+      }
+      if (followTextarea) {
+        followTextarea.value = "";
+      }
+      if (!firstTurnSent) {
+        firstTurnSent = true;
+        void deps.popupController.sendFollowUp(
+          conversation.id,
+          `Quote: "${selection.quote}"\n\nQuestion: ${raw.trim()}`
+        );
+        return;
+      }
+      void deps.popupController.sendFollowUp(conversation.id, raw.trim());
+    });
+    followTextarea?.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        followForm?.requestSubmit();
+      }
+    });
+
+    popupUnmount = deps.ui.mountPopup(popup, {
+      anchor: selection.anchor,
+      onDismiss: () => {
+        popupUnsubscribe?.();
+        popupUnsubscribe = null;
+        popupUnmount = null;
+      }
+    });
+    popupUnsubscribe = deps.store.subscribe(conversation.id, (updated) => {
+      if (body === null) {
+        return;
+      }
+      renderPopupConversation(updated, {
+        body,
+        loading,
+        errorBlock,
+        errorMessageEl,
+        turnsContainer
+      });
+    });
+
+    cleanup.push(cleanupAsk);
+    // No auto-stream: ask-question waits for the user's first question.
   }
 
   /**
@@ -994,7 +1218,7 @@ export function createZoteroRuntime(deps: {
     // because the click event that triggered us is still bubbling — the
     // dialog's own click-to-restore handler would otherwise fire on the
     // same event and undo the minimize immediately.
-    const handleCitationClick = (itemKey: string): void => {
+    const handleCitationClick = (citation: CitationClick): void => {
       const win = deps.zotero?.getMainWindow?.() ?? null;
       const scheduler =
         win !== null
@@ -1008,7 +1232,7 @@ export function createZoteroRuntime(deps: {
           // Defensive: minimize is idempotent in the adapter.
         }
       }, 0);
-      chat.openItem(itemKey);
+      chat.openItem(citation);
     };
 
     const submit = async (question: string): Promise<void> => {
@@ -1057,6 +1281,14 @@ export function createZoteroRuntime(deps: {
           store.fail("No indexed content found — index your library first.");
           return;
         }
+        // Pin the per-turn citation lookup to the assistant message's
+        // index BEFORE streaming begins. The user message is already
+        // appended, so the assistant turn lands at the current message
+        // count; its first delta appends at exactly that index.
+        store.attachCitationLookup(
+          store.getState().messages.length,
+          buildCitationLookup(retrieved)
+        );
         const messages: readonly ChatMessage[] = [
           { role: "user", content: buildLibraryPrompt({ question, chunks: retrieved }) }
         ];
@@ -1198,8 +1430,7 @@ export function createZoteroRuntime(deps: {
           itemKey: null,
           itemTitle: null,
           attachmentKey: null,
-          pageLabel: null,
-          location: null
+          pageLabel: null
         },
         anchor:
           rect === null
@@ -1261,7 +1492,12 @@ export function createZoteroRuntime(deps: {
       if (libraryChat !== undefined) {
         cleanup.push(deps.ui.addMenuItem("Ask your library", openLibraryChatDialog));
       }
-      cleanup.push(deps.ui.addReaderCommand("Explain with AI", startExplain));
+      cleanup.push(
+        deps.ui.addReaderCommands([
+          { label: "Explain with AI", mode: "explain", action: startExplain },
+          { label: "Ask a question", mode: "ask-question", action: startAskQuestion }
+        ])
+      );
       cleanup.push(registerKeyboardShortcuts());
       return Promise.resolve();
     },

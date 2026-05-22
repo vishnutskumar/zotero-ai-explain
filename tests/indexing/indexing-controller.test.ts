@@ -26,7 +26,9 @@ describe("createIndexingController", () => {
       skippedNoText: 0,
       totalItems: 0,
       indexedItems: 0,
-      failedItems: 0
+      failedItems: 0,
+      // AC-14: the initial status seeds the read-only migration signal.
+      migrationActive: false
     });
   });
 
@@ -99,6 +101,7 @@ describe("createIndexingController", () => {
     const logger = makeLogger();
     const deps = controllerStubDeps();
     await deps.storage.write({
+      schemaVersion: 2,
       indexedAt: "2026-05-18T00:00:00.000Z",
       items: { a: { chunks: [] }, b: { chunks: [] }, c: { chunks: [] } } as never
     });
@@ -128,6 +131,7 @@ describe("createIndexingController", () => {
     const logger = makeLogger();
     const deps = controllerStubDeps();
     await deps.storage.write({
+      schemaVersion: 2,
       indexedAt: "2026-05-18T00:00:00.000Z",
       items: {}
     });
@@ -145,6 +149,7 @@ describe("createIndexingController", () => {
     const logger = makeLogger();
     const deps = controllerStubDeps();
     await deps.storage.write({
+      schemaVersion: 2,
       indexedAt: "2026-05-18T00:00:00.000Z",
       items: { a: { chunks: [] } } as never
     });

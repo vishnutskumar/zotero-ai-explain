@@ -83,6 +83,22 @@ function makeIo(initial: Record<string, string> = {}): {
     async exists(p) {
       await Promise.resolve();
       return files.has(p);
+    },
+    async rename(src, dst) {
+      await Promise.resolve();
+      const v = files.get(src);
+      if (v === undefined) {
+        throw new Error(`ENOENT: ${src}`);
+      }
+      files.set(dst, v);
+      files.delete(src);
+    },
+    async stat(p) {
+      // AC-12: cheap stat for the index-cache fingerprint. Resolves
+      // `null` when the file is absent (matches `IOUtils.stat` ENOENT).
+      await Promise.resolve();
+      const v = files.get(p);
+      return v === undefined ? null : { size: v.length };
     }
   };
   return { io, files };
@@ -101,10 +117,11 @@ function makeStorage(
 }
 
 const validFile: IndexFile = {
+  schemaVersion: 2,
   items: {
     K1: {
       title: "Paper One",
-      chunks: [{ text: "chunk", embedding: [0.1, 0.2, 0.3] }]
+      chunks: [{ text: "chunk", embedding: [0.1, 0.2, 0.3], sourceKind: "metadata" }]
     }
   },
   indexedAt: "2026-05-17T00:00:00.000Z"
@@ -286,23 +303,27 @@ describe("createIndexStorage", () => {
     });
   });
 
-  describe("legacy filename migration (Bug A)", () => {
+  describe("legacy filename fallback (Bug A)", () => {
     /**
      * Premises (P_legacy):
      *   P1. When `embedProvider = {kind: "ollama", model: "embeddinggemma"}`
      *       and the per-provider file is missing, `read()` MUST fall back
      *       to the legacy `zotero-ai-explain-index.json` filename.
-     *   P2. After a successful legacy read, the storage MUST write the
-     *       parsed data to the per-provider filename so subsequent reads
-     *       skip the fallback.
+     *   P2. `read()` is PURE (AC-12 SP-12.4 / AC-5 FINDING-1) — a legacy
+     *       fallback returns the parsed legacy data and issues NO
+     *       `writeString`/`remove`/`rename`. The legacy file is NOT
+     *       copied to the per-provider name by `read()`; the per-provider
+     *       file is (re)created by the next real `write()` instead.
+     *       (Codex S9 FINDING-2: the prior copy was a read-path mutation.)
      *   P3. If the per-provider file exists, the legacy filename is
      *       IGNORED (new wins; legacy is stale).
      *   P4. If the embed provider is NOT ollama/embeddinggemma, the
      *       legacy file is NOT considered (legacy only ever held
      *       ollama/embeddinggemma vectors).
      *   P5. A malformed legacy file MUST yield null, NOT throw.
-     *   P6. A migration write failure MUST still return the parsed
-     *       legacy data (best-effort copy, never block the read).
+     *   P6. Every legacy fallback read returns the same parsed legacy
+     *       data — there is no copy to fail, so a read-only disk never
+     *       blocks the read.
      */
 
     const legacyPath = "/var/test-fixture/zotero-data/zotero-ai-explain-index.json";
@@ -328,30 +349,51 @@ describe("createIndexStorage", () => {
       expect(result).toEqual(validFile);
     });
 
-    it("migrates the legacy file to the new per-provider path on first read", async () => {
+    it("read() does NOT copy the legacy file to the per-provider path (read stays pure)", async () => {
+      // AC-12 SP-12.4 / codex S9 FINDING-2: a legacy fallback `read()`
+      // returns the parsed data WITHOUT writing the per-provider file —
+      // the read path issues no `writeString`. The per-provider file is
+      // created by the next real `write()`, not as a read side effect.
       const { io, files } = makeIo({ [legacyPath]: JSON.stringify(validFile) });
       const storage = makeOllamaEmbedStorage(io);
-      await storage.read();
-      expect(files.has(newPath)).toBe(true);
-      const persisted: unknown = JSON.parse(files.get(newPath) ?? "");
-      expect(persisted).toEqual(validFile);
+      const result = await storage.read();
+      expect(result).toEqual(validFile);
+      // No copy: the per-provider file is NOT created by the read.
+      expect(files.has(newPath)).toBe(false);
       // The legacy file is left alone — we don't destroy user data.
       expect(files.has(legacyPath)).toBe(true);
     });
 
-    it("subsequent reads hit the new per-provider path (legacy fallback only runs once)", async () => {
+    it("repeated legacy-fallback reads all return the legacy data (pure, no copy)", async () => {
+      const { io } = makeIo({ [legacyPath]: JSON.stringify(validFile) });
+      const storage = makeOllamaEmbedStorage(io);
+      // Every read falls back to the legacy file directly — there is no
+      // one-time copy, so the second read behaves identically to the
+      // first. (The per-provider fast path is restored by `write()`.)
+      expect(await storage.read()).toEqual(validFile);
+      expect(await storage.read()).toEqual(validFile);
+    });
+
+    it("a write() after a legacy read creates the per-provider file (fast path restored)", async () => {
+      // The per-provider file is (re)created by the next real `write()`,
+      // not by `read()`. After a write, reads hit the per-provider path.
       const { io, files } = makeIo({ [legacyPath]: JSON.stringify(validFile) });
       const storage = makeOllamaEmbedStorage(io);
       await storage.read();
-      // Now make the legacy file unreadable. If the migration succeeded
-      // the second read must still work because we now hit the new path.
+      expect(files.has(newPath)).toBe(false);
+
+      await storage.write(validFile);
+      expect(files.has(newPath)).toBe(true);
+
+      // With the per-provider file present, a read no longer needs the
+      // legacy fallback.
       files.delete(legacyPath);
-      const second = await storage.read();
-      expect(second).toEqual(validFile);
+      expect(await storage.read()).toEqual(validFile);
     });
 
     it("prefers the new per-provider file when BOTH legacy and new exist (legacy is stale)", async () => {
       const stale: IndexFile = {
+        schemaVersion: 2,
         items: { OLD: { title: "Old", chunks: [] } },
         indexedAt: "1970-01-01T00:00:00Z"
       };
@@ -400,10 +442,14 @@ describe("createIndexStorage", () => {
       await expect(storage.read()).resolves.toBeNull();
     });
 
-    it("returns the parsed legacy data even when the migration write fails", async () => {
-      // Custom IO whose writeString rejects so the best-effort migration
-      // can't complete. The read still has to return the parsed data.
+    it("a legacy-fallback read() issues NO writeString — it is pure (FINDING-2)", async () => {
+      // AC-12 SP-12.4: `read()` is pure. A legacy fallback must NOT copy
+      // the file to the per-provider name. A spy IO whose `writeString`
+      // throws on any call proves the read path never writes: if `read()`
+      // still attempted the (removed) copy this would surface the error
+      // OR populate `newPath`. Neither must happen.
       const files = new Map<string, string>([[legacyPath, JSON.stringify(validFile)]]);
+      let writeStringCalls = 0;
       const io: IndexStorageIoLike = {
         async readString(p) {
           await Promise.resolve();
@@ -413,6 +459,7 @@ describe("createIndexStorage", () => {
         },
         async writeString() {
           await Promise.resolve();
+          writeStringCalls += 1;
           throw new Error("EROFS: read-only filesystem");
         },
         async remove(p) {
@@ -422,12 +469,26 @@ describe("createIndexStorage", () => {
         async exists(p) {
           await Promise.resolve();
           return files.has(p);
+        },
+        async rename(src, dst) {
+          await Promise.resolve();
+          const v = files.get(src);
+          if (v === undefined) throw new Error(`ENOENT: ${src}`);
+          files.set(dst, v);
+          files.delete(src);
+        },
+        async stat(p) {
+          await Promise.resolve();
+          const v = files.get(p);
+          return v === undefined ? null : { size: v.length };
         }
       };
       const storage = makeOllamaEmbedStorage(io);
       const result = await storage.read();
       expect(result).toEqual(validFile);
-      // Migration failed silently; the new path stays empty.
+      // The read path issued zero writes — it is genuinely pure.
+      expect(writeStringCalls).toBe(0);
+      // No copy: the per-provider path stays empty.
       expect(files.has(newPath)).toBe(false);
     });
 

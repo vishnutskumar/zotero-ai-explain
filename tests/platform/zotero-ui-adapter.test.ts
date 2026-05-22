@@ -313,14 +313,21 @@ describe("createZoteroUiAdapter floating layers", () => {
     expect(onDismiss).toHaveBeenCalledTimes(1);
   });
 
-  it("mountPopup: wrapper keeps overflow auto + max-height for scrollability (AC3)", () => {
+  it("mountPopup: wrapper is the bounded scroll container for long content (AC3)", () => {
     const { ui } = createAdapter();
     const unmount = ui.mountPopup(document.createElement("section"));
     const wrapper = document.querySelector<HTMLElement>(".zotero-ai-popup-wrapper");
     const style = wrapper?.getAttribute("style") ?? "";
+    // The wrapper itself caps height (`max-height`) AND scrolls
+    // (`overflow-y: auto`): a long response scrolls within the popup
+    // instead of growing it unboundedly. Accept the `overflow` shorthand
+    // or the `overflow-y` longhand — both express the same scroll intent.
     expect(style).toContain("max-height: 60vh");
+    expect(style).toMatch(/overflow(?:-y)?\s*:\s*(auto|scroll)/u);
     const bodyWrapper = document.querySelector<HTMLElement>(".zotero-ai-popup-wrapper__body");
-    expect(bodyWrapper?.getAttribute("style") ?? "").toMatch(/overflow\s*:\s*auto/u);
+    expect(bodyWrapper?.getAttribute("style") ?? "").toMatch(
+      /overflow(?:-y)?\s*:\s*(auto|scroll)/u
+    );
     unmount();
   });
 
@@ -357,6 +364,7 @@ describe("createZoteroUiAdapter floating layers", () => {
     const handler = reader.registerEventListener.mock.calls[0]?.[1] as
       | ((event: {
           doc: Document;
+          params?: { annotation?: { text?: string } };
           reader?: { _iframe?: { getBoundingClientRect(): DOMRect } };
           append: (el: HTMLElement) => void;
         }) => void)
@@ -366,6 +374,8 @@ describe("createZoteroUiAdapter floating layers", () => {
     let appended: HTMLButtonElement | null = null;
     handler?.({
       doc: document,
+      // AC-1: a command button is only appended for a non-empty selection.
+      params: { annotation: { text: "selected text" } },
       reader: {
         _iframe: { getBoundingClientRect: () => document.body.getBoundingClientRect() }
       },
@@ -409,6 +419,7 @@ describe("createZoteroUiAdapter floating layers", () => {
     const handler = reader.registerEventListener.mock.calls[0]?.[1] as
       | ((event: {
           doc: Document;
+          params?: { annotation?: { text?: string } };
           reader?: { _iframe?: { getBoundingClientRect(): DOMRect } };
           append: (el: HTMLElement) => void;
         }) => void)
@@ -416,6 +427,8 @@ describe("createZoteroUiAdapter floating layers", () => {
     let appended: HTMLButtonElement | null = null;
     handler?.({
       doc: document,
+      // AC-1: a command button is only appended for a non-empty selection.
+      params: { annotation: { text: "selected text" } },
       reader: {
         _iframe: { getBoundingClientRect: () => document.body.getBoundingClientRect() }
       },

@@ -108,14 +108,18 @@ type AppendResult = {
 };
 
 function buildSyntheticAppend(doc: Document, container: HTMLElement): AppendResult {
-  let captured: HTMLElement | null = null;
+  // The v0.3.0 reader handler appends MORE than one button (Explain with
+  // AI + Ask a question). Track every appended element; `button()` returns
+  // the `explain`-mode one so these explain-flow tests click the right
+  // control regardless of append order.
+  const captured: HTMLElement[] = [];
   const win = doc.defaultView;
   if (win === null) {
     throw new Error("synthetic append: document has no defaultView");
   }
   const append: ReaderEvent["append"] = (content) => {
     if (content instanceof win.HTMLElement) {
-      captured = content;
+      captured.push(content);
       container.append(content);
       return;
     }
@@ -125,16 +129,19 @@ function buildSyntheticAppend(doc: Document, container: HTMLElement): AppendResu
     button.addEventListener("click", () => {
       content.onCommand();
     });
-    captured = button;
+    captured.push(button);
     container.append(button);
   };
   return {
     append,
     button: () => {
-      if (captured === null) {
+      // Prefer the explain command button; fall back to the first appended.
+      const explain = captured.find((el) => el.dataset.mode === "explain");
+      const chosen = explain ?? captured[0];
+      if (chosen === undefined) {
         throw new Error("synthetic append: no button captured");
       }
-      return captured;
+      return chosen;
     }
   };
 }

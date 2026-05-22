@@ -19,14 +19,16 @@ docs/
 ## ADRs (`docs/decisions/`)
 
 Lightweight Architectural Decision Records — one file per major design choice. Format: Context ·
-Decision · Consequences · Alternatives considered. The Phase 4 real-product-pipeline work landed
-five:
+Decision · Consequences · Alternatives considered. The Phase 4 real-product-pipeline work landed the
+first five; the pdf-context-features (v0.3.0) work added two more:
 
 - `0001-llm-proxy-architecture.md` — local HTTP proxy with codex/claude/ollama backends.
 - `0002-per-provider-index-files.md` — one index file per (embed-provider, model) pair.
 - `0003-provider-profile-abstraction.md` — independent chat/embed selectors + preset layer.
 - `0004-bootstrap-chrome-subprocess.md` — `Subprocess.sys.mjs` for the in-plugin proxy lifecycle.
 - `0005-library-chat-rag-design.md` — cosine top-K=8 retrieval with citation rendering.
+- `0006-pdf-worker-per-page-extraction.md` — per-page PDF text via `Zotero.PDFWorker.getFullText`.
+- `0007-schema-versioned-index-migration.md` — crash-safe write-new-then-swap index migration.
 
 Add a new ADR when a future change makes one of these decisions obsolete (mark the old ADR
 **Superseded** and reference the new one) or when a new decision of similar weight is made.

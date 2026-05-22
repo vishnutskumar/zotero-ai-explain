@@ -10,6 +10,7 @@
  */
 
 import type { ChatMessage } from "../providers/provider-types.js";
+import type { CitationLookup } from "../ui/citation-lookup.js";
 
 export type LibraryChatStatus = "idle" | "streaming" | "completed" | "failed";
 
@@ -17,6 +18,13 @@ export type LibraryChatState = {
   readonly status: LibraryChatStatus;
   readonly messages: readonly ChatMessage[];
   readonly errorMessage: string | null;
+  /**
+   * Per-turn citation lookup tables (AC-6), keyed by the assistant
+   * message's index in `messages`. Pinned per-turn so re-rendering an
+   * older assistant message resolves its citations against THAT turn's
+   * retrieved chunks, not the most recent turn's.
+   */
+  readonly citationLookups: ReadonlyMap<number, CitationLookup>;
 };
 
 export type LibraryChatListener = (state: LibraryChatState) => void;
@@ -29,11 +37,18 @@ export type LibraryConversationStore = {
   complete(): void;
   fail(message: string): void;
   reset(): void;
+  /**
+   * Pin a citation lookup table to a specific assistant message index
+   * (AC-6). A later attach for a different index does NOT overwrite an
+   * earlier turn's table — each turn keeps its own. Notifies subscribers
+   * so the view re-renders with the now-resolved citations.
+   */
+  attachCitationLookup(messageIndex: number, lookup: CitationLookup): void;
   subscribe(listener: LibraryChatListener): () => void;
 };
 
 function initialState(): LibraryChatState {
-  return { status: "idle", messages: [], errorMessage: null };
+  return { status: "idle", messages: [], errorMessage: null, citationLookups: new Map() };
 }
 
 export function createLibraryConversationStore(): LibraryConversationStore {
@@ -89,6 +104,14 @@ export function createLibraryConversationStore(): LibraryConversationStore {
     },
     reset() {
       set(initialState());
+    },
+    attachCitationLookup(messageIndex, lookup) {
+      // Copy-on-write so the prior state object stays immutable for any
+      // subscriber that captured it. A new entry is added for this index
+      // only — earlier turns' tables are carried over untouched.
+      const next = new Map(state.citationLookups);
+      next.set(messageIndex, lookup);
+      set({ ...state, citationLookups: next });
     },
     subscribe(listener) {
       listeners.add(listener);

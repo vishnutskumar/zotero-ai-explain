@@ -2,18 +2,42 @@ import type { SelectionAnchor, SelectionContext } from "../selection/selection-c
 import type {
   DialogHandle,
   PopupMountOptions,
+  ReaderCommandSpec,
   Unsubscribe,
   ZoteroUiAdapter
 } from "./zotero-ui-types.js";
 
+/**
+ * Narrow shape of a Zotero reader `_item` (the attachment the reader was
+ * opened for). PDF child attachments carry a `parentItem`; standalone PDF
+ * attachments do not. Underscore-free public API only, so it survives the
+ * Xray wrapper when accessed through `wrappedJSObject`.
+ */
+type ReaderItem = {
+  readonly key?: string;
+  readonly parentItem?: {
+    readonly key?: string;
+    getDisplayTitle?(): string;
+  } | null;
+  getDisplayTitle?(): string;
+};
+
 type ReaderEvent = {
   readonly doc: Document;
-  readonly params?: { readonly annotation?: { readonly text?: string } };
+  readonly params?: {
+    readonly annotation?: {
+      readonly text?: string;
+      readonly pageLabel?: string;
+      readonly position?: { readonly pageIndex?: number };
+    };
+  };
   // Reader instance attached by Zotero's customEvent bridge (xpcom/reader.js:184).
   // `_iframe` is the chrome-side XUL <browser> element hosting the reader iframe;
   // its bounding rect maps reader-iframe-local coords to chrome-window coords.
+  // `_item` is the attachment item the reader was opened for.
   readonly reader?: {
     readonly _iframe?: { getBoundingClientRect(): DOMRect };
+    readonly _item?: ReaderItem;
   };
   append(content: HTMLElement | { readonly label: string; readonly onCommand: () => void }): void;
 };
@@ -81,22 +105,35 @@ const DIALOG_BODY_STYLE = "padding: 16px; overflow: auto; flex: 1 1 auto;";
  * Base popup wrapper style. When an anchor is provided, the wrapper's
  * `top`/`left`/`transform` are recomputed in {@link computePopupPosition}.
  * Otherwise we fall back to the legacy top-center position.
+ *
+ * The wrapper is the bounded scroll container: `max-height: 60vh` caps the
+ * rendered box and `overflow-y: auto` makes content beyond the cap scroll
+ * *within the wrapper* rather than growing the popup unboundedly. The
+ * `__header` row is `position: sticky` (see {@link POPUP_HEADER_STYLE}) so
+ * the close/drag affordance stays pinned while the body scrolls. The body
+ * wrapper keeps its intrinsic height (`flex: 0 0 auto`) so a long response
+ * pushes the wrapper's `scrollHeight` past its clamped `clientHeight` — if
+ * the body were `flex: 1 1 auto` the flex algorithm would shrink it to fit
+ * the wrapper and the wrapper would never report overflow.
  */
 const POPUP_WRAPPER_BASE_STYLE =
   "position: fixed; z-index: 999999; max-width: 480px; min-width: 320px; " +
   `background: ${SURFACE_BG}; color: ${FG}; font-family: ${FONT_STACK}; ` +
   `font-size: 13px; line-height: 1.45; border-radius: 6px; ` +
   `border: 1px solid ${BORDER_HAIRLINE}; ` +
-  "box-shadow: 0 12px 32px rgba(0,0,0,0.35); max-height: 60vh; " +
+  "box-shadow: 0 12px 32px rgba(0,0,0,0.35); max-height: 60vh; overflow-y: auto; " +
   "display: flex; flex-direction: column;";
 const POPUP_HEADER_STYLE =
   `display: flex; align-items: center; justify-content: flex-end; ` +
-  `padding: 4px 6px 0 6px; cursor: move; user-select: none;`;
+  `padding: 4px 6px 0 6px; cursor: move; user-select: none; ` +
+  // Pin the close/drag row to the top of the scrolling wrapper so it stays
+  // reachable while a long response scrolls underneath it.
+  `position: sticky; top: 0; z-index: 1; background: ${SURFACE_BG};`;
 const POPUP_CLOSE_STYLE =
   `appearance: none; border: 1px solid transparent; background: transparent; color: ${FG}; ` +
   "width: 22px; height: 22px; padding: 0; border-radius: 4px; cursor: pointer; " +
   "font-size: 16px; line-height: 1; display: inline-flex; align-items: center; justify-content: center;";
-const POPUP_BODY_WRAPPER_STYLE = "padding: 0 14px 12px 14px; overflow: auto; flex: 1 1 auto;";
+const POPUP_BODY_WRAPPER_STYLE = "padding: 0 14px 12px 14px; overflow-y: auto; flex: 0 0 auto;";
 /** Fallback used when no anchor is supplied. */
 const POPUP_FALLBACK_POSITION_STYLE = "top: 80px; left: 50%; transform: translateX(-50%);";
 
@@ -249,13 +286,67 @@ export function createZoteroUiAdapter(input: {
         item.remove();
       };
     },
-    addReaderCommand(label, action): Unsubscribe {
+    addReaderCommands(commands): Unsubscribe {
+      // Resolve PDF identity off the reader event ONCE per dispatch so
+      // every command button shares the same source metadata. Mirrors the
+      // three-tier `_iframe` strategy below: direct `_item`, then the Xray
+      // `wrappedJSObject._item`, then a miss → all identity fields null.
+      const resolveSource = (event: ReaderEvent): SelectionContext["source"] => {
+        const readerRaw = event.reader as
+          | {
+              readonly wrappedJSObject?: { readonly _item?: ReaderItem };
+              readonly _item?: ReaderItem;
+            }
+          | undefined;
+        const item: ReaderItem | undefined = readerRaw?._item ?? readerRaw?.wrappedJSObject?._item;
+        const attachmentKey = item?.key ?? null;
+        const parent = item?.parentItem ?? null;
+        // itemKey resolves to the parent item's key when the reader
+        // attachment is a PDF child; standalone attachments fall back to
+        // their own key so the field is still populated.
+        const itemKey = parent?.key ?? item?.key ?? null;
+        const itemTitle = parent?.getDisplayTitle?.() ?? item?.getDisplayTitle?.() ?? null;
+        const pageLabel = event.params?.annotation?.pageLabel ?? null;
+        const pageIndex = event.params?.annotation?.position?.pageIndex;
+        return {
+          itemKey,
+          itemTitle,
+          attachmentKey,
+          pageLabel,
+          // `pageIndex: 0` is a valid first page — only attach the field
+          // when the reader event actually supplied a number, never
+          // conflate an absent position with 0.
+          ...(typeof pageIndex === "number" ? { pageIndex } : {})
+        };
+      };
+
       const handler = (event: ReaderEvent): void => {
         const quote = event.params?.annotation?.text?.trim() ?? "";
+        // Hidden-when-no-selection (AC-1): an empty or whitespace-only
+        // selection renders NO command buttons at all. `event.params`
+        // undefined is the defensive fall-through — `quote` is "" and we
+        // bail before appending anything.
+        if (quote.length === 0) {
+          return;
+        }
+        const source = resolveSource(event);
+        for (const spec of commands) {
+          appendReaderCommandButton(event, spec, quote, source);
+        }
+      };
+
+      const appendReaderCommandButton = (
+        event: ReaderEvent,
+        spec: ReaderCommandSpec,
+        quote: string,
+        source: SelectionContext["source"]
+      ): void => {
+        const { label, action } = spec;
         const button = event.doc.createElement("button");
         button.type = "button";
         button.textContent = label;
-        button.dataset.action = "explain-with-ai";
+        button.dataset.action = spec.mode === "ask-question" ? "ask-question" : "explain-with-ai";
+        button.dataset.mode = spec.mode;
         button.addEventListener("click", () => {
           // AC1: compute anchor in CHROME-WINDOW coordinates. The reader iframe
           // is a XUL <browser> element (xpcom/reader.js:1812), so the HTML
@@ -366,13 +457,6 @@ export function createZoteroUiAdapter(input: {
             };
             viewWindow?.setTimeout(restore, 1500);
           }
-          const source: SelectionContext["source"] = {
-            itemKey: null,
-            itemTitle: null,
-            attachmentKey: null,
-            pageLabel: null,
-            location: null
-          };
           // FINDING-3: no `mainWindow` OR no reader frame rect → bail out
           // with `anchor: null` rather than fabricating viewport math.
           // Production always has both; this is defensive.
@@ -401,10 +485,16 @@ export function createZoteroUiAdapter(input: {
       }
       const reader = input.Zotero.Reader;
       reader.registerEventListener("renderTextSelectionPopup", handler, input.pluginId);
-      input.Zotero.debug(`Zotero AI Explain registered reader command: ${label}`);
+      input.Zotero.debug(
+        `Zotero AI Explain registered reader commands: ${commands.map((c) => c.label).join(", ")}`
+      );
       return () => {
         reader.unregisterEventListener("renderTextSelectionPopup", handler);
       };
+    },
+    addReaderCommand(label, action): Unsubscribe {
+      // Convenience wrapper — a single `explain`-mode command.
+      return this.addReaderCommands([{ label, mode: "explain", action }]);
     },
     openDialog(title, content): DialogHandle {
       const mainWindow = input.Zotero.getMainWindow?.();
@@ -612,8 +702,11 @@ export function createZoteroUiAdapter(input: {
       applyFocusRing(closeButton);
       header.append(closeButton);
 
-      // AC3: dedicated scrollable body container so the inner content can
-      // grow vertically and scroll within the wrapper's max-height.
+      // AC3: dedicated body container. It keeps its intrinsic content
+      // height (`flex: 0 0 auto`); the scrolling happens on the outer
+      // wrapper, which is `max-height`-capped with `overflow-y: auto`. The
+      // wrapper is the surface a user perceives as scrollable when a long
+      // response exceeds the 60vh cap.
       const bodyWrapper = document.createElement("div");
       bodyWrapper.className = "zotero-ai-popup-wrapper__body";
       bodyWrapper.setAttribute("style", POPUP_BODY_WRAPPER_STYLE);

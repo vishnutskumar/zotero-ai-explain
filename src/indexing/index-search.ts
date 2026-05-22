@@ -28,6 +28,25 @@ export type RetrievedChunk = {
   readonly title: string;
   readonly text: string;
   readonly score: number;
+  /** Position of this chunk within the retrieved-chunks list. */
+  readonly chunkIndex?: number;
+  /** Source page (PDF chunks only); 0-indexed. `undefined`-absent. */
+  readonly pageIndex?: number;
+  /** Source attachment key (PDF/EPUB/snapshot/attachment chunks). */
+  readonly attachmentKey?: string;
+  /** Descriptive provenance of the chunk's text. */
+  readonly sourceKind?: "pdf-page" | "metadata" | "note" | "epub" | "snapshot" | "attachment";
+};
+
+/**
+ * Optional retrieval scoping. When `scopedItemKey` is set, only chunks of
+ * that item are eligible — used by the in-PDF RAG popup. Omitted (or with
+ * an explicit `undefined` `scopedItemKey`) ⇒ library-wide retrieval — both
+ * absence representations are accepted so callers can forward an optional
+ * field without conditionally spreading it.
+ */
+export type TopKChunksOptions = {
+  readonly scopedItemKey?: string | undefined;
 };
 
 export class EmbeddingDimensionMismatchError extends Error {
@@ -72,19 +91,40 @@ export function cosineSimilarity(a: readonly number[], b: readonly number[]): nu
 export function topKChunks(
   indexFile: IndexFile,
   queryEmbedding: readonly number[],
-  k: number
+  k: number,
+  options?: TopKChunksOptions
 ): readonly RetrievedChunk[] {
   if (k <= 0) return [];
+  const scopedItemKey = options?.scopedItemKey;
   const scored: RetrievedChunk[] = [];
   for (const [itemKey, item] of Object.entries(indexFile.items)) {
+    // AC-3 scope filter: when a scope is set, only chunks of that item
+    // are eligible. Skipping the whole item BEFORE `cosineSimilarity`
+    // means a dimension mismatch on an out-of-scope item never surfaces.
+    if (scopedItemKey !== undefined && itemKey !== scopedItemKey) {
+      continue;
+    }
     for (const chunk of item.chunks) {
       // Eager dim-mismatch detection: surface the first encountered
       // mismatch as an error so the UI can render a clear "re-index"
       // message instead of returning silently-wrong scores.
       const score = cosineSimilarity(queryEmbedding, chunk.embedding);
-      scored.push({ itemKey, title: item.title, text: chunk.text, score });
+      scored.push({
+        itemKey,
+        title: item.title,
+        text: chunk.text,
+        score,
+        // Provenance carried verbatim from the index chunk. `sourceKind`
+        // is always present (required on `IndexedItemChunk`); `pageIndex`/
+        // `attachmentKey` are optional, attached only when supplied.
+        // `pageIndex: 0` is preserved — only attach when it is a number.
+        sourceKind: chunk.sourceKind,
+        ...(typeof chunk.pageIndex === "number" ? { pageIndex: chunk.pageIndex } : {}),
+        ...(chunk.attachmentKey !== undefined ? { attachmentKey: chunk.attachmentKey } : {})
+      });
     }
   }
   scored.sort((x, y) => y.score - x.score);
-  return scored.slice(0, k);
+  // Stamp `chunkIndex` as the post-sort position in the retrieval result.
+  return scored.slice(0, k).map((chunk, index) => ({ ...chunk, chunkIndex: index }));
 }

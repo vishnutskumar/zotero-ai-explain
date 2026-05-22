@@ -38,7 +38,18 @@ export function createRagAugmentedProvider(deps: RagAugmentedProviderDeps): Mode
     id: deps.inner.id,
     displayName: deps.inner.displayName,
     async *streamChat(request, signal) {
-      const augmented = await augmentMessages(request.messages, deps, topK, debug, signal);
+      // AC-3: the RAG scope is request-scoped — read it off each request's
+      // selection, never cached on the provider instance. Two concurrent
+      // streams with different scopes stay independent.
+      const scopedItemKey = request.selection.source.scopedItemKey;
+      const augmented = await augmentMessages(
+        request.messages,
+        deps,
+        topK,
+        debug,
+        signal,
+        scopedItemKey
+      );
       yield* deps.inner.streamChat({ ...request, messages: augmented }, signal);
     }
   };
@@ -49,7 +60,8 @@ async function augmentMessages(
   deps: RagAugmentedProviderDeps,
   topK: number,
   debug: (message: string) => void,
-  signal: AbortSignal
+  signal: AbortSignal,
+  scopedItemKey: string | undefined
 ): Promise<readonly ChatMessage[]> {
   const latestUser = findLatestUser(messages);
   if (latestUser === null || latestUser.length === 0) return messages;
@@ -79,7 +91,14 @@ async function augmentMessages(
   if (queryEmbedding === undefined) return messages;
   let retrieved;
   try {
-    retrieved = topKChunks(file, queryEmbedding, topK);
+    // Forward the request-scoped RAG scope. When set, retrieval filters
+    // to chunks of that item; when undefined, retrieval is library-wide.
+    retrieved = topKChunks(
+      file,
+      queryEmbedding,
+      topK,
+      scopedItemKey !== undefined ? { scopedItemKey } : undefined
+    );
   } catch (err) {
     debug(`rag-augment: topKChunks failed: ${err instanceof Error ? err.message : String(err)}`);
     return messages;

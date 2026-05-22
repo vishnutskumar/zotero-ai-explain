@@ -24,8 +24,7 @@ function createSelection(): SelectionContext {
       itemKey: "I",
       itemTitle: "Paper",
       attachmentKey: "A",
-      pageLabel: "3",
-      location: "page=3"
+      pageLabel: "3"
     },
     anchor: null
   };
@@ -43,6 +42,17 @@ function createFakeUi(calls: string[]): {
         action();
       }
       return () => calls.push(`remove-menu:${label}`);
+    },
+    addReaderCommands(commands) {
+      for (const command of commands) {
+        calls.push(`reader:${command.label}`);
+        readerActions.push(command.action);
+      }
+      return () => {
+        for (const command of commands) {
+          calls.push(`remove-reader:${command.label}`);
+        }
+      };
     },
     addReaderCommand(label, action) {
       calls.push(`reader:${label}`);
@@ -126,8 +136,10 @@ describe("createZoteroRuntime", () => {
       "menu:Zotero AI Explain Settings",
       "dialog:Zotero AI Explain:zotero-ai-settings",
       "reader:Explain with AI",
+      "reader:Ask a question",
       "remove-menu:Zotero AI Explain Settings",
-      "remove-reader:Explain with AI"
+      "remove-reader:Explain with AI",
+      "remove-reader:Ask a question"
     ]);
   });
 
@@ -466,8 +478,7 @@ describe("createZoteroRuntime", () => {
         itemKey: "I",
         itemTitle: null,
         attachmentKey: null,
-        pageLabel: null,
-        location: null
+        pageLabel: null
       },
       anchor: { left: 100, top: 200, width: 80, height: 24 }
     };
@@ -738,5 +749,203 @@ describe("createZoteroRuntime direct-API validation auth headers (H3)", () => {
     // Error message rendered in the DOM for the openaiApiKey field.
     const err = document.querySelector<HTMLElement>('[data-error-for="openaiApiKey"]');
     expect(err?.textContent ?? "").toMatch(/required/iu);
+  });
+});
+
+/**
+ * FINDING-2 (Phase 4b codex review, AC-2) — PDF identity must reach the
+ * LLM prompt frame.
+ *
+ * `selection.source` carries `itemKey` / `itemTitle` / `attachmentKey` /
+ * `pageIndex` / `pageLabel`, but pre-fix the runtime never put any of it
+ * into the actual provider messages. The provider receives
+ * `conversation.messages`, so a `system` message with the rendered
+ * source frame is the prompt-frame surface AC-2 (plan L409-420) requires.
+ *
+ * These tests trigger the explain + ask-question reader actions and
+ * inspect the conversation store's messages — the exact array
+ * `popup-controller` forwards to `provider.streamChat({ messages })`.
+ */
+describe("createZoteroRuntime PDF-identity prompt frame (FINDING-2 / AC-2)", () => {
+  function controllers(): {
+    popupController: PopupController;
+    sidebarController: SidebarController;
+  } {
+    return {
+      popupController: {
+        explain: vi.fn(async () => Promise.resolve()),
+        cancel: vi.fn(),
+        retry: vi.fn(async () => Promise.resolve()),
+        continueInSidebar: vi.fn(),
+        sendFollowUp: vi.fn(async () => Promise.resolve())
+      },
+      sidebarController: {
+        sendFollowUp: vi.fn(async () => Promise.resolve())
+      }
+    };
+  }
+
+  async function bootRuntime(): Promise<{
+    readonly store: ReturnType<typeof createConversationStore>;
+    readonly readerActions: ((selection: SelectionContext) => void)[];
+    readonly shutdown: () => Promise<void>;
+  }> {
+    const calls: string[] = [];
+    const { ui, readerActions } = createFakeUi(calls);
+    const store = createConversationStore();
+    const { popupController, sidebarController } = controllers();
+    const runtime = createZoteroRuntime({
+      settings: createDefaultOllamaSettings(),
+      indexingController: createIndexingController({
+        logger: { debug: () => undefined },
+        ...controllerStubDeps()
+      }),
+      ui,
+      store,
+      profile: () => ollamaSettingsToProfile(createDefaultOllamaSettings()),
+      popupController,
+      sidebarController,
+      disclosure: () => "disclosure"
+    });
+    await runtime.startup();
+    return { store, readerActions, shutdown: () => runtime.shutdown() };
+  }
+
+  /**
+   * Pull the single in-flight conversation's messages. The runtime
+   * creates exactly one conversation per reader action; `conversation-1`
+   * is its deterministic id (the store's counter starts at 1).
+   */
+  function messagesOf(store: ReturnType<typeof createConversationStore>): readonly {
+    role: string;
+    content: string;
+  }[] {
+    const conversation = store.get("conversation-1");
+    expect(conversation, "no conversation created by the reader action").not.toBeNull();
+    return conversation?.messages ?? [];
+  }
+
+  it("explain seeds a system frame carrying the document title, page reference, and Zotero keys", async () => {
+    const selection: SelectionContext = {
+      quote: "Dense quote.",
+      source: {
+        itemKey: "ITEMKEY1",
+        itemTitle: "On the Nature of Things",
+        attachmentKey: "ATTACH01",
+        pageLabel: "12"
+      },
+      anchor: null
+    };
+    const { store, readerActions, shutdown } = await bootRuntime();
+    readerActions[0]?.(selection);
+
+    const messages = messagesOf(store);
+    const systemFrame = messages.find((m) => m.role === "system");
+    expect(systemFrame, "explain must seed a system prompt frame").toBeDefined();
+    const frame = systemFrame?.content ?? "";
+    expect(frame).toContain("On the Nature of Things");
+    expect(frame).toContain("Page: 12");
+    expect(frame).toContain("ITEMKEY1");
+    expect(frame).toContain("ATTACH01");
+    // The quote still rides as the user message.
+    expect(messages.some((m) => m.role === "user" && m.content.includes("Dense quote."))).toBe(
+      true
+    );
+    await shutdown();
+  });
+
+  it("explain renders pageIndex 0 as page '1' (never dropped as falsy)", async () => {
+    // The reader event carried `pageIndex: 0` and no `pageLabel`. Page 0
+    // is a real first page — the frame must show "Page: 1", not skip it.
+    const selection: SelectionContext = {
+      quote: "First page text.",
+      source: {
+        itemKey: "ITEMKEY2",
+        itemTitle: "Intro Paper",
+        attachmentKey: null,
+        pageLabel: null,
+        pageIndex: 0
+      },
+      anchor: null
+    };
+    const { store, readerActions, shutdown } = await bootRuntime();
+    readerActions[0]?.(selection);
+
+    const frame = messagesOf(store).find((m) => m.role === "system")?.content ?? "";
+    expect(frame).toContain("Page: 1");
+    await shutdown();
+  });
+
+  it("explain falls back to String(pageIndex + 1) when pageLabel is absent", async () => {
+    const selection: SelectionContext = {
+      quote: "Mid-document text.",
+      source: {
+        itemKey: "ITEMKEY3",
+        itemTitle: "Long Paper",
+        attachmentKey: null,
+        pageLabel: null,
+        pageIndex: 16
+      },
+      anchor: null
+    };
+    const { store, readerActions, shutdown } = await bootRuntime();
+    readerActions[0]?.(selection);
+
+    const frame = messagesOf(store).find((m) => m.role === "system")?.content ?? "";
+    expect(frame).toContain("Page: 17");
+    await shutdown();
+  });
+
+  it("ask-question carries the source frame alongside the sticky quote frame", async () => {
+    const selection: SelectionContext = {
+      quote: "A passage to ask about.",
+      source: {
+        itemKey: "ITEMKEY4",
+        itemTitle: "Reference Work",
+        attachmentKey: "ATTACH04",
+        pageLabel: null,
+        pageIndex: 0
+      },
+      anchor: null
+    };
+    const { store, readerActions, shutdown } = await bootRuntime();
+    // readerActions[1] is the "Ask a question" command.
+    readerActions[1]?.(selection);
+
+    const systemMessages = messagesOf(store).filter((m) => m.role === "system");
+    // One sticky-quote frame + one source frame.
+    expect(systemMessages.length).toBeGreaterThanOrEqual(2);
+    const joined = systemMessages.map((m) => m.content).join("\n");
+    expect(joined).toContain("A passage to ask about.");
+    expect(joined).toContain("Reference Work");
+    expect(joined).toContain("Page: 1");
+    expect(joined).toContain("ITEMKEY4");
+    expect(joined).toContain("ATTACH04");
+    await shutdown();
+  });
+
+  it("degrades gracefully: no source frame when the selection carries no identity", async () => {
+    // A non-reader / identity-less selection — every source field null
+    // and no pageIndex. The runtime must NOT seed an empty source frame;
+    // the explain request degrades to quote-only exactly as before.
+    const selection: SelectionContext = {
+      quote: "Shortcut selection.",
+      source: {
+        itemKey: null,
+        itemTitle: null,
+        attachmentKey: null,
+        pageLabel: null
+      },
+      anchor: null
+    };
+    const { store, readerActions, shutdown } = await bootRuntime();
+    readerActions[0]?.(selection);
+
+    const messages = messagesOf(store);
+    expect(messages.some((m) => m.role === "system")).toBe(false);
+    expect(
+      messages.some((m) => m.role === "user" && m.content.includes("Shortcut selection."))
+    ).toBe(true);
+    await shutdown();
   });
 });
