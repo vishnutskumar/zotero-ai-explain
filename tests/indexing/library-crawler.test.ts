@@ -76,7 +76,7 @@ import type {
   LibraryCrawlerDeps,
   ZoteroItemLike
 } from "./contracts.js";
-import { indexLibrary } from "../../src/indexing/library-crawler.js";
+import { CURRENT_SCHEMA_VERSION, indexLibrary } from "../../src/indexing/library-crawler.js";
 
 type FakeItemSpec = {
   readonly id: number;
@@ -353,18 +353,28 @@ function makeHarness(opts: {
 }
 
 describe("indexLibrary — empty / skipped libraries (FINDING-11)", () => {
-  it("T-empty: empty library resolves {completed: true}, onProgress(0,0,0), no embed, no write", async () => {
+  it("T-empty: empty library resolves {completed: true}, onProgress(0,0,0), no embed, ONE final write (empty schemaVersion-2 file)", async () => {
     const h = makeHarness({ items: [] });
     const result = await indexLibrary(h.deps, h.options);
     expect(result).toEqual({ completed: true });
     expect(h.embedCalls).toHaveLength(0);
-    expect(h.storageWrites).toHaveLength(0);
+    // AC-15: the crawler must always write a final file on completion so
+    // downstream consumers ("controller state == complete" → file exists)
+    // can rely on the invariant. Migration path already seeds an empty
+    // file (indexing-controller.ts:323-327); the non-migration path must
+    // do the same. For an empty library, one final write lands an empty
+    // schemaVersion-2 IndexFile.
+    expect(h.storageWrites).toHaveLength(1);
+    expect(h.storageWrites[0]).toMatchObject({
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      items: {}
+    });
     // onProgress must be called at least once with (0, 0, 0).
     expect(h.progressCalls.length).toBeGreaterThanOrEqual(1);
     expect(h.progressCalls).toContainEqual({ indexed: 0, failed: 0, total: 0 });
   });
 
-  it("T-all-skipped: 3 items with empty extractItemText skipped; no embed, no write", async () => {
+  it("T-all-skipped: 3 items with empty extractItemText skipped; no embed, ONE final write (AC-15 persist-on-complete invariant)", async () => {
     const items = [
       fakeItem({ id: 1, key: "A" }),
       fakeItem({ id: 2, key: "B" }),
@@ -374,7 +384,13 @@ describe("indexLibrary — empty / skipped libraries (FINDING-11)", () => {
     const result = await indexLibrary(h.deps, h.options);
     expect(result).toEqual({ completed: true });
     expect(h.embedCalls).toHaveLength(0);
-    expect(h.storageWrites).toHaveLength(0);
+    // AC-15: even when every item is skipped (no extractable text), the
+    // crawler must persist an empty file so "completed → file exists".
+    expect(h.storageWrites).toHaveLength(1);
+    expect(h.storageWrites[0]).toMatchObject({
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      items: {}
+    });
     // The plan mandates onProgress(0, 0, 3) is called.
     expect(h.progressCalls).toContainEqual({ indexed: 0, failed: 0, total: 3 });
   });
@@ -726,16 +742,22 @@ describe("indexLibrary — PDF fulltext (Phase 4)", () => {
     expect(allText).toContain("PDF body content.");
   });
 
-  it("T-fulltext-standalone-no-cache-still-skipped: standalone PDF without cached text remains skipped", async () => {
+  it("T-fulltext-standalone-no-cache-still-skipped: standalone PDF without cached text remains skipped (one final write per AC-15)", async () => {
     // Belt-and-suspenders for "missing PDF cache shouldn't crash" — the
-    // attachment has no metadata at all AND no fulltext, so we should
-    // see exactly zero embed/write calls (matches pre-Phase-4 behavior).
+    // attachment has no metadata at all AND no fulltext. Zero embed calls,
+    // and exactly one final write of an empty schemaVersion-2 IndexFile
+    // (AC-15 persist-on-complete invariant — the migration path seeds an
+    // empty `.tmp` for the same reason; the non-migration path now matches).
     const items = [fakeAttachmentItem({ id: 1, key: "EMPTY" })];
     const h = makeHarness({ items, fullText: {} });
     const result = await indexLibrary(h.deps, h.options);
     expect(result).toEqual({ completed: true });
     expect(h.embedCalls).toHaveLength(0);
-    expect(h.storageWrites).toHaveLength(0);
+    expect(h.storageWrites).toHaveLength(1);
+    expect(h.storageWrites[0]).toMatchObject({
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      items: {}
+    });
   });
 
   it("T-fulltext-no-fulltext-deps-still-runs: crawler works when FullText is not wired", async () => {
@@ -777,14 +799,19 @@ describe("indexLibrary — PDF fulltext (Phase 4)", () => {
     expect(h.embedCalls.length).toBeGreaterThan(0);
   });
 
-  it("T-fulltext-annotation-still-skipped: PDF annotation items with cached text are NOT indexed", async () => {
+  it("T-fulltext-annotation-still-skipped: PDF annotation items with cached text are NOT indexed (one final write per AC-15)", async () => {
     // Annotation attachments have their own text but are noisy; the
     // crawler skips them by policy. Same item as T-fulltext-standalone
-    // but with isAnnotation()=true.
+    // but with isAnnotation()=true. Zero embed calls; one final write
+    // (the AC-15 persist-on-complete invariant — empty schemaVersion-2).
     const items = [fakeAttachmentItem({ id: 1, key: "ANN", isAnnotation: true })];
     const h = makeHarness({ items, fullText: { 1: "Some annotation body" } });
     await indexLibrary(h.deps, h.options);
     expect(h.embedCalls).toHaveLength(0);
-    expect(h.storageWrites).toHaveLength(0);
+    expect(h.storageWrites).toHaveLength(1);
+    expect(h.storageWrites[0]).toMatchObject({
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      items: {}
+    });
   });
 });

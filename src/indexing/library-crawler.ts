@@ -536,6 +536,15 @@ export async function indexLibrary(
     items: {},
     indexedAt: new Date().toISOString()
   };
+  // AC-15: track whether the loop wrote at least once. The per-item write
+  // at the bottom of the loop only fires on a successful index. If a fresh
+  // crawl indexes zero items (empty library; or every item skipped for
+  // no-text; or every item failed), nothing ever writes, but we still
+  // return `{completed: true}` — leaving downstream consumers ("complete
+  // implies file exists") inconsistent. The migration path handles this
+  // by seeding an empty `.tmp` (indexing-controller.ts:323-327); the
+  // non-migration path needs the same invariant, applied below.
+  let didWriteThisRun = false;
 
   let indexed = 0;
   let failed = 0;
@@ -735,6 +744,7 @@ export async function indexLibrary(
       indexedAt: new Date().toISOString()
     };
     await deps.storage.write(currentFile);
+    didWriteThisRun = true;
     indexed += 1;
     if (attachmentTextContributed) {
       indexedAttachments += 1;
@@ -758,6 +768,20 @@ export async function indexLibrary(
   mainWin?.debug(summary);
   const mw = mainWin?.getMainWindow?.();
   mw?.console?.error(summary);
+
+  // AC-15: guarantee the "completed → file exists" invariant. The per-item
+  // write inside the loop only fires when an item indexes successfully.
+  // If nothing was written this run — empty library, every item skipped
+  // for no-text, every item failed, or a resume where every item was
+  // already in initialFile — write `currentFile` once now so the file
+  // exists on disk before we return `{completed: true}`. This matches the
+  // migration path's existing empty-tmp seed. Conditional, not unconditional:
+  // when items DID index, the last per-item write already persisted the
+  // same `currentFile`, and a duplicate write would be a wasted 70 MB
+  // rewrite on a large library.
+  if (!didWriteThisRun) {
+    await deps.storage.write(currentFile);
+  }
 
   return { completed: true };
 }
