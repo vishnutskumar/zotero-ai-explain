@@ -50,14 +50,23 @@ cpSync("scripts/llm-proxy", stagedProxyDir, {
 });
 
 try {
-  execFileSync(
-    "zip",
-    ["-X", "-r", `../${artifactPath}`, "manifest.json", "bootstrap.js", "content", "llm-proxy"],
-    {
+  // Cross-platform zip: POSIX runners have `zip` preinstalled; Windows
+  // runners (GitHub-hosted) ship 7-Zip at `7z` on PATH but no `zip`.
+  // `7z a -tzip` produces a standards-compliant zip that Zotero accepts.
+  const isWindows = process.platform === "win32";
+  const archiveTarget = `../${artifactPath}`;
+  const includes = ["manifest.json", "bootstrap.js", "content", "llm-proxy"];
+  if (isWindows) {
+    execFileSync("7z", ["a", "-tzip", "-mx=5", archiveTarget, ...includes], {
       cwd: "addon",
       stdio: "inherit"
-    }
-  );
+    });
+  } else {
+    execFileSync("zip", ["-X", "-r", archiveTarget, ...includes], {
+      cwd: "addon",
+      stdio: "inherit"
+    });
+  }
 } finally {
   // Always remove the staged copy; leaving it would confuse subsequent
   // `npm run build` invocations (they expect a clean addon/ tree).
