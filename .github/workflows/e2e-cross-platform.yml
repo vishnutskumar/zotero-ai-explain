@@ -307,9 +307,12 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -euxo pipefail
-          mkdir -p "$RUNNER_TEMP/ollama-logs"
+          # Log dir lives INSIDE $GITHUB_WORKSPACE so `actions/upload-artifact`
+          # can pick it up on failure — v4 rejects paths outside the
+          # workspace root, which $RUNNER_TEMP is on Windows.
+          mkdir -p "$GITHUB_WORKSPACE/.zotero-e2e/ollama-logs"
           # nohup + & detaches; we poll the HTTP endpoint to confirm.
-          nohup ollama serve > "$RUNNER_TEMP/ollama-logs/serve.log" 2>&1 &
+          nohup ollama serve > "$GITHUB_WORKSPACE/.zotero-e2e/ollama-logs/serve.log" 2>&1 &
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
               echo "Ollama is up after $i attempt(s)"
@@ -318,7 +321,7 @@ jobs:
             sleep 1
           done
           echo "Ollama failed to start within 30s; serve.log follows:" >&2
-          cat "$RUNNER_TEMP/ollama-logs/serve.log" >&2 || true
+          cat "$GITHUB_WORKSPACE/.zotero-e2e/ollama-logs/serve.log" >&2 || true
           exit 1
 
       - name: Start Ollama daemon (Windows)
@@ -326,15 +329,20 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $logDir = "$env:RUNNER_TEMP\ollama-logs"
+          # Log dir inside the workspace so upload-artifact@v4 accepts it.
+          $logDir = Join-Path $env:GITHUB_WORKSPACE ".zotero-e2e\ollama-logs"
           New-Item -ItemType Directory -Force -Path $logDir | Out-Null
           $logFile = Join-Path $logDir "serve.log"
-          # Start-Process -PassThru keeps a handle but does not block; the
-          # next steps will use the HTTP endpoint to confirm readiness.
-          Start-Process -FilePath "ollama" -ArgumentList "serve" `
-            -RedirectStandardOutput $logFile `
-            -RedirectStandardError (Join-Path $logDir "serve.err.log") `
-            -WindowStyle Hidden
+          $errFile = Join-Path $logDir "serve.err.log"
+          # `Start-Process -RedirectStandardOutput` ties the child's stdout
+          # handle to the parent PowerShell — when this step exits, the
+          # handle closes and `ollama serve` dies on broken pipe before
+          # later steps (Pull / E2E) can talk to it. Use WScript.Shell.Run
+          # with shell-level redirection inside `cmd /c` so the cmd.exe
+          # process owns its own file handles and survives the step.
+          $wsh = New-Object -ComObject WScript.Shell
+          $invocation = 'cmd /c ollama serve > "' + $logFile + '" 2> "' + $errFile + '"'
+          $wsh.Run($invocation, 0, $false) | Out-Null
           $up = $false
           for ($i = 0; $i -lt 30; $i++) {
             try {
@@ -345,6 +353,7 @@ jobs:
           if (-not $up) {
             Write-Host "Ollama failed to start within 30s; log follows:"
             if (Test-Path $logFile) { Get-Content $logFile }
+            if (Test-Path $errFile) { Get-Content $errFile }
             throw "Ollama did not become ready"
           }
           Write-Host "Ollama is up"
@@ -432,4 +441,3 @@ jobs:
             .zotero-e2e/**
             zotero-ai-explain.xpi
             dist/*.xpi
-            ${{ runner.temp }}/ollama-logs/**
