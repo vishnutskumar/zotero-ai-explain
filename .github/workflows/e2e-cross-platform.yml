@@ -436,6 +436,11 @@ jobs:
           name: e2e-cross-platform-${{ runner.os }}-failure
           retention-days: 7
           if-no-files-found: ignore
+          # `.zotero-e2e/` starts with a dot, so upload-artifact@v4's
+          # default `include-hidden-files: false` skips it — and the
+          # Zotero log + ollama daemon log we want for diagnosis both
+          # live there. Toggling this on uploads the directory contents.
+          include-hidden-files: true
           path: |
             .zotero-e2e/**
             zotero-ai-explain.xpi
