@@ -165,7 +165,17 @@ export type CreateIndexStorageDeps = {
 const LEGACY_FILE_NAME = LEGACY_INDEX_FILE_NAME;
 
 function joinPath(dir: string, name: string): string {
-  return dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`;
+  // Use the same separator the parent path uses. Zotero's
+  // `DataDirectory.dir` is `C:\Users\...` on Windows and a POSIX-style
+  // absolute path elsewhere. Mozilla's chrome IOUtils tolerates either separator
+  // individually but mixed-slash paths (e.g.
+  // `C:\Users\...\data/foo.json`) fail `makeDirectory`/`writeUTF8` on
+  // Windows because the underlying kernel APIs expect a single
+  // canonical separator. Detect Windows via a drive-letter prefix
+  // (more robust than counting slashes when paths get re-joined).
+  const isWindows = /^[A-Za-z]:[\\/]/u.test(dir);
+  const sep = isWindows ? "\\" : "/";
+  return dir.endsWith(sep) ? `${dir}${name}` : `${dir}${sep}${name}`;
 }
 
 function isIndexFile(value: unknown): value is IndexFile {
