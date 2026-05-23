@@ -33,17 +33,12 @@ on:
 
 # Avoid stacking redundant runs on rapid pushes; the matrix is expensive.
 concurrency:
-  group: e2e-cross-platform-${{ github.ref }}
+  # Include the Zotero version so matrix entries don't cancel each other
+  # across PR pushes.
+  group: e2e-cross-platform-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
-  # Pin a single Zotero release across all three OSes for reproducibility.
-  # Update this single value when bumping. 7.0.21 is the current stable
-  # release at time of authoring; the plugin manifest accepts 8.0–9.99.99
-  # but Zotero 7 shares the bootstrap/Marionette surface the harness uses,
-  # so this is the most stable target available today. Bump in lockstep
-  # when Zotero 8 ships and re-validate.
-  ZOTERO_VERSION: "7.0.21"
   # Pin Ollama for cache stability — the model cache key includes this.
   # 0.5.13 first added gemma3 family support; 0.6.6 is a stable point
   # release (no prerelease/draft, published 2025-04-17) used to pull
@@ -56,7 +51,7 @@ env:
 
 jobs:
   cross-platform-e2e:
-    name: ${{ matrix.os }} (Zotero ${{ matrix.zotero-version || '7.0.21' }})
+    name: ${{ matrix.os }} (Zotero ${{ matrix.zotero-version }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
 
@@ -64,6 +59,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # Validate the manifest's declared compatibility range
+        # (8.0–9.99.99). Both pinned versions are current CDN-available
+        # stable releases at workflow-author time; bump to the latest
+        # available stable for each major when newer points ship.
+        zotero-version: ["8.0.4", "9.0.3"]
+
+    env:
+      ZOTERO_VERSION: ${{ matrix.zotero-version }}
 
     steps:
       - name: Check out repository
@@ -121,8 +124,17 @@ jobs:
             libxt6 \
             libx11-xcb1 \
             libxtst6
-          TARBALL="$RUNNER_TEMP/zotero.tar.bz2"
-          URL="https://download.zotero.org/client/release/${ZOTERO_VERSION}/Zotero-${ZOTERO_VERSION}_linux-x86_64.tar.bz2"
+          # Zotero 8+ ships as .tar.xz (Zotero 7 was .tar.bz2). `tar -xf`
+          # auto-detects the format, so the only thing that changes by
+          # version is the URL extension. Try .tar.xz first (8+); fall
+          # back to .tar.bz2 for any Zotero-7-style URL the matrix may
+          # exercise in the future.
+          BASE="https://download.zotero.org/client/release/${ZOTERO_VERSION}"
+          TARBALL="$RUNNER_TEMP/zotero.tar"
+          URL="${BASE}/Zotero-${ZOTERO_VERSION}_linux-x86_64.tar.xz"
+          if ! curl -fsI -o /dev/null "$URL"; then
+            URL="${BASE}/Zotero-${ZOTERO_VERSION}_linux-x86_64.tar.bz2"
+          fi
           echo "Downloading $URL"
           # Zotero CDN occasionally returns 403; --retry handles the flake.
           curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors "$URL" -o "$TARBALL"
