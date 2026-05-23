@@ -11,13 +11,19 @@ import { createServer } from "node:net";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createOllamaProvider } from "../../src/providers/adapters/ollama.js";
 import type { ChatEvent } from "../../src/providers/provider-types.js";
 
-const REPO_ROOT = new URL("../..", import.meta.url).pathname;
+// `new URL("../..", import.meta.url).pathname` returns `/D:/...` on Windows
+// (leading slash + drive letter); a subsequent `path.join` then produces a
+// `D:\D:\...` double-drive-prefix string and the spawn ENOENTs. Use
+// `fileURLToPath` so we get a native Windows path on Windows and a POSIX
+// path elsewhere.
+const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const SERVER_SCRIPT = join(REPO_ROOT, "scripts", "llm-proxy", "server.mjs");
 
 type Spawned = {

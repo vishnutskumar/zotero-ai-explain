@@ -30,6 +30,7 @@
 
 import { createServer } from "node:http";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 import { createClaudeBackend } from "./backends/claude.mjs";
 import { createCodexBackend } from "./backends/codex.mjs";
@@ -488,7 +489,12 @@ export function createProxyServer(deps = {}) {
 }
 
 // Entrypoint: only run when invoked directly (node scripts/llm-proxy/server.mjs).
-const isDirect = import.meta.url === `file://${process.argv[1]}`;
+// `file://${process.argv[1]}` would naively concatenate a Windows-style
+// `D:\a\...` path into a URL, producing unescaped backslashes that don't
+// match `import.meta.url`'s percent-encoded URL form. Use `pathToFileURL`
+// so the comparison works on every platform.
+const isDirect =
+  typeof process.argv[1] === "string" && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isDirect) {
   const port = readEnvInt("LLM_PROXY_PORT", DEFAULT_PORT);
   // Bug B2: macOS GUI apps (Zotero, Firefox) spawn the proxy with the

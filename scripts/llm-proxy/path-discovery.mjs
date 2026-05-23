@@ -36,9 +36,38 @@
 
 import { spawn as defaultSpawn } from "node:child_process";
 import { accessSync, constants as fsConstants, existsSync } from "node:fs";
-import nodePath, { delimiter as pathDelimiter, join as pathJoin, basename } from "node:path";
+import nodePath, { basename } from "node:path";
 import { homedir } from "node:os";
 import process from "node:process";
+
+/**
+ * Per-platform PATH delimiter. `node:path`'s host-platform `delimiter`
+ * cannot be used inside the platform-parameterised helpers below because
+ * a unit test passing `platform: "darwin"` from a Windows CI runner would
+ * otherwise get a `;` and a test passing `platform: "win32"` from macOS
+ * would get a `:`. Always derive from the explicit `platform` argument
+ * so the function output is a pure function of its inputs.
+ *
+ * @param {NodeJS.Platform} platform
+ * @returns {string}
+ */
+function platformDelimiter(platform) {
+  return platform === "win32" ? ";" : ":";
+}
+
+/**
+ * Per-platform `path.join`. Same rationale as `platformDelimiter`: we
+ * cannot use `node:path`'s host-platform `join` because the unit tests
+ * pin the platform explicitly. Routes to `path.win32.join` /
+ * `path.posix.join` based on the explicit argument.
+ *
+ * @param {NodeJS.Platform} platform
+ * @param  {...string} parts
+ * @returns {string}
+ */
+function platformJoin(platform, ...parts) {
+  return platform === "win32" ? nodePath.win32.join(...parts) : nodePath.posix.join(...parts);
+}
 
 /**
  * POSIX executable check. Returns true iff `accessSync(path, X_OK)`
@@ -74,10 +103,13 @@ export const FALLBACK_PATH_ENTRIES = Object.freeze([
   "/usr/local/sbin",
   "/opt/local/bin",
   "/opt/local/sbin",
-  pathJoin(homedir(), ".bun", "bin"),
-  pathJoin(homedir(), ".cargo", "bin"),
-  pathJoin(homedir(), ".local", "bin"),
-  pathJoin(homedir(), "bin")
+  // POSIX-shaped fallbacks; these prefixes are only meaningful on
+  // macOS / Linux where `enrichEnvironmentPath` actually runs them.
+  // The `win32` branch returns a noop before consulting this list.
+  nodePath.posix.join(homedir(), ".bun", "bin"),
+  nodePath.posix.join(homedir(), ".cargo", "bin"),
+  nodePath.posix.join(homedir(), ".local", "bin"),
+  nodePath.posix.join(homedir(), "bin")
 ]);
 
 /**
@@ -174,25 +206,27 @@ export async function discoverLoginShellPath(deps = {}) {
 }
 
 /**
- * Merge the given PATH-like string (colon-separated on POSIX) into the
- * current `process.env.PATH`, appending any entries that aren't already
- * present. Existing entries keep their position so a system-managed PATH
- * isn't reordered. Returns the new PATH string.
+ * Merge the given PATH-like string (colon-separated on POSIX, semi-colon
+ * on Windows) into the current `process.env.PATH`, appending any entries
+ * that aren't already present. Existing entries keep their position so a
+ * system-managed PATH isn't reordered. Returns the new PATH string.
  *
  * Exported so tests can pin the merge behavior in isolation.
  *
  * @param {string} currentPath
  * @param {Iterable<string>|string} additions
+ * @param {{ platform?: NodeJS.Platform }} [opts]
  * @returns {string}
  */
-export function mergePathEntries(currentPath, additions) {
+export function mergePathEntries(currentPath, additions, opts = {}) {
+  const platform = opts.platform ?? process.platform;
+  const delim = platformDelimiter(platform);
   const current = (currentPath ?? "")
-    .split(pathDelimiter)
+    .split(delim)
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
   const seen = new Set(current);
-  const additionList =
-    typeof additions === "string" ? additions.split(pathDelimiter) : [...additions];
+  const additionList = typeof additions === "string" ? additions.split(delim) : [...additions];
   for (const raw of additionList) {
     const entry = (raw ?? "").trim();
     if (entry.length === 0) continue;
@@ -200,7 +234,7 @@ export function mergePathEntries(currentPath, additions) {
     seen.add(entry);
     current.push(entry);
   }
-  return current.join(pathDelimiter);
+  return current.join(delim);
 }
 
 /**
@@ -274,12 +308,17 @@ export async function enrichEnvironmentPath(deps = {}) {
     discovered = null;
   }
 
+  // Honour the platform parameter rather than the host's `path.delimiter`.
+  // A test passing `platform: "darwin"` from a Windows CI runner expects
+  // POSIX `:` joining; the host-platform constant would produce `;`.
+  const delim = platformDelimiter(platform);
+
   let source = "fallback";
   let entries = [];
   if (typeof discovered === "string" && discovered.length > 0) {
     source = "shell";
     entries = discovered
-      .split(pathDelimiter)
+      .split(delim)
       .map((p) => p.trim())
       .filter(Boolean);
   } else {
@@ -296,7 +335,7 @@ export async function enrichEnvironmentPath(deps = {}) {
 
   const beforeSet = new Set(
     before
-      .split(pathDelimiter)
+      .split(delim)
       .map((p) => p.trim())
       .filter(Boolean)
   );
@@ -309,7 +348,7 @@ export async function enrichEnvironmentPath(deps = {}) {
       shellUsed: source === "shell" ? env.SHELL : undefined
     };
   }
-  const finalPath = mergePathEntries(before, added);
+  const finalPath = mergePathEntries(before, added, { platform });
   env.PATH = finalPath;
   return {
     source,
@@ -364,13 +403,14 @@ export function findBinary(command, deps = {}) {
     }
     return { path: null, searched: [override] };
   }
-  // Windows uses `;` as PATH separator and backslash path joins; the
-  // posix `path.delimiter`/`path.join` from this module would give the
-  // wrong result on a Windows-shaped input. Switch to `path.win32` when
-  // looking up Windows binaries (rare for Zotero AI on macOS, but the
-  // codepath has to work for the cross-platform release matrix).
-  const join = platform === "win32" ? nodePath.win32.join : pathJoin;
-  const delim = platform === "win32" ? ";" : pathDelimiter;
+  // Windows uses `;` as PATH separator and backslash path joins. Derive
+  // both from the explicit `platform` argument rather than the host's
+  // `node:path` constants so a Windows CI runner running a test with
+  // `platform: "darwin"` still splits / joins POSIX-style (and vice
+  // versa). Without this, tests pinned to a non-host platform produce
+  // mixed delimiter strings (`/usr/bin:/bin;/opt/homebrew/bin`).
+  const join = (...parts) => platformJoin(platform, ...parts);
+  const delim = platformDelimiter(platform);
   const path = env.PATH ?? "";
   const dirs = path
     .split(delim)

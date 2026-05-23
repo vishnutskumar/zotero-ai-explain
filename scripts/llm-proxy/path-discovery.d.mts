@@ -13,7 +13,8 @@ export declare function discoverLoginShellPath(deps?: {
 
 export declare function mergePathEntries(
   currentPath: string,
-  additions: Iterable<string> | string
+  additions: Iterable<string> | string,
+  opts?: { readonly platform?: NodeJS.Platform }
 ): string;
 
 export type PathEnrichmentResult = {
