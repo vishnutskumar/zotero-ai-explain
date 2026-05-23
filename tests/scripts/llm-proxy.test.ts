@@ -1640,7 +1640,10 @@ describe("llm-proxy / claude backend live-config discovery (Bug B)", () => {
     expect(result).toEqual([]);
   });
 
-  it("claude backend tags() merges discovered with builtin opus/sonnet/haiku", () => {
+  it("AC-21: claude backend tags() puts discovered models first, BUILTIN fallback last", () => {
+    // AC-21 trimmed BUILTIN_CLAUDE_TAGS from the speculative
+    // opus/sonnet/haiku list down to a single conservative fallback.
+    // Live discovery is the source of truth when consent is granted.
     const claudeBackend = createClaudeBackend({
       spawn: () => {
         throw new Error("not called");
@@ -1653,9 +1656,8 @@ describe("llm-proxy / claude backend live-config discovery (Bug B)", () => {
     const names = claudeBackend.tags().map((t) => t.name);
     expect(names[0]).toBe("claude-opus-4-7");
     expect(names).toContain("claude-opus-4-8-preview");
-    expect(names).toContain("opus");
-    expect(names).toContain("sonnet");
-    expect(names).toContain("haiku");
+    // The single BUILTIN fallback is still in the merged tail.
+    expect(names).toContain("claude-sonnet-4-7");
   });
 });
 

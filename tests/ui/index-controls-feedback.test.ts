@@ -385,6 +385,19 @@ function plainStorage(): import("../../src/indexing/index-storage.js").IndexStor
     async write(file) {
       stored = file;
     },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async writeItem(itemKey, entry) {
+      stored = stored ?? {
+        schemaVersion: 2,
+        items: {},
+        indexedAt: new Date(0).toISOString()
+      };
+      stored = {
+        ...stored,
+        items: { ...stored.items, [itemKey]: entry },
+        indexedAt: new Date().toISOString()
+      };
+    },
     async writeTmp() {
       /* unused */
     },
@@ -469,17 +482,19 @@ describe("AC-14 Adv-1 — start disabled while running", () => {
     ui.btn("start-index")?.click();
     await flush();
 
-    // D1: the start button must be disabled — a second click is a
-    // silent no-op the user would not understand.
-    expect(ui.btn("start-index")?.disabled).toBe(true);
+    // D1: start must not be actionable — a second click is a silent
+    // no-op the user would not understand. Button-clutter cleanup
+    // hides irrelevant buttons rather than greying them out; check
+    // `hidden` instead of `disabled`.
+    expect(ui.btn("start-index")?.hidden).toBe(true);
     expect(ui.summary?.textContent ?? "").toContain("Already indexing");
 
     ui.detach();
     ui.view.remove();
   });
 
-  it("a running-state initial render already disables start-index", () => {
-    // renderIndexControls must set the initial disabled flag — not only
+  it("a running-state initial render hides start-index", () => {
+    // renderIndexControls must set the initial hidden flag — not only
     // attachIndexControls' refresh.
     const view = renderIndexControls({
       state: "running",
@@ -487,9 +502,7 @@ describe("AC-14 Adv-1 — start disabled while running", () => {
       indexedItems: 3,
       failedItems: 0
     });
-    expect(view.querySelector<HTMLButtonElement>('[data-action="start-index"]')?.disabled).toBe(
-      true
-    );
+    expect(view.querySelector<HTMLButtonElement>('[data-action="start-index"]')?.hidden).toBe(true);
   });
 });
 
@@ -509,29 +522,28 @@ describe("AC-14 Adv-2 — start disabled while paused", () => {
     await flush();
 
     expect(controller.getStatus().state).toBe("paused");
-    expect(ui.btn("start-index")?.disabled).toBe(true);
+    // Hidden-instead-of-disabled UX: start/pause not actionable from
+    // paused state; resume is the steering action and remains visible.
+    expect(ui.btn("start-index")?.hidden).toBe(true);
     expect(ui.summary?.textContent ?? "").toContain("Paused");
     expect(ui.summary?.textContent ?? "").toMatch(/use Resume to continue/u);
-    // resume is the steering action — it must be ENABLED while paused.
+    expect(ui.btn("resume-index")?.hidden).toBe(false);
     expect(ui.btn("resume-index")?.disabled).toBe(false);
-    // pause itself is disabled (already paused).
-    expect(ui.btn("pause-index")?.disabled).toBe(true);
+    expect(ui.btn("pause-index")?.hidden).toBe(true);
 
     ui.detach();
     ui.view.remove();
   });
 
-  it("pause is disabled at idle and resume is disabled at idle (symmetric guards)", () => {
+  it("pause and resume are hidden at idle (symmetric guards)", () => {
     const view = renderIndexControls({
       state: "idle",
       totalItems: 0,
       indexedItems: 0,
       failedItems: 0
     });
-    expect(view.querySelector<HTMLButtonElement>('[data-action="pause-index"]')?.disabled).toBe(
-      true
-    );
-    expect(view.querySelector<HTMLButtonElement>('[data-action="resume-index"]')?.disabled).toBe(
+    expect(view.querySelector<HTMLButtonElement>('[data-action="pause-index"]')?.hidden).toBe(true);
+    expect(view.querySelector<HTMLButtonElement>('[data-action="resume-index"]')?.hidden).toBe(
       true
     );
   });
@@ -542,12 +554,13 @@ describe("AC-14 Adv-2 — start disabled while paused", () => {
     const ui = mount(controller);
     ui.btn("start-index")?.click();
     await flush();
-    expect(ui.btn("start-index")?.disabled).toBe(true);
+    expect(ui.btn("start-index")?.hidden).toBe(true);
 
-    // Drive the controller to `complete` — start must re-enable.
+    // Drive the controller to `complete` — start must re-appear.
     crawlerCalls[crawlerCalls.length - 1]?.resolve({ completed: true });
     await flush();
     expect(controller.getStatus().state).toBe("complete");
+    expect(ui.btn("start-index")?.hidden).toBe(false);
     expect(ui.btn("start-index")?.disabled).toBe(false);
 
     ui.detach();
@@ -588,6 +601,19 @@ function migrationStorage(): import("../../src/indexing/index-storage.js").Index
     // eslint-disable-next-line @typescript-eslint/require-await
     async write(file) {
       state.primary = file;
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async writeItem(itemKey, entry) {
+      const base: IndexFile = state.primary ?? {
+        schemaVersion: 2,
+        items: {},
+        indexedAt: new Date(0).toISOString()
+      };
+      state.primary = {
+        ...base,
+        items: { ...base.items, [itemKey]: entry },
+        indexedAt: new Date().toISOString()
+      };
     },
     // eslint-disable-next-line @typescript-eslint/require-await
     async writeTmp(file) {
@@ -657,20 +683,23 @@ describe("AC-14 Adv-3 — start disabled + reason while a migration is active", 
     const hydratePromise = controller.hydrate();
     await flush();
 
-    // D6: while migrationActive the start button is disabled and the
-    // summary carries the migration reason fragment.
+    // D6: while migrationActive the start button is hidden (not
+    // actionable) and the summary carries the migration reason fragment.
     expect(controller.getStatus().migrationActive).toBe(true);
-    expect(ui.btn("start-index")?.disabled).toBe(true);
+    expect(ui.btn("start-index")?.hidden).toBe(true);
     expect(ui.summary?.textContent ?? "").toMatch(/Migrating the index/u);
 
-    // Clear is also disabled mid-migration (confirm would be confusing).
+    // Clear stays visible but disabled mid-migration (confirm would
+    // be confusing).
+    expect(ui.btn("clear-index")?.hidden).toBe(false);
     expect(ui.btn("clear-index")?.disabled).toBe(true);
 
-    // After the migration settles start re-enables and the fragment clears.
+    // After the migration settles start re-appears and the fragment clears.
     crawlerCalls[crawlerCalls.length - 1]?.resolve({ completed: true });
     await hydratePromise;
     await flush();
     expect(controller.getStatus().migrationActive).toBe(false);
+    expect(ui.btn("start-index")?.hidden).toBe(false);
     expect(ui.btn("start-index")?.disabled).toBe(false);
     expect(ui.summary?.textContent ?? "").not.toMatch(/Migrating the index/u);
 

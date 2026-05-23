@@ -76,7 +76,11 @@ import type {
   LibraryCrawlerDeps,
   ZoteroItemLike
 } from "./contracts.js";
-import { CURRENT_SCHEMA_VERSION, indexLibrary } from "../../src/indexing/library-crawler.js";
+import {
+  CURRENT_SCHEMA_VERSION,
+  type IndexedItem,
+  indexLibrary
+} from "../../src/indexing/library-crawler.js";
 
 type FakeItemSpec = {
   readonly id: number;
@@ -169,6 +173,7 @@ type Harness = {
   readonly deps: LibraryCrawlerDeps;
   readonly options: IndexLibraryOptions;
   readonly storageWrites: IndexFile[];
+  readonly storageItemWrites: { itemKey: string; entry: IndexedItem }[];
   readonly storageReads: IndexFile[];
   readonly progressCalls: { indexed: number; failed: number; total: number }[];
   readonly schedulerCalls: { count: number };
@@ -196,8 +201,14 @@ function makeHarness(opts: {
   // attachments not in the top-level `items` list) go in `childItems`.
   fullText?: Record<number, string>;
   childItems?: readonly ZoteroItemLike[];
+  // AC-23: optional per-call behaviour for the per-item persist call.
+  // Used to simulate IO errors during writeItem. Returns one entry per
+  // writeItem call; "ok" appends to storageWrites, "throw" throws the
+  // supplied error so the crawler's persist-catch is exercised.
+  writeBehaviors?: readonly ({ kind: "ok" } | { kind: "throw"; error: Error })[];
 }): Harness {
   const storageWrites: IndexFile[] = [];
+  const storageItemWrites: { itemKey: string; entry: IndexedItem }[] = [];
   const storageReads: IndexFile[] = [];
   const progressCalls: { indexed: number; failed: number; total: number }[] = [];
   const schedulerCalls = { count: 0 };
@@ -217,8 +228,14 @@ function makeHarness(opts: {
     itemsById.set(child.id, child);
   }
 
-  // The crawler consumes only the narrow `{read, write, clear, path}`
-  // storage subset — not the full `IndexStorage` migration surface.
+  // AC-23: the crawler now persists per-item via `writeItem`. Synthesize
+  // a "current-state snapshot" into `storageWrites` on each writeItem so
+  // the tests' existing assertions on `storageWrites[last].items`
+  // continue to work — the snapshot is the monolithic IndexFile the
+  // crawler used to write before the per-item layout.
+  let accumulated: IndexFile = opts.initialFile
+    ? { ...opts.initialFile, items: { ...opts.initialFile.items } }
+    : { schemaVersion: 2, items: {}, indexedAt: new Date(0).toISOString() };
   const storage: LibraryCrawlerDeps["storage"] = {
     async read() {
       await Promise.resolve();
@@ -229,7 +246,35 @@ function makeHarness(opts: {
     },
     async write(file) {
       await Promise.resolve();
+      // AC-15 final-write fallback (empty completion). Reused by tests
+      // that intentionally exercise the back-compat `write` path. Most
+      // tests now exercise the `writeItem` snapshot below; `write` only
+      // fires when the crawler indexed zero items this run.
       storageWrites.push(file);
+      accumulated = { ...file, items: { ...file.items } };
+    },
+    async writeItem(itemKey, entry) {
+      await Promise.resolve();
+      // Support the AC-23 OOM-isolation behaviours: a per-item write
+      // throw must not abort the crawl. The behaviour index is the
+      // count of writeItem calls so far.
+      const behavior = opts.writeBehaviors?.[storageItemWrites.length];
+      storageItemWrites.push({ itemKey, entry });
+      if (behavior?.kind === "throw") {
+        throw behavior.error;
+      }
+      // Snapshot the accumulated state into the legacy `storageWrites`
+      // array so existing assertions keep working without per-test
+      // rewrites. Each per-item write contributes one snapshot.
+      accumulated = {
+        ...accumulated,
+        items: { ...accumulated.items, [itemKey]: entry },
+        indexedAt: new Date().toISOString()
+      };
+      storageWrites.push({
+        ...accumulated,
+        items: { ...accumulated.items }
+      });
     },
     async clear() {
       await Promise.resolve();
@@ -338,6 +383,7 @@ function makeHarness(opts: {
     deps,
     options,
     storageWrites,
+    storageItemWrites,
     storageReads,
     progressCalls,
     schedulerCalls,
@@ -512,6 +558,40 @@ describe("indexLibrary — failure semantics", () => {
     );
     // storage.write must NOT have been called.
     expect(h.storageWrites).toHaveLength(0);
+  });
+
+  it("AC-23: writeItem throw on item B does NOT abort item C", async () => {
+    // Long-term OOM fix (AC-23): the crawler now persists per-item via
+    // `writeItem`, so each persist is O(1) regardless of library size.
+    // Per-item write failures (IO errors, transient permission denials,
+    // bad item key, etc.) must still be contained per item — a single
+    // failed writeItem MUST NOT cascade into aborting the rest of the
+    // crawl. The in-memory `currentFile` is only mutated on success so a
+    // failed write does not leak a phantom entry.
+    const items = [
+      fakeItem({ id: 1, key: "A", title: "one" }),
+      fakeItem({ id: 2, key: "B", title: "two" }),
+      fakeItem({ id: 3, key: "C", title: "three" })
+    ];
+    const ioErr = new Error("EIO: write failed");
+    const h = makeHarness({
+      items,
+      embedBehaviors: [{ kind: "ok" }, { kind: "ok" }, { kind: "ok" }],
+      // Second writeItem (item B) throws; A and C succeed.
+      writeBehaviors: [{ kind: "ok" }, { kind: "throw", error: ioErr }, { kind: "ok" }]
+    });
+    const result = await indexLibrary(h.deps, h.options);
+    // The crawl completed: a per-item writeItem throw is contained.
+    expect(result).toEqual({ completed: true });
+    // A + C indexed, B counted as failed.
+    const last = h.progressCalls[h.progressCalls.length - 1];
+    expect(last).toEqual({ indexed: 2, failed: 1, total: 3 });
+    // The accumulated snapshot has A and C, but NOT B (in-memory state
+    // is only mutated on successful persist).
+    const final = h.storageWrites[h.storageWrites.length - 1];
+    expect(Object.keys(final?.items ?? {}).sort()).toEqual(["A", "C"]);
+    // Per-item writes attempted: A, B (throw), C — exactly 3.
+    expect(h.storageItemWrites.map((w) => w.itemKey)).toEqual(["A", "B", "C"]);
   });
 
   it("T-circuit-reset: transient failure then success resets the counter (no breaker trip)", async () => {

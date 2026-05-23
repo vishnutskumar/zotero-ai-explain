@@ -38,16 +38,41 @@ export function renderSidebarConversation(input: {
     `display: flex; flex-direction: column; height: 100%; font-family: ${FONT_STACK};`
   );
 
-  // AC-13: the sidebar ships no `<style>` of its own, so markdown bodies
-  // rendered by `renderMarkdown` would otherwise get only UA defaults.
-  // Mount the shared markdown stylesheet — scoped under
-  // `.zotero-ai-explain-sidebar__body` — so the sidebar and the popup
-  // render identical markdown typography. It travels into chrome with
-  // the element via `mountSidebar`, covering both the initial render
-  // and every streamed live-update delta (the runtime subscription
-  // reuses the same `__body` class).
+  // The sidebar mounts MARKDOWN_CSS so its body divs share popup
+  // typography, plus chat-bubble layout rules so each `<li>` turn
+  // renders as a left (assistant) or right (user) bubble. Role text
+  // is hidden — the side + colour carries the signal.
   const styleTag = document.createElement("style");
-  styleTag.textContent = MARKDOWN_CSS;
+  styleTag.textContent = `${MARKDOWN_CSS}
+    .zotero-ai-explain-sidebar__turn {
+      max-width: 88%;
+      padding: 8px 12px;
+      border-radius: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .zotero-ai-explain-sidebar__turn[data-role="assistant"] {
+      align-self: flex-start;
+      background: rgba(127, 127, 127, 0.15);
+      border-bottom-left-radius: 4px;
+    }
+    .zotero-ai-explain-sidebar__turn[data-role="user"] {
+      align-self: flex-end;
+      background: rgba(64, 128, 255, 0.22);
+      border-bottom-right-radius: 4px;
+    }
+    .zotero-ai-explain-sidebar__role {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      margin: -1px;
+      padding: 0;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }`;
 
   // Header: selection quote + source label + close button. Pinned at the top
   // so the user always sees what they asked about as the conversation scrolls.
@@ -107,7 +132,10 @@ export function renderSidebarConversation(input: {
       "overflow-y: auto; display: flex; flex-direction: column; gap: 10px;"
   );
 
+  // Skip system messages — they're prompt frames meant for the model,
+  // not user-visible turns. The popup never renders them; symmetry.
   for (const message of input.messages) {
+    if (message.role === "system") continue;
     messages.append(renderMessage(message));
   }
 
@@ -142,13 +170,11 @@ export function renderSidebarConversation(input: {
 
 function renderMessage(message: ChatMessage): HTMLLIElement {
   const row = document.createElement("li");
+  row.className = "zotero-ai-explain-sidebar__turn";
   row.dataset.role = message.role;
-  row.setAttribute("style", "display: flex; flex-direction: column; gap: 2px;");
 
-  // Role attribution as a separate text node, then the body rendered as
-  // markdown so headings/lists/code blocks land as real DOM. Concatenating
-  // `${role}: ${content}` into `.textContent` (the previous approach) would
-  // lose markdown structure even before the renderer runs.
+  // Kept for assistive tech; CSS `display: none` hides it visually so
+  // role is communicated by bubble side + colour.
   const attribution = document.createElement("span");
   attribution.className = "zotero-ai-explain-sidebar__role";
   attribution.textContent = `${message.role}: `;

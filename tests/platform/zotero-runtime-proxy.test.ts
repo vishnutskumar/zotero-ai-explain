@@ -59,6 +59,15 @@ function makeProxyHandle(initial: ProxySettingsState): {
       log.push("stop");
       current = { ...current, running: false };
       return Promise.resolve();
+    },
+    redetectNode: () => {
+      log.push("redetectNode");
+      return { ...current };
+    },
+    setAutoStart: (enabled) => {
+      log.push(`setAutoStart:${String(enabled)}`);
+      current = { ...current, autoStart: enabled };
+      return { ...current };
     }
   };
   return {

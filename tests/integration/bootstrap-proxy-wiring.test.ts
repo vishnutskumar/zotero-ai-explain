@@ -402,16 +402,24 @@ describe("bootstrap proxy + embed-url wiring", () => {
     spy.mockRestore();
   });
 
-  it("does not auto-start when the autostart pref is absent", async () => {
-    // Without the autostart pref, wireProxyLifecycle constructs but
-    // does NOT spawn. The Start button in the settings dialog is the
-    // user-facing affordance that triggers a spawn (covered by the
-    // runtime-layer proxy test).
+  it("auto-starts when the autostart pref is absent (opt-out default)", async () => {
+    // The autostart pref now defaults to ON: a fresh install spawns
+    // the proxy immediately so the codex/claude presets work without
+    // an explicit Start click. Users opt OUT by toggling the
+    // "Start on Zotero launch" checkbox in settings.
     rig.prefs.delete("extensions.zotero-ai-explain.proxy-autostart");
     const bootstrap = await import("../../src/bootstrap.js");
     await bootstrap.startup(rig.context);
+    expect(rig.recording.spawns.length).toBeGreaterThan(0);
+    setTimeout(() => rig.procs.list[0]?.finishExit(0), 0);
+    await bootstrap.shutdown(rig.context);
+  });
+
+  it("does not auto-start when the autostart pref is explicitly 'false'", async () => {
+    rig.prefs.set("extensions.zotero-ai-explain.proxy-autostart", "false");
+    const bootstrap = await import("../../src/bootstrap.js");
+    await bootstrap.startup(rig.context);
     expect(rig.recording.spawns).toHaveLength(0);
-    // Shutdown still must not throw and must not kill anything.
     await bootstrap.shutdown(rig.context);
     expect(rig.recording.killed).toHaveLength(0);
   });

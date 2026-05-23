@@ -136,6 +136,8 @@ export type ProxyRuntimeHandle = {
     { readonly pid: number } | { readonly external: true } | { readonly error: string }
   >;
   stop(): Promise<void>;
+  redetectNode(): ProxySettingsState;
+  setAutoStart(enabled: boolean): ProxySettingsState;
 };
 
 /**
@@ -530,21 +532,24 @@ export function createZoteroRuntime(deps: {
         if (list === null) {
           return;
         }
-        const rows = updated.messages.map((message) => {
-          const row = list.ownerDocument.createElement("li");
-          row.dataset.role = message.role;
-          // Role attribution as a separate text node so the message body
-          // can be rendered as markdown (block-level elements) without
-          // having `${role}: ` baked into the same text node.
-          const attribution = list.ownerDocument.createElement("span");
-          attribution.className = "zotero-ai-explain-sidebar__role";
-          attribution.textContent = `${message.role}: `;
-          const body = list.ownerDocument.createElement("div");
-          body.className = "zotero-ai-explain-sidebar__body";
-          renderMarkdown(body, message.content);
-          row.append(attribution, body);
-          return row;
-        });
+        // Skip system messages — see `renderMessage` in sidebar-view.ts.
+        // The CSS bubble layout keys off `.__turn[data-role]`, so the row
+        // classes here must stay in sync with the initial render.
+        const rows = updated.messages
+          .filter((message) => message.role !== "system")
+          .map((message) => {
+            const row = list.ownerDocument.createElement("li");
+            row.className = "zotero-ai-explain-sidebar__turn";
+            row.dataset.role = message.role;
+            const attribution = list.ownerDocument.createElement("span");
+            attribution.className = "zotero-ai-explain-sidebar__role";
+            attribution.textContent = `${message.role}: `;
+            const body = list.ownerDocument.createElement("div");
+            body.className = "zotero-ai-explain-sidebar__body";
+            renderMarkdown(body, message.content);
+            row.append(attribution, body);
+            return row;
+          });
         list.replaceChildren(...rows);
       });
     };
@@ -1152,6 +1157,16 @@ export function createZoteroRuntime(deps: {
               },
               stop: async () => {
                 await proxyHandle.stop();
+              },
+              detect: () => {
+                const snap = proxyHandle.redetectNode();
+                return {
+                  path: snap.nodeBinaryPath,
+                  autoDetectFailed: snap.nodeAutoDetectFailed ?? false
+                };
+              },
+              setAutoStart: (enabled) => {
+                proxyHandle.setAutoStart(enabled);
               }
             }
           }

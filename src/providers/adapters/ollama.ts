@@ -29,6 +29,46 @@ function readEmbeddings(payload: unknown): readonly (readonly number[])[] {
 }
 
 /**
+ * Yield NDJSON lines as their terminating newline arrives. Replaces
+ * the `await response.text().split("\n")` path so the first delta
+ * surfaces without waiting for the upstream stream to close.
+ */
+async function* readNdjsonLines(body: ReadableStream<Uint8Array> | null): AsyncIterable<string> {
+  if (body === null) return;
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let streamDone = false;
+  try {
+    while (!streamDone) {
+      const { value, done } = await reader.read();
+      streamDone = done;
+      if (value !== undefined) {
+        buffer += decoder.decode(value, { stream: true });
+        let newlineIdx = buffer.indexOf("\n");
+        while (newlineIdx !== -1) {
+          const line = buffer.slice(0, newlineIdx);
+          buffer = buffer.slice(newlineIdx + 1);
+          if (line.trim().length > 0) {
+            yield line;
+          }
+          newlineIdx = buffer.indexOf("\n");
+        }
+      }
+    }
+    // The upstream may close without a trailing newline; flush any
+    // pending multi-byte sequences from the decoder and emit the
+    // residual line if it has content.
+    buffer += decoder.decode();
+    if (buffer.trim().length > 0) {
+      yield buffer;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
  * Detect a terminal error chunk in an NDJSON line and return its
  * human-readable message, or null if the chunk is not a terminal error.
  *
@@ -128,9 +168,19 @@ export function createOllamaProvider(deps: {
           return;
         }
 
-        for (const line of (await response.text())
-          .split("\n")
-          .filter((entry) => entry.trim().length > 0)) {
+        if (response.body === null) {
+          // A 200 OK with no body is a protocol-level failure: the
+          // popup must show an error, NOT a completed empty message.
+          // Codex review P2 — without this guard the for-await yielded
+          // nothing and `messageEndEvent()` below fired success.
+          yield {
+            type: "error",
+            message: `Ollama error: empty response body from ${url}`,
+            retryable: false
+          };
+          return;
+        }
+        for await (const line of readNdjsonLines(response.body)) {
           const payload = parseJsonPayload(line);
           // H2 (Phase 4b codex review): proxy/CLI backends emit terminal
           // error chunks as HTTP 200 NDJSON with `{error, done, done_reason}`

@@ -254,18 +254,6 @@ function makeStorage(fs: SpyFs): IndexStorage {
   return createIndexStorage(deps);
 }
 
-const LEGACY = `${DATA_DIR}/zotero-ai-explain-index.json`;
-
-/** Storage configured for the historical (ollama, embeddinggemma) pairing. */
-function makeOllamaStorage(fs: SpyFs): IndexStorage {
-  const deps: CreateIndexStorageDeps = {
-    zotero: { DataDirectory: { dir: DATA_DIR } },
-    io: fs.io,
-    embedProvider: { kind: "ollama", model: "embeddinggemma" }
-  };
-  return createIndexStorage(deps);
-}
-
 function indexFile(itemKey = "K1", title = "Paper One"): IndexFile {
   return {
     schemaVersion: CURRENT_SCHEMA_VERSION,
@@ -691,61 +679,15 @@ describe("AC-12 Adv-5 — read() stays pure (AC-5 FINDING-1 contract)", () => {
 });
 
 // ====================================================================
-// FINDING-2 — read()/readWithMigration() stay pure on the legacy
-// per-provider fallback path.
+// (removed) FINDING-2 — legacy per-provider fallback read.
 //
-// Codex S9 review: with `embedProvider = {ollama, embeddinggemma}` and
-// ONLY the legacy `zotero-ai-explain-index.json` present, `readPure()`
-// used to copy the legacy file to the per-provider name — a read-path
-// `writeString`, a real AC-5/AC-12 read-purity contract violation. Both
-// `read()` and `readWithMigration()` route through `readPure()`, so the
-// purity tests above (which use a non-provider path) miss the mutation.
-// The fix returns the legacy content WITHOUT copying it.
+// The historical `zotero-ai-explain-index.json` fallback for the
+// (ollama, embeddinggemma) pairing has been removed from `readPure()`.
+// Users upgrading from a pre-per-provider monolithic install must
+// clear+re-index; the legacy flat file is left on disk untouched. The
+// three FINDING-2 tests that pinned the old fallback behaviour were
+// deleted alongside the source change.
 // ====================================================================
-
-describe("AC-12 FINDING-2 — legacy per-provider fallback read is pure", () => {
-  it("read() over the legacy-eligible provider returns the legacy file and writes NOTHING", async () => {
-    const legacy = indexFile("LEG1", "Legacy Paper");
-    // Only the legacy flat file exists — no per-provider file.
-    const fs = makeSpyFs({ [LEGACY]: JSON.stringify(legacy) });
-    const storage = makeOllamaStorage(fs);
-
-    const result = await storage.read();
-    // The legacy content is returned correctly.
-    expect(result?.items.LEG1).toBeDefined();
-    // FINDING-2: the read path issued NO filesystem mutation — no copy
-    // of the legacy file to the per-provider name.
-    expect(fs.ops.some((op) => op.startsWith("writeString:"))).toBe(false);
-    expect(fs.ops.some((op) => op.startsWith("remove:"))).toBe(false);
-    expect(fs.ops.some((op) => op.startsWith("rename:"))).toBe(false);
-  });
-
-  it("readWithMigration() over the legacy-eligible provider is also pure", async () => {
-    const legacy = indexFile("LEG1", "Legacy Paper");
-    const fs = makeSpyFs({ [LEGACY]: JSON.stringify(legacy) });
-    const storage = makeOllamaStorage(fs);
-
-    const { file } = await storage.readWithMigration();
-    // The legacy content is returned correctly through the migration probe.
-    expect(file?.items.LEG1).toBeDefined();
-    // `readWithMigration()` shares `readPure()` — it must NOT copy either.
-    expect(fs.ops.some((op) => op.startsWith("writeString:"))).toBe(false);
-    expect(fs.ops.some((op) => op.startsWith("remove:"))).toBe(false);
-    expect(fs.ops.some((op) => op.startsWith("rename:"))).toBe(false);
-  });
-
-  it("repeated legacy-fallback reads all return the legacy data with zero writes", async () => {
-    const legacy = indexFile("LEG1", "Legacy Paper");
-    const fs = makeSpyFs({ [LEGACY]: JSON.stringify(legacy) });
-    const storage = makeOllamaStorage(fs);
-
-    expect((await storage.read())?.items.LEG1).toBeDefined();
-    expect((await storage.read())?.items.LEG1).toBeDefined();
-    // No one-time copy means every read is a clean, side-effect-free
-    // legacy fallback.
-    expect(fs.ops.some((op) => op.startsWith("writeString:"))).toBe(false);
-  });
-});
 
 // ====================================================================
 // Adv-6 — clear() invalidates: read() after clear() returns null

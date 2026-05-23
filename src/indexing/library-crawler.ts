@@ -216,7 +216,21 @@ export type LibraryCrawlerDeps = {
   readonly settings: { readonly baseUrl: string; readonly embeddingModel: string };
   readonly storage: {
     read(): Promise<IndexFile | null>;
+    /**
+     * Back-compat / AC-15 final-write fallback. Persists the WHOLE
+     * IndexFile (O(N) in items). The hot per-item loop uses `writeItem`
+     * (O(1)) instead — `write` is only called once at the end of an
+     * empty completion. Migration adapters in the controller also wire
+     * `write` to `writeTmp` so the empty-completion seed lands in the
+     * AC-5 `.tmp` rather than the primary.
+     */
     write(file: IndexFile): Promise<void>;
+    /**
+     * AC-23 (OOM fix): per-item persist. The crawler calls this after
+     * each successfully-indexed item so each persist is O(1) instead of
+     * O(N) per item / O(N²) over a crawl.
+     */
+    writeItem(itemKey: string, entry: IndexedItem): Promise<void>;
     clear(): Promise<void>;
     path(): string;
   };
@@ -751,17 +765,29 @@ export async function indexLibrary(
     }
 
     // Success: reset the breaker, persist the item, advance progress.
+    // AC-23: per-item file write — O(1) regardless of library size
+    // (was O(N) per write under the monolithic-file layout, which
+    // OOMed at ~200 items). The persist step is wrapped in try/catch
+    // so a single-item write failure (the JSON for one item is still
+    // measured in MB) counts as `failed += 1` rather than aborting
+    // the whole crawl; the in-memory `currentFile` is only mutated
+    // on success so a failed write doesn't leak a phantom entry.
     consecutiveFailures = 0;
     const title = (item.getField("title") ?? "").trim();
+    const entry = { title, chunks: accumulated };
+    try {
+      await deps.storage.writeItem(item.key, entry);
+    } catch (err) {
+      if (isAbortError(err)) throw err;
+      failed += 1;
+      deps.onProgress(indexed, failed, total, skippedNoText);
+      continue;
+    }
     currentFile = {
       schemaVersion: CURRENT_SCHEMA_VERSION,
-      items: {
-        ...currentFile.items,
-        [item.key]: { title, chunks: accumulated }
-      },
+      items: { ...currentFile.items, [item.key]: entry },
       indexedAt: new Date().toISOString()
     };
-    await deps.storage.write(currentFile);
     didWriteThisRun = true;
     indexed += 1;
     if (attachmentTextContributed) {

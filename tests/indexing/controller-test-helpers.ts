@@ -64,6 +64,21 @@ export function stubIndexStorage(): IndexStorage {
       stored = file;
     },
     // eslint-disable-next-line @typescript-eslint/require-await
+    async writeItem(itemKey, entry) {
+      // AC-23: per-item persist. Merge into the in-memory stored
+      // IndexFile so the next `read()` sees the new item.
+      stored = stored ?? {
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+        items: {},
+        indexedAt: new Date(0).toISOString()
+      };
+      stored = {
+        ...stored,
+        items: { ...stored.items, [itemKey]: entry },
+        indexedAt: new Date().toISOString()
+      };
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
     async writeTmp(file) {
       tmp = file;
     },

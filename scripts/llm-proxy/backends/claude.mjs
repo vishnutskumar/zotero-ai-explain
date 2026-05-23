@@ -78,15 +78,15 @@ export function describeClaudeFailure({ spawnError, stderr, exitCode, claudeComm
   return `claude exited with code ${String(exitCode)} (command: ${claudeCommand}).`;
 }
 
-/** Tags returned for /claude/api/tags. Identifier-only — Zotero only reads `name`. */
-const BUILTIN_CLAUDE_TAGS = [
-  "claude-opus-4-7",
-  "claude-sonnet-4-7",
-  "claude-haiku-4-7",
-  "opus",
-  "sonnet",
-  "haiku"
-];
+/**
+ * Hardcoded fallback for /claude/api/tags when live config-read is
+ * disabled. AC-21: previously this listed speculative variants
+ * (`opus`, `sonnet`, `haiku`) that don't always resolve in the real
+ * Claude CLI. Trimmed to a single conservative entry; live discovery
+ * via `readDiscoveredClaudeModels` is the source of truth when
+ * consent is granted, and users can extend with `CLAUDE_TAGS_EXTRA`.
+ */
+const BUILTIN_CLAUDE_TAGS = ["claude-sonnet-4-7"];
 
 function readEnvExtraClaudeTags() {
   const raw = process.env.CLAUDE_TAGS_EXTRA;

@@ -94,7 +94,10 @@ type ChromeIOUtils = {
   readonly read: (path: string) => Promise<Uint8Array>;
   readonly writeUTF8?: (path: string, contents: string) => Promise<number>;
   readonly write: (path: string, contents: Uint8Array) => Promise<number>;
-  readonly remove: (path: string, options?: { ignoreAbsent?: boolean }) => Promise<void>;
+  readonly remove: (
+    path: string,
+    options?: { ignoreAbsent?: boolean; recursive?: boolean }
+  ) => Promise<void>;
   readonly exists: (path: string) => Promise<boolean>;
   // Atomic move; backs `IndexStorage`'s migration `.tmp` → primary swap.
   readonly move: (source: string, dest: string) => Promise<void>;
@@ -103,6 +106,16 @@ type ChromeIOUtils = {
   readonly stat?: (
     path: string
   ) => Promise<{ readonly size?: number; readonly lastModified?: number }>;
+  // AC-23: create a directory. Optional — present on Zotero 7+ chrome.
+  // The storage layer treats absence as "host without filesystem" and
+  // degrades to legacy single-file mode.
+  readonly makeDirectory?: (
+    path: string,
+    options?: { ignoreExisting?: boolean; createAncestors?: boolean }
+  ) => Promise<void>;
+  // AC-23: enumerate children of a directory (returns full absolute
+  // paths on Zotero 7+ chrome).
+  readonly getChildren?: (path: string) => Promise<readonly string[]>;
 };
 
 /**
@@ -408,6 +421,18 @@ function buildIndexStorageIo(zotero: ZoteroGlobal): CreateIndexStorageDeps["io"]
         // AC-12: the no-op fallback returns the "unstattable" sentinel
         // so the index cache degrades to never-cache (never stale).
         return null;
+      },
+      // AC-23: no-op directory primitives so the storage layer falls
+      // back to its legacy single-file path on hosts without IOUtils.
+      async makeDirectory() {
+        // Swallow.
+      },
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async listChildren() {
+        return null;
+      },
+      async removeDirectory() {
+        // Swallow.
       }
     };
   }
@@ -453,6 +478,57 @@ function buildIndexStorageIo(zotero: ZoteroGlobal): CreateIndexStorageDeps["io"]
       } catch {
         // ENOENT (or any stat failure) → treat as absent.
         return null;
+      }
+    },
+    // AC-23: per-item directory primitives. Optional on the storage type
+    // — when the host's `IOUtils` lacks the method we surface the
+    // absence so the storage layer can fall back to the legacy
+    // single-file path.
+    ...((): {
+      readonly makeDirectory?: (path: string) => Promise<void>;
+    } => {
+      const makeDir = utils.makeDirectory;
+      if (typeof makeDir !== "function") return {};
+      return {
+        async makeDirectory(path: string): Promise<void> {
+          try {
+            await makeDir(path, { ignoreExisting: true, createAncestors: true });
+          } catch {
+            // Idempotent: an existing-dir race is a no-op.
+          }
+        }
+      };
+    })(),
+    ...((): {
+      readonly listChildren?: (path: string) => Promise<readonly string[] | null>;
+    } => {
+      const getChildren = utils.getChildren;
+      if (typeof getChildren !== "function") return {};
+      return {
+        async listChildren(path: string): Promise<readonly string[] | null> {
+          try {
+            const children = await getChildren(path);
+            // `IOUtils.getChildren` returns absolute paths — strip the
+            // directory prefix so the storage layer sees bare file names.
+            return children.map((p) => {
+              const slash = p.lastIndexOf("/");
+              const back = p.lastIndexOf("\\");
+              const cut = Math.max(slash, back);
+              return cut >= 0 ? p.substring(cut + 1) : p;
+            });
+          } catch {
+            // ENOENT — the directory does not exist yet.
+            return null;
+          }
+        }
+      };
+    })(),
+    async removeDirectory(path: string): Promise<void> {
+      try {
+        await utils.remove(path, { ignoreAbsent: true, recursive: true });
+      } catch {
+        // The per-file fallback in `IndexStorage.clear()` will handle
+        // whatever survives.
       }
     }
   };
@@ -805,6 +881,37 @@ function resolveBundledServerScriptPath(rootURI: string | undefined): string {
  * detector falls through to the next candidate (`detectNodeBinary` in
  * `wire-proxy-lifecycle.ts`).
  */
+/**
+ * Resolve the current user's home directory via Mozilla's directory
+ * service (`Services.dirsvc.get("Home", ...)`). Returns `undefined` on
+ * any failure so the detector skips home-relative shim paths instead
+ * of crashing — production should always succeed, but tests and
+ * stripped builds may not have a directory service.
+ */
+function readChromeHomeDir(zotero: ZoteroGlobal): string | undefined {
+  type ServicesLike = {
+    readonly dirsvc: {
+      get(key: string, iface: unknown): { readonly path: string };
+    };
+  };
+  type ComponentsLike = {
+    readonly interfaces: Record<string, unknown>;
+  };
+  const services = (globalThis as unknown as { readonly Services?: ServicesLike }).Services;
+  const components = (globalThis as unknown as { readonly Components?: ComponentsLike }).Components;
+  if (services === undefined || components === undefined) return undefined;
+  try {
+    const file = services.dirsvc.get("Home", components.interfaces.nsIFile);
+    const path = file.path.trim();
+    return path.length > 0 ? path : undefined;
+  } catch (err) {
+    zotero.debug(
+      `Zotero AI Explain: readChromeHomeDir failed ${err instanceof Error ? err.message : String(err)}`
+    );
+    return undefined;
+  }
+}
+
 function makeChromePathExists(zotero: ZoteroGlobal): (path: string) => boolean {
   type FileFactory = {
     createInstance(iface: unknown): {
@@ -1075,6 +1182,7 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
     const prefReader = asStringPrefReader(zotero.Prefs);
     const prefWriter = asStringPrefWriter(zotero.Prefs);
     const proxyFetch = boundFetch as unknown as Parameters<typeof wireProxyLifecycle>[0]["fetch"];
+    const detectedHomeDir = readChromeHomeDir(context.Zotero);
     proxyWired = wireProxyLifecycle({
       subprocess: subprocessAdapter,
       prefs: {
@@ -1084,6 +1192,7 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
         }
       },
       pathExists: makeChromePathExists(context.Zotero),
+      ...(detectedHomeDir !== undefined ? { homeDir: detectedHomeDir } : {}),
       // Developer-friendly default: the user's checkout. End users can
       // override via the settings dialog; the XPI does not ship the
       // scripts/ tree.
@@ -1208,7 +1317,9 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
               snapshot: () => wired.snapshot(),
               applyValues: (values) => wired.applyValues(values),
               start: () => wired.start(),
-              stop: () => wired.stop()
+              stop: () => wired.stop(),
+              redetectNode: () => wired.redetectNode(),
+              setAutoStart: (enabled) => wired.setAutoStart(enabled)
             }
           };
         })()

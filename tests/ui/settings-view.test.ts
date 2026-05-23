@@ -759,12 +759,11 @@ describe("renderSettingsView providerProfile section", () => {
     expect(view.querySelector<HTMLElement>('[data-provider-key-for="gemini"]')?.hidden).toBe(false);
   });
 
-  it("renders the Local LLM Proxy section ABOVE the chat/embed dropdowns (sectioned layout)", () => {
-    // When the proxy isn't running, the chat-model dropdown reads "not
-    // available" — users who hadn't realised they needed to start the
-    // proxy first kept submitting bugs about it. Anchoring Start/Stop at
-    // the top of the dialog makes the dependency obvious. This test
-    // pins the order so we don't quietly regress it again.
+  it("renders the Local LLM Proxy section ABOVE the chat/embed dropdowns", () => {
+    // Proxy is the primary user-visible control: when it isn't running
+    // the chat model dropdown reads "not available", so surfacing the
+    // Start/Stop pill at the top of the dialog makes that dependency
+    // obvious.
     const view = renderSettingsView({
       settings: createDefaultOllamaSettings(),
       indexStatus: { state: "idle", totalItems: 0, indexedItems: 0, failedItems: 0 },
@@ -793,14 +792,16 @@ describe("renderSettingsView providerProfile section", () => {
     if (proxySection === null) throw new Error("expected proxy section in sectioned layout");
     if (chatHeading === undefined) throw new Error("expected Chat Backend heading");
     if (embedHeading === undefined) throw new Error("expected Embedding Backend heading");
-    // DOCUMENT_POSITION_FOLLOWING = 4 when the argument follows the receiver
-    // in document order.
+    // DOCUMENT_POSITION_FOLLOWING = 4 when the argument follows the
+    // receiver in document order. Proxy is rendered BEFORE chat/embed.
     expect(proxySection.compareDocumentPosition(chatHeading)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING
     );
     expect(proxySection.compareDocumentPosition(embedHeading)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING
     );
+    // The proxy section is no longer wrapped in <details> Advanced.
+    expect(view.querySelector("details.zotero-ai-advanced")).toBeNull();
   });
 
   it("warns the user that API keys are stored locally in plain text", () => {

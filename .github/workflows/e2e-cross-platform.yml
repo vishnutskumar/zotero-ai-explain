@@ -229,29 +229,42 @@ jobs:
       - name: Install Ollama (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        timeout-minutes: 5
         run: |
           $ErrorActionPreference = "Stop"
           $version = $env:OLLAMA_VERSION
-          $installer = "$env:RUNNER_TEMP\OllamaSetup.exe"
-          $url = "https://github.com/ollama/ollama/releases/download/v$version/OllamaSetup.exe"
-          Write-Host "Downloading $url"
-          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
-          # OllamaSetup.exe is an InnoSetup installer — /VERYSILENT installs
-          # without UI and without restart prompts. /NORESTART is defensive.
-          $proc = Start-Process -FilePath $installer -ArgumentList "/VERYSILENT","/NORESTART" -PassThru -Wait
-          if ($proc.ExitCode -ne 0) {
-            throw "Ollama installer exited with $($proc.ExitCode)"
+          # Use the standalone zip rather than OllamaSetup.exe: the InnoSetup
+          # installer spawns a tray helper / background `ollama serve` whose
+          # lifetime exceeds the installer process, so `Start-Process -Wait`
+          # blocks on descendants indefinitely (observed: 16+ min hang).
+          # The zip ships the same `ollama.exe` with no side effects.
+          $zip = "$env:RUNNER_TEMP\ollama-windows-amd64.zip"
+          $url = "https://github.com/ollama/ollama/releases/download/v$version/ollama-windows-amd64.zip"
+          # GitHub release CDN is generally reliable but TLS half-opens have
+          # been observed; mirror the Zotero install retry/timeout pattern.
+          $maxAttempts = 5
+          for ($i = 1; $i -le $maxAttempts; $i++) {
+            try {
+              Write-Host "Downloading $url (attempt $i / $maxAttempts)"
+              Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 120
+              break
+            } catch {
+              if ($i -eq $maxAttempts) { throw }
+              Write-Host "Download attempt $i failed: $($_.Exception.Message). Retrying in 10s..."
+              Start-Sleep -Seconds 10
+            }
           }
-          # InnoSetup default install path for per-user installs.
-          $ollamaDir = "$env:LOCALAPPDATA\Programs\Ollama"
-          if (-not (Test-Path (Join-Path $ollamaDir "ollama.exe"))) {
-            # Fall back to per-machine install path.
-            $ollamaDir = "C:\Program Files\Ollama"
-          }
-          if (-not (Test-Path (Join-Path $ollamaDir "ollama.exe"))) {
-            throw "ollama.exe not found in known install paths"
+          $ollamaDir = "$env:RUNNER_TEMP\ollama"
+          New-Item -ItemType Directory -Force -Path $ollamaDir | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $ollamaDir -Force
+          # The zip flattens ollama.exe at the root; sanity-check before
+          # exporting PATH so a future layout change fails loudly here.
+          $ollamaExe = Join-Path $ollamaDir "ollama.exe"
+          if (-not (Test-Path $ollamaExe)) {
+            throw "ollama.exe not found at $ollamaExe after extracting $zip"
           }
           "$ollamaDir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & $ollamaExe --version
 
       # ----------------------------------------------------------------
       # Cache Ollama model blobs (~1.6 GB total for gemma3:1b +

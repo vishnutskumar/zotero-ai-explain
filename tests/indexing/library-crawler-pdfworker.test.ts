@@ -162,6 +162,15 @@ async function runCrawl(opts: {
     itemsById.set(child.id, child);
   }
 
+  // AC-23: the crawler persists per-item via `writeItem`. Mirror the
+  // accumulated state into `writes` so the test's existing
+  // `written.items.*.chunks` assertions keep working without per-test
+  // rewrites.
+  let accumulated: IndexFile = {
+    schemaVersion: 2,
+    items: {},
+    indexedAt: new Date(0).toISOString()
+  };
   const storage: IndexStorage = {
     async read() {
       await Promise.resolve();
@@ -174,6 +183,16 @@ async function runCrawl(opts: {
     async write(file: IndexFile) {
       await Promise.resolve();
       writes.push(file);
+      accumulated = { ...file, items: { ...file.items } };
+    },
+    async writeItem(itemKey: string, entry: IndexFile["items"][string]) {
+      await Promise.resolve();
+      accumulated = {
+        ...accumulated,
+        items: { ...accumulated.items, [itemKey]: entry },
+        indexedAt: new Date().toISOString()
+      };
+      writes.push({ ...accumulated, items: { ...accumulated.items } });
     },
     async clear() {
       await Promise.resolve();

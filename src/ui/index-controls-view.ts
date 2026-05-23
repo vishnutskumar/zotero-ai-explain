@@ -79,13 +79,17 @@ export function renderIndexControls(status: IndexingStatus): HTMLElement {
   const resume = makeButton("resume-index", "Resume", false);
   const clear = makeButton("clear-index", CLEAR_LABEL, false);
 
-  // AC-14 Fix 1: set the initial `disabled` flags so `renderIndexControls`
-  // alone (before `attachIndexControls` wires the controller) already
-  // reflects whether each lifecycle action can run. `attachIndexControls`
-  // recomputes these on every status change.
-  setDisabled(start, startBlocked(status));
-  setDisabled(pause, status.state !== "running");
-  setDisabled(resume, status.state !== "paused");
+  // AC-14 Fix 1 + button-clutter polish: hide buttons that aren't
+  // actionable in the current state instead of greying them out, so
+  // the row only ever shows controls relevant right now (was: 4
+  // buttons always visible, 3 greyed-out at any time).
+  setVisible(start, !startBlocked(status));
+  setVisible(pause, status.state === "running");
+  setVisible(resume, status.state === "paused");
+  // Clear stays visible whenever an index exists or migration is idle;
+  // disable (not hide) it during a migration so the user knows it's
+  // suspended rather than missing.
+  setVisible(clear, true);
   setDisabled(clear, status.migrationActive === true);
 
   buttons.append(start, pause, resume, clear);
@@ -127,9 +131,13 @@ export function attachIndexControls(
    */
   const refreshControls = (): void => {
     const status = controller.getStatus();
-    setDisabled(startBtn, startBlocked(status));
-    setDisabled(pauseBtn, status.state !== "running");
-    setDisabled(resumeBtn, status.state !== "paused");
+    // Hide buttons that aren't actionable in the current state. The
+    // dialog used to render all four buttons (3 greyed) which looked
+    // cluttered; now only the relevant action(s) appear.
+    setVisible(startBtn, !startBlocked(status));
+    setVisible(pauseBtn, status.state === "running");
+    setVisible(resumeBtn, status.state === "paused");
+    setVisible(clearBtn, true);
     // A clear during a migration is controller-safe, but the two-stage
     // destructive confirm would be confusing mid-migration — disable it.
     setDisabled(clearBtn, status.migrationActive === true);
@@ -269,6 +277,13 @@ function setDisabled(button: HTMLButtonElement | null, disabled: boolean): void 
   button.setAttribute("aria-disabled", disabled ? "true" : "false");
   button.style.opacity = disabled ? "0.5" : "";
   button.style.cursor = disabled ? "default" : "pointer";
+}
+
+function setVisible(button: HTMLButtonElement | null, visible: boolean): void {
+  if (button === null) {
+    return;
+  }
+  button.hidden = !visible;
 }
 
 function makeButton(action: string, label: string, primary: boolean): HTMLButtonElement {

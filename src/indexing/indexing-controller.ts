@@ -341,9 +341,27 @@ export function createIndexingController(deps: {
         //     so a concurrent `clear()` can interrupt the crawl.
         const controller = new AbortController();
         migrationAbortController = controller;
+        // AC-23: the migration writes to the legacy single-file `.tmp`
+        // so `commitMigration` can atomic-rename it over the primary.
+        // The crawler now persists per-item via `writeItem`; the
+        // migration adapter accumulates each item in-memory and
+        // rewrites the `.tmp` so the final commit captures the full
+        // crawl. (Migration crawls are infrequent — once per upgrade —
+        // so the rewrite cost is acceptable, unlike the production hot
+        // loop the AC-23 directory layout fixes.)
+        const migrationAccumulator: IndexFile = {
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+          items: {},
+          indexedAt: new Date().toISOString()
+        };
         const migrationStorage: LibraryCrawlerDeps["storage"] = {
           read: () => Promise.resolve(null),
           write: (file) => deps.storage.writeTmp(file),
+          async writeItem(itemKey, entry) {
+            migrationAccumulator.items[itemKey] = entry;
+            (migrationAccumulator as { indexedAt: string }).indexedAt = new Date().toISOString();
+            await deps.storage.writeTmp(migrationAccumulator);
+          },
           clear: () => Promise.resolve(),
           path: () => deps.storage.path()
         };

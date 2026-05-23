@@ -90,6 +90,45 @@ export function computeIndexPath(dataDir: string, input: IndexPathInput): string
 }
 
 /**
+ * Build the bare DIRECTORY name (no parent) for the per-(provider,model)
+ * index. AC-23: the long-term fix for the indexing OOM splits the
+ * monolithic IndexFile into one file per item under this directory, so
+ * each persist is O(1) instead of O(N) per item / O(N²) over a crawl.
+ *
+ * The directory name is intentionally the same base string as the
+ * single-file name without the trailing `.json` — the legacy single-file
+ * sits alongside the directory during the back-compat transition (read()
+ * prefers the directory; falls back to the file when the directory is
+ * absent). For the (ollama, embeddinggemma) historical pairing the legacy
+ * `zotero-ai-explain-index.json` is the file name AND
+ * `zotero-ai-explain-index-ollama-embeddinggemma/` is the new directory.
+ */
+export function computeIndexDirName(input: IndexPathInput): string {
+  return `${FILE_PREFIX}-${input.provider}-${slugifyModel(input.model)}`;
+}
+
+/**
+ * Compute the per-item file name within an index directory. AC-23:
+ * `<itemKey>.json`. Item keys are Zotero's 8-character base-32 keys
+ * (`[A-Z0-9]{8}` in practice), which are filesystem-safe across macOS,
+ * Linux, and Windows. Reserved names (`_meta.json`) are guarded by the
+ * storage layer (item keys can never collide with the reserved meta file
+ * because Zotero keys are uppercase and `_meta` has a leading underscore).
+ */
+export function computeItemFileName(itemKey: string): string {
+  return `${itemKey}.json`;
+}
+
+/**
+ * Reserved meta file name inside an index directory. Holds
+ * `{ schemaVersion, indexedAt, itemCount }` so `readItemCount()` answers
+ * in O(few-bytes) instead of enumerating the whole directory. The
+ * leading underscore guarantees no Zotero item key (uppercase
+ * alphanumeric) collides with this name.
+ */
+export const META_FILE_NAME = "_meta.json";
+
+/**
  * Inverse: given a path or filename, recover the (provider, modelSlug)
  * that produced it. Returns null when the filename doesn't match the
  * expected pattern. Used by diagnostics + the settings "Switched to X

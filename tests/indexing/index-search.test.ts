@@ -23,6 +23,9 @@ function fakeStorage(file: IndexFile | null): IndexStorage {
     write() {
       return Promise.resolve();
     },
+    writeItem() {
+      return Promise.resolve();
+    },
     writeTmp() {
       return Promise.resolve();
     },

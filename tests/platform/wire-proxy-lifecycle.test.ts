@@ -4,6 +4,7 @@ import type { SubprocessHandle, SubprocessLike } from "../../src/platform/proxy-
 import {
   DEFAULT_PROXY_PORT,
   NODE_BINARY_CANDIDATES,
+  PROXY_AUTOSTART_PREF,
   PROXY_CONFIG_READ_CONSENT_PREF,
   PROXY_NODE_BINARY_PREF,
   PROXY_PORT_PREF,
@@ -224,10 +225,24 @@ describe("wireProxyLifecycle start/stop", () => {
     expect(sub.calls).toHaveLength(1);
   });
 
-  it("does not auto-start when the autostart pref is missing or 'false'", async () => {
+  it("auto-starts when the autostart pref is missing (opt-out default)", async () => {
     const sub = fakeSubprocess();
     wireProxyLifecycle({
       subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs"
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(sub.calls).toHaveLength(1);
+  });
+
+  it("does not auto-start when the autostart pref is explicitly 'false'", async () => {
+    const sub = fakeSubprocess();
+    const prefs = memPrefs({ [PROXY_AUTOSTART_PREF]: "false" });
+    wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      prefs,
       pathExists: () => false,
       defaultServerScriptPath: "/abs/server.mjs"
     });
@@ -414,7 +429,10 @@ describe("wireProxyLifecycle config-read consent (Bug B)", () => {
     expect(sub.calls[0]?.env).toMatchObject({ LLM_PROXY_CONFIG_READ: "allow" });
   });
 
-  it("does NOT pass LLM_PROXY_CONFIG_READ when the pref is missing", async () => {
+  it("AC-21: defaults to passing LLM_PROXY_CONFIG_READ=allow when the pref is missing", async () => {
+    // AC-21 flipped the consent default to allow so the codex / claude
+    // dropdowns serve the user's REAL configured models out of the
+    // box. Users opt OUT by setting the pref to "never".
     const sub = fakeSubprocess();
     const wired = wireProxyLifecycle({
       subprocess: sub.subprocess,
@@ -422,11 +440,10 @@ describe("wireProxyLifecycle config-read consent (Bug B)", () => {
       defaultServerScriptPath: "/abs/server.mjs"
     });
     await wired.start();
-    const env = sub.calls[0]?.env ?? {};
-    expect(env).not.toHaveProperty("LLM_PROXY_CONFIG_READ");
+    expect(sub.calls[0]?.env).toMatchObject({ LLM_PROXY_CONFIG_READ: "allow" });
   });
 
-  it("does NOT pass LLM_PROXY_CONFIG_READ when the pref is 'never' or 'once'", async () => {
+  it("does NOT pass LLM_PROXY_CONFIG_READ when the pref is 'never'", async () => {
     const sub = fakeSubprocess();
     const prefs = memPrefs({ [PROXY_CONFIG_READ_CONSENT_PREF]: "never" });
     const wired = wireProxyLifecycle({
@@ -476,6 +493,53 @@ describe("wireProxyLifecycle exit diagnostics (Bug C)", () => {
     // the lastError after the exit fired.
     const errStates = states.filter((s) => s.lastError !== undefined);
     expect(errStates.length).toBeGreaterThan(0);
+  });
+
+  it("codex P1: redetectNode() does NOT rebuild lifecycle while a start is in flight", async () => {
+    // Race: start() awaits subprocess.call(); during that await,
+    // trackedPid() is still null. Before the P1 fix, redetectNode()
+    // saw null and rebuilt the lifecycle — orphaning whatever child
+    // the original lifecycle ended up spawning.
+    let resolveCall!: (handle: SubprocessHandle) => void;
+    const pendingCalls: { command: string }[] = [];
+    const callImpl: SubprocessLike["call"] = (spec) => {
+      pendingCalls.push({ command: spec.command });
+      return new Promise<SubprocessHandle>((resolve) => {
+        resolveCall = resolve;
+      });
+    };
+    const subprocess: SubprocessLike = { call: vi.fn(callImpl) };
+    const wired = wireProxyLifecycle({
+      subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs"
+    });
+    // Kick off start; await microtasks so the inner await reaches
+    // the still-pending subprocess.call().
+    const startP = wired.start();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(pendingCalls).toHaveLength(1);
+
+    // Concurrent Detect click. Before the fix this rebuilt the
+    // lifecycle, and the subsequent resolveCall below would attach
+    // the spawned handle to a lifecycle no longer referenced.
+    wired.redetectNode();
+
+    // Resolve the pending subprocess.call() — original lifecycle still
+    // owns the spawn so it gets tracked, no orphan.
+    const handle: SubprocessHandle = {
+      pid: 4242,
+      wait: () => new Promise(() => undefined),
+      kill: () => undefined
+    };
+    resolveCall(handle);
+    await startP;
+
+    // The single spawn is tracked, and no extra spawn occurred from a
+    // rebuilt lifecycle.
+    expect(pendingCalls).toHaveLength(1);
+    expect(wired.snapshot().running).toBe(true);
   });
 
   it("clears lastError on a fresh successful start()", async () => {

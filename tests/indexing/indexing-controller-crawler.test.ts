@@ -900,6 +900,20 @@ function makeMigrationStorage(legacyPrimary: IndexFile | null): {
       state.primary = file;
     },
     // eslint-disable-next-line @typescript-eslint/require-await
+    async writeItem(itemKey, entry) {
+      // AC-23: per-item persist mirrored into the in-memory state.
+      const base = state.primary ?? {
+        schemaVersion: 2,
+        items: {},
+        indexedAt: new Date(0).toISOString()
+      };
+      state.primary = {
+        ...base,
+        items: { ...base.items, [itemKey]: entry },
+        indexedAt: new Date().toISOString()
+      };
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
     async writeTmp(file) {
       opLog.push("writeTmp");
       state.tmp = file;

@@ -93,16 +93,19 @@ export const PROXY_SERVER_SCRIPT_PREF = "extensions.zotero-ai-explain.proxy-serv
 export const PROXY_PORT_PREF = "extensions.zotero-ai-explain.proxy-port";
 export const PROXY_AUTOSTART_PREF = "extensions.zotero-ai-explain.proxy-autostart";
 /**
- * Per-session consent for the proxy's live-config discovery flow (Bug
- * B). When the pref's value is the literal string `"always"` the
- * wiring passes `LLM_PROXY_CONFIG_READ=allow` into the spawned proxy's
- * environment so the codex/claude backends may read
- * `~/.codex/config.toml` and `~/.claude/settings.json` for live model
- * discovery. Any other value (missing, `"never"`, `"once"`) leaves the
- * env unset, so the proxy returns only its hardcoded defaults.
+ * Opt-OUT pref for the proxy's live-config discovery flow (AC-21).
+ * The proxy reads `~/.codex/config.toml` and `~/.claude/settings.json`
+ * for the user's real model list — without it the dropdown can only
+ * surface the single hardcoded fallback name per backend.
  *
- * The full consent-dialog UX is queued as a follow-up; this pref is
- * the bare wiring that the future dialog will set.
+ * Pref values:
+ *   - missing / `"true"` / `"always"` → wiring passes
+ *     `LLM_PROXY_CONFIG_READ=allow` into the spawned proxy (default).
+ *   - `"never"` → wiring omits the env var; proxy uses only BUILTIN
+ *     fallback names.
+ *
+ * Users toggle this via a future settings checkbox; until then,
+ * editing the pref directly is the escape hatch.
  */
 export const PROXY_CONFIG_READ_CONSENT_PREF = "extensions.zotero-ai-explain.config-read-consent";
 
@@ -113,17 +116,44 @@ export const DEFAULT_PROXY_PORT = 11400;
  * one that exists wins; if none exist, the bare command `"node"` is
  * returned so the user gets a clear error from `Subprocess.call`.
  *
- * Order is Apple Silicon (Homebrew default) → macOS Intel → Linux.
- * Windows users must configure the path manually (Subprocess doesn't
- * search %PATH% in the chrome context). When a `whichRunner` is wired
- * the detector tries `which node` first and only falls back to this
- * list if `which` returns no usable path.
+ * Order is Apple Silicon (Homebrew default) → macOS Intel → Linux →
+ * common Windows installs. Version-manager shim paths under `$HOME`
+ * (volta / asdf / fnm) are appended by `homeRelativeNodeCandidates`
+ * when a `homeDir` is supplied; we list them after the static system
+ * paths so a system-managed Node wins when both exist.
  */
 export const NODE_BINARY_CANDIDATES: readonly string[] = [
   "/opt/homebrew/bin/node",
   "/usr/local/bin/node",
-  "/usr/bin/node"
+  "/usr/bin/node",
+  // Windows: default Program Files install location for both the
+  // official MSI and Chocolatey package. Subprocess.call accepts the
+  // full path; %PATH% is not searched in chrome context.
+  "C:\\Program Files\\nodejs\\node.exe",
+  "C:\\Program Files (x86)\\nodejs\\node.exe"
 ];
+
+/**
+ * Generate version-manager shim candidates rooted at the user's home
+ * directory. Returned paths are deterministic ("default" shim for fnm,
+ * shim entry for asdf, fixed `bin/node` for volta) so a sync
+ * `pathExists` check can find them without listing the parent dir.
+ */
+export function homeRelativeNodeCandidates(homeDir: string): readonly string[] {
+  const sep = homeDir.includes("\\") ? "\\" : "/";
+  const join = (...parts: string[]): string => [homeDir, ...parts].join(sep);
+  return [
+    // volta — single canonical bin shim that resolves the active version.
+    join(".volta", "bin", "node"),
+    // asdf — shim file dispatches to whichever version is active in the
+    // user's `.tool-versions`. Reliable across version changes.
+    join(".asdf", "shims", "node"),
+    // fnm — `default` alias is the shell-default Node binary.
+    join(".local", "share", "fnm", "aliases", "default", "bin", "node"),
+    // n (TJ's manager) — installs to ~/n/bin in single-user mode.
+    join("n", "bin", "node")
+  ];
+}
 
 /**
  * Sync `which`-style probe. Returns the resolved absolute path for a
@@ -160,6 +190,12 @@ export type WireProxyLifecycleDeps = {
    * helper that shells out to `/usr/bin/which`.
    */
   readonly whichRunner?: WhichRunner;
+  /**
+   * Home directory used to seed version-manager shim candidates
+   * (volta / asdf / fnm / n). When omitted, detection only walks the
+   * static system paths in `NODE_BINARY_CANDIDATES`.
+   */
+  readonly homeDir?: string;
   /** Default server-script path when no pref override is set. */
   readonly defaultServerScriptPath?: string;
   /** Fetch for the lifecycle's isRunning probe. */
@@ -206,6 +242,12 @@ export type ProxyState = {
    */
   readonly externallyManaged: boolean;
   /**
+   * Whether the proxy should auto-spawn at plugin load. Mirrors the
+   * `proxy-autostart` pref so the settings UI can render the live
+   * checkbox state. Defaults to true (opt-out).
+   */
+  readonly autoStart: boolean;
+  /**
    * Optional snapshot of the proxy's `/api/diagnostics` response. Set
    * after a successful start when a `diagnosticsFetch` is supplied.
    * Omitted when the fetch is absent or the diagnostics call failed.
@@ -233,6 +275,21 @@ export type WiredProxy = {
     readonly serverScriptPath: string;
     readonly port: number;
   }) => ProxyState;
+  /**
+   * Re-run Node binary detection and update the in-memory path +
+   * `nodeAutoDetectFailed` flag. Returns the fresh snapshot. Used by
+   * the settings dialog's Detect button so the user can rescan after
+   * installing Node or switching version managers without restarting
+   * Zotero.
+   */
+  readonly redetectNode: () => ProxyState;
+  /**
+   * Persist the proxy-autostart pref. Settings dialog's "Start on
+   * Zotero launch" checkbox routes here so the toggle survives a
+   * restart. The change does NOT spawn or kill the running proxy —
+   * it only affects the next plugin load.
+   */
+  readonly setAutoStart: (enabled: boolean) => ProxyState;
   /**
    * Tear down the proxy (call from plugin shutdown). Always awaits a
    * `lifecycle.stop()` so we never leave an orphan child process.
@@ -265,19 +322,24 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
 
   // Detection result: keeps both the chosen path and a flag that says
   // "we had to fall back to the bare command name" so the UI can warn.
+  const runDetection = (): { readonly path: string; readonly autoDetectFailed: boolean } =>
+    detectNodeBinaryWithStatus({
+      ...(deps.whichRunner !== undefined ? { whichRunner: deps.whichRunner } : {}),
+      ...(deps.homeDir !== undefined ? { homeDir: deps.homeDir } : {}),
+      pathExists
+    });
   const detection =
-    persistedNode !== undefined
-      ? { path: persistedNode, autoDetectFailed: false }
-      : detectNodeBinaryWithStatus({
-          ...(deps.whichRunner !== undefined ? { whichRunner: deps.whichRunner } : {}),
-          pathExists
-        });
+    persistedNode !== undefined ? { path: persistedNode, autoDetectFailed: false } : runDetection();
   let nodeBinaryPath = detection.path;
   let nodeAutoDetectFailed = detection.autoDetectFailed;
   let serverScriptPath = persistedScript ?? deps.defaultServerScriptPath ?? "";
   let port = persistedPort ?? DEFAULT_PROXY_PORT;
   let lastError: string | undefined;
   let diagnostics: ProxyDiagnostics | undefined;
+  // Codex review P1: true while `start()` is awaiting `lifecycle.start()`.
+  // `redetectNode()` consults this before rebuilding the lifecycle so
+  // a concurrent spawn never gets orphaned by a replaced lifecycle.
+  let spawnInFlight = false;
   /**
    * Monotonic generation tag bumped on every start() / stop() / unsolicited
    * exit. A diagnostics fetch captures the generation BEFORE its
@@ -293,11 +355,15 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
   let exitUnsub = lifecycle.onExit(handleExit);
 
   function readConsentEnv(): Readonly<Record<string, string>> | undefined {
+    // AC-21: default to "allow" when the pref is unset so the codex /
+    // claude proxy backends serve the user's REAL configured models
+    // (from ~/.codex/config.toml and ~/.claude/settings.json) instead
+    // of a stale hardcoded list. The pref's only meaningful "off"
+    // value is "never" — users who explicitly opt out of config reads
+    // set it via settings and get the BUILTIN fallback list instead.
     const value = deps.prefs?.get(PROXY_CONFIG_READ_CONSENT_PREF)?.trim();
-    if (value === "always") {
-      return { LLM_PROXY_CONFIG_READ: "allow" };
-    }
-    return undefined;
+    if (value === "never") return undefined;
+    return { LLM_PROXY_CONFIG_READ: "allow" };
   }
 
   function buildLifecycle(): ProxyLifecycle {
@@ -339,6 +405,11 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
     deps.onStateChange?.(snapshot());
   }
 
+  function readAutoStartPref(): boolean {
+    const value = deps.prefs?.get(PROXY_AUTOSTART_PREF)?.trim();
+    return value !== "false";
+  }
+
   function snapshot(): ProxyState {
     const tracked = lifecycle.trackedPid();
     const externallyManaged = lifecycle.isExternallyManaged();
@@ -349,6 +420,7 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
       serverScriptPath,
       nodeAutoDetectFailed,
       externallyManaged,
+      autoStart: readAutoStartPref(),
       ...(lastError !== undefined ? { lastError } : {}),
       ...(diagnostics !== undefined ? { diagnostics } : {})
     };
@@ -463,10 +535,22 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
   }
 
   async function start(): Promise<{ pid: number } | { external: true } | { error: string }> {
+    // Codex review P1: redetectNode() probes `trackedPid()` to decide
+    // whether to rebuild the lifecycle. During the awaits below the
+    // child is mid-spawn and `trackedPid()` is still null — a
+    // concurrent Detect click would replace `lifecycle` and the
+    // pending spawn would survive as an orphan. The guard flag tells
+    // redetectNode to skip the rebuild while a start is in flight.
+    spawnInFlight = true;
+    try {
+      return await startInner();
+    } finally {
+      spawnInFlight = false;
+    }
+  }
+
+  async function startInner(): Promise<{ pid: number } | { external: true } | { error: string }> {
     lastError = undefined;
-    // Drop any stale diagnostics from a prior process so the UI doesn't
-    // show "codex found at /old/path" between a stop and a successful
-    // restart from a different PATH.
     diagnostics = undefined;
     generation += 1;
     let myGeneration = generation;
@@ -532,12 +616,56 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
     }
     // Rebuild the lifecycle so the next start() picks up the new
     // settings. If a child is currently tracked, leave it running —
-    // the user can click Stop + Start to apply.
+    // the user can click Stop + Start to apply. Skip the rebuild
+    // while a spawn is in flight (codex P1) to avoid orphaning it.
     const tracked = lifecycle.trackedPid();
-    if (tracked === null) {
+    if (tracked === null && !spawnInFlight) {
       exitUnsub();
       lifecycle = buildLifecycle();
       exitUnsub = lifecycle.onExit(handleExit);
+    }
+    deps.onStateChange?.(snapshot());
+    return snapshot();
+  }
+
+  function redetectNode(): ProxyState {
+    const fresh = runDetection();
+    nodeBinaryPath = fresh.path;
+    nodeAutoDetectFailed = fresh.autoDetectFailed;
+    // Persist the new path so future restarts use it without re-probing.
+    if (deps.prefs !== undefined && !nodeAutoDetectFailed) {
+      try {
+        deps.prefs.set(PROXY_NODE_BINARY_PREF, nodeBinaryPath);
+      } catch (err) {
+        debug(
+          `proxy-lifecycle: pref write failed ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+    // Codex P1: skip the lifecycle rebuild while a `start()` is in
+    // flight. Replacing `lifecycle` mid-spawn would orphan whatever
+    // child the prior lifecycle ends up spawning. The next start()
+    // (after the current spawn settles) will pick up the new Node
+    // path because applyValues rebuilds the lifecycle at that point.
+    const tracked = lifecycle.trackedPid();
+    if (tracked === null && !spawnInFlight) {
+      exitUnsub();
+      lifecycle = buildLifecycle();
+      exitUnsub = lifecycle.onExit(handleExit);
+    }
+    deps.onStateChange?.(snapshot());
+    return snapshot();
+  }
+
+  function setAutoStart(enabled: boolean): ProxyState {
+    if (deps.prefs !== undefined) {
+      try {
+        deps.prefs.set(PROXY_AUTOSTART_PREF, enabled ? "true" : "false");
+      } catch (err) {
+        debug(
+          `proxy-lifecycle: pref write failed ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
     }
     deps.onStateChange?.(snapshot());
     return snapshot();
@@ -551,9 +679,13 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
     }
   }
 
-  // ---- Optional auto-start ----
-  const autoStart =
-    deps.autoStartOverride ?? deps.prefs?.get(PROXY_AUTOSTART_PREF)?.trim() === "true";
+  // ---- Auto-start ----
+  // User requirement: the proxy should be ready when the dialog opens
+  // so the codex / claude presets just work. The autostart pref now
+  // defaults to ON; users opt OUT by setting it to "false" via the
+  // settings dialog's "Start on Zotero launch" toggle.
+  const autoStartPref = deps.prefs?.get(PROXY_AUTOSTART_PREF)?.trim();
+  const autoStart = deps.autoStartOverride ?? autoStartPref !== "false";
   if (autoStart) {
     void start();
   }
@@ -564,6 +696,8 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
     start,
     stop,
     applyValues,
+    redetectNode,
+    setAutoStart,
     shutdown
   };
 }
@@ -580,11 +714,12 @@ export function detectNodeBinary(exists: PathExists): string {
  * Resolve the Node binary path with priority:
  *   1. `whichRunner("node")` — POSIX `which` lookup (catches user-
  *      installed Node in non-standard prefixes).
- *   2. Each NODE_BINARY_CANDIDATES path in order, gated on
- *      `pathExists(p)`.
- *   3. Fall back to the bare command `"node"` and flag the result with
- *      `autoDetectFailed: true` so the UI knows to reveal the manual
- *      override field.
+ *   2. Each `NODE_BINARY_CANDIDATES` path, gated on `pathExists`.
+ *   3. When `homeDir` is supplied, each `homeRelativeNodeCandidates`
+ *      entry — volta / asdf / fnm / n shims.
+ *   4. Fall back to the bare command `"node"` and flag the result
+ *      with `autoDetectFailed: true` so the UI knows the manual
+ *      override field needs the user's attention.
  *
  * Exported for tests so the detection priority is easy to assert
  * without spinning up the full lifecycle.
@@ -592,6 +727,7 @@ export function detectNodeBinary(exists: PathExists): string {
 export function detectNodeBinaryWithStatus(deps: {
   readonly whichRunner?: WhichRunner;
   readonly pathExists: PathExists;
+  readonly homeDir?: string;
 }): { readonly path: string; readonly autoDetectFailed: boolean } {
   if (deps.whichRunner !== undefined) {
     try {
@@ -603,14 +739,15 @@ export function detectNodeBinaryWithStatus(deps: {
       // Fall through to the candidate scan.
     }
   }
-  for (const candidate of NODE_BINARY_CANDIDATES) {
+  const candidates =
+    deps.homeDir !== undefined && deps.homeDir.length > 0
+      ? [...NODE_BINARY_CANDIDATES, ...homeRelativeNodeCandidates(deps.homeDir)]
+      : NODE_BINARY_CANDIDATES;
+  for (const candidate of candidates) {
     if (deps.pathExists(candidate)) {
       return { path: candidate, autoDetectFailed: false };
     }
   }
-  // Last-resort fallback. The Start button will surface a clear error
-  // from Subprocess.call and the UI uses `autoDetectFailed: true` to
-  // reveal the otherwise-hidden manual override field.
   return { path: "node", autoDetectFailed: true };
 }
 

@@ -44,10 +44,16 @@ var ZoteroAiExplain = (() => {
     if (contentType === void 0) return void 0;
     return contentType.toLowerCase().includes("pdf");
   }
-  async function extractPdfPages(attachment, pdfWorker) {
+  async function extractPdfPages(attachment, pdfWorker, maxChars) {
     try {
       const result = await pdfWorker.getFullText(attachment.id);
-      return splitPdfWorkerText(result.text);
+      let text = result.text;
+      if (text.length > maxChars) {
+        const truncated = text.substring(0, maxChars);
+        const lastBoundary = truncated.lastIndexOf("\f");
+        text = lastBoundary > 0 ? truncated.substring(0, lastBoundary) : truncated;
+      }
+      return splitPdfWorkerText(text);
     } catch {
       return null;
     }
@@ -59,7 +65,7 @@ var ZoteroAiExplain = (() => {
     const pdfByContentType = isPdfContentType(contentType);
     const pdfWorker = access.PDFWorker;
     if (pdfWorker !== void 0 && pdfByContentType !== false) {
-      const pages = await extractPdfPages(attachment, pdfWorker);
+      const pages = await extractPdfPages(attachment, pdfWorker, maxChars);
       if (pages !== null) {
         for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
           yield {
@@ -293,16 +299,23 @@ ${para}`;
         deps.onProgress(indexed, failed, total, skippedNoText);
         continue;
       }
-      const sourceChunks = [];
-      for (const source of sources) {
-        for (const chunk of chunkText(source.text, DEFAULT_CHUNK_BYTES)) {
-          sourceChunks.push({
-            text: chunk,
-            sourceKind: source.sourceKind,
-            ...source.pageIndex !== void 0 ? { pageIndex: source.pageIndex } : {},
-            ...source.attachmentKey !== void 0 ? { attachmentKey: source.attachmentKey } : {}
-          });
+      let sourceChunks;
+      try {
+        sourceChunks = [];
+        for (const source of sources) {
+          for (const chunk of chunkText(source.text, DEFAULT_CHUNK_BYTES)) {
+            sourceChunks.push({
+              text: chunk,
+              sourceKind: source.sourceKind,
+              ...source.pageIndex !== void 0 ? { pageIndex: source.pageIndex } : {},
+              ...source.attachmentKey !== void 0 ? { attachmentKey: source.attachmentKey } : {}
+            });
+          }
         }
+      } catch {
+        failed += 1;
+        deps.onProgress(indexed, failed, total, skippedNoText);
+        continue;
       }
       if (sourceChunks.length === 0) {
         skippedNoText += 1;
@@ -371,15 +384,20 @@ ${para}`;
       }
       consecutiveFailures = 0;
       const title = (item.getField("title") ?? "").trim();
+      const entry = { title, chunks: accumulated };
+      try {
+        await deps.storage.writeItem(item.key, entry);
+      } catch (err) {
+        if (isAbortError(err)) throw err;
+        failed += 1;
+        deps.onProgress(indexed, failed, total, skippedNoText);
+        continue;
+      }
       currentFile = {
         schemaVersion: CURRENT_SCHEMA_VERSION,
-        items: {
-          ...currentFile.items,
-          [item.key]: { title, chunks: accumulated }
-        },
+        items: { ...currentFile.items, [item.key]: entry },
         indexedAt: (/* @__PURE__ */ new Date()).toISOString()
       };
-      await deps.storage.write(currentFile);
       didWriteThisRun = true;
       indexed += 1;
       if (attachmentTextContributed) {
@@ -611,9 +629,19 @@ ${para}`;
           }
           const controller = new AbortController();
           migrationAbortController = controller;
+          const migrationAccumulator = {
+            schemaVersion: CURRENT_SCHEMA_VERSION,
+            items: {},
+            indexedAt: (/* @__PURE__ */ new Date()).toISOString()
+          };
           const migrationStorage = {
             read: () => Promise.resolve(null),
             write: (file) => deps.storage.writeTmp(file),
+            async writeItem(itemKey, entry) {
+              migrationAccumulator.items[itemKey] = entry;
+              migrationAccumulator.indexedAt = (/* @__PURE__ */ new Date()).toISOString();
+              await deps.storage.writeTmp(migrationAccumulator);
+            },
             clear: () => Promise.resolve(),
             path: () => deps.storage.path()
           };
@@ -1013,9 +1041,10 @@ ${para}`;
     const pause = makeButton("pause-index", "Pause", false);
     const resume = makeButton("resume-index", "Resume", false);
     const clear = makeButton("clear-index", CLEAR_LABEL, false);
-    setDisabled(start, startBlocked(status));
-    setDisabled(pause, status.state !== "running");
-    setDisabled(resume, status.state !== "paused");
+    setVisible(start, !startBlocked(status));
+    setVisible(pause, status.state === "running");
+    setVisible(resume, status.state === "paused");
+    setVisible(clear, true);
     setDisabled(clear, status.migrationActive === true);
     buttons.append(start, pause, resume, clear);
     element.append(summary, buttons);
@@ -1030,9 +1059,10 @@ ${para}`;
     let pendingClearConfirm = false;
     const refreshControls = () => {
       const status = controller.getStatus();
-      setDisabled(startBtn, startBlocked(status));
-      setDisabled(pauseBtn, status.state !== "running");
-      setDisabled(resumeBtn, status.state !== "paused");
+      setVisible(startBtn, !startBlocked(status));
+      setVisible(pauseBtn, status.state === "running");
+      setVisible(resumeBtn, status.state === "paused");
+      setVisible(clearBtn, true);
       setDisabled(clearBtn, status.migrationActive === true);
       if (summary !== null) {
         summary.textContent = composeSummary(status, pendingClearConfirm);
@@ -1132,6 +1162,12 @@ ${para}`;
     button.setAttribute("aria-disabled", disabled ? "true" : "false");
     button.style.opacity = disabled ? "0.5" : "";
     button.style.cursor = disabled ? "default" : "pointer";
+  }
+  function setVisible(button, visible) {
+    if (button === null) {
+      return;
+    }
+    button.hidden = !visible;
   }
   function makeButton(action, label, primary) {
     const button = document.createElement("button");
@@ -1488,21 +1524,14 @@ ${para}`;
     group.setAttribute("style", FIELD_GROUP_STYLE);
     const labelId = `zotero-ai-field-${input.name}`;
     const label = document.createElement("label");
-    label.htmlFor = labelId;
+    label.htmlFor = `${labelId}__picker`;
     label.textContent = input.labelText;
     label.setAttribute("style", FIELD_LABEL_STYLE);
     const row = document.createElement("div");
     row.className = "zotero-ai-model-field__row";
     row.setAttribute("style", MODEL_ROW_STYLE);
-    const field = document.createElement("input");
-    field.id = labelId;
-    field.name = input.name;
-    field.value = input.value;
-    field.type = "text";
-    field.spellcheck = false;
-    field.setAttribute("style", MODEL_INPUT_STYLE);
-    applyFocusRing(field);
     const picker = document.createElement("select");
+    picker.id = `${labelId}__picker`;
     picker.name = input.pickerName;
     picker.dataset.role = "model-picker";
     picker.dataset.targetInput = input.name;
@@ -1520,14 +1549,25 @@ ${para}`;
     refresh.setAttribute("style", BUTTON_BASE_STYLE);
     applyFocusRing(refresh);
     applyHoverState(refresh);
-    row.append(field, picker, refresh);
+    row.append(picker, refresh);
+    const field = document.createElement("input");
+    field.id = labelId;
+    field.name = input.name;
+    field.value = input.value;
+    field.type = "text";
+    field.spellcheck = false;
+    field.dataset.role = "model-custom-input";
+    field.setAttribute("style", `${FIELD_INPUT_STYLE} margin-top: 4px;`);
+    field.setAttribute("aria-label", `${input.labelText} (custom)`);
+    field.hidden = true;
+    applyFocusRing(field);
     const error = document.createElement("p");
     error.className = "zotero-ai-field__error";
     error.dataset.errorFor = input.name;
     error.setAttribute("role", "alert");
     error.setAttribute("style", ERROR_TEXT_STYLE);
     error.hidden = true;
-    group.append(label, row);
+    group.append(label, row, field);
     if (input.hint !== void 0 && input.hint.length > 0) {
       const hintEl = document.createElement("p");
       hintEl.className = "zotero-ai-field__hint";
@@ -1659,7 +1699,7 @@ ${para}`;
     heading.setAttribute("style", SECTION_HEADING_STYLE);
     const blurb = document.createElement("p");
     blurb.className = "zotero-ai-proxy__blurb";
-    blurb.textContent = "Lets the plugin talk to Codex / Claude CLI tools using your existing subscription. Required only if you selected a *-via-Proxy preset above.";
+    blurb.textContent = "Required for Codex / Claude CLI presets. Skip otherwise.";
     blurb.setAttribute("style", SECTION_BLURB_STYLE);
     const statusRow = document.createElement("div");
     statusRow.className = "zotero-ai-proxy__status-row";
@@ -1699,37 +1739,73 @@ ${para}`;
     section.className = "zotero-ai-proxy";
     section.setAttribute("style", `${SECTION_BLOCK_STYLE} ${SECTION_DIVIDER_STYLE}`);
     section.append(heading, blurb, statusRow, errorLine, buttons);
-    if (state.nodeAutoDetectFailed === true) {
-      const banner = document.createElement("p");
-      banner.className = "zotero-ai-proxy__node-banner";
-      banner.dataset.role = "proxy-node-banner";
-      banner.textContent = "Node not found. Install Node.js, or paste the absolute path to your node binary below.";
-      banner.setAttribute(
-        "style",
-        `margin: 0; font-size: 11px; color: ${ERROR_COLOR}; line-height: 1.3;`
-      );
-      section.append(
-        banner,
-        makeField(
-          "proxyNodeBinaryPath",
-          "Node binary path",
-          state.nodeBinaryPath,
-          "Absolute path to a node >= 22 binary."
-        )
-      );
-    } else {
-      const hidden = document.createElement("input");
-      hidden.type = "hidden";
-      hidden.name = "proxyNodeBinaryPath";
-      hidden.value = state.nodeBinaryPath;
-      section.append(hidden);
-    }
+    const banner = document.createElement("p");
+    banner.className = "zotero-ai-proxy__node-banner";
+    banner.dataset.role = "proxy-node-banner";
+    banner.textContent = "Node not found. Install Node.js, click Detect to rescan, or paste the absolute path below.";
+    banner.setAttribute(
+      "style",
+      `margin: 0; font-size: 11px; color: ${ERROR_COLOR}; line-height: 1.3;`
+    );
+    banner.hidden = state.nodeAutoDetectFailed !== true;
+    section.append(banner);
+    const nodeGroup = document.createElement("div");
+    nodeGroup.className = "zotero-ai-field zotero-ai-proxy__node";
+    nodeGroup.dataset.field = "proxyNodeBinaryPath";
+    nodeGroup.setAttribute("style", FIELD_GROUP_STYLE);
+    const nodeLabelId = "zotero-ai-field-proxyNodeBinaryPath";
+    const nodeLabel = document.createElement("label");
+    nodeLabel.htmlFor = nodeLabelId;
+    nodeLabel.textContent = "Node binary path";
+    nodeLabel.setAttribute("style", FIELD_LABEL_STYLE);
+    const nodeRow = document.createElement("div");
+    nodeRow.setAttribute(
+      "style",
+      "display: flex; gap: 8px; align-items: stretch; flex-wrap: nowrap;"
+    );
+    const nodeInput = document.createElement("input");
+    nodeInput.id = nodeLabelId;
+    nodeInput.name = "proxyNodeBinaryPath";
+    nodeInput.type = "text";
+    nodeInput.value = state.nodeBinaryPath;
+    nodeInput.spellcheck = false;
+    nodeInput.setAttribute("style", `${FIELD_INPUT_STYLE} flex: 1 1 auto; min-width: 0;`);
+    applyFocusRing(nodeInput);
+    const detectBtn = makeButton2("detect-node", "Detect", false);
+    detectBtn.dataset.role = "proxy-detect-node";
+    detectBtn.setAttribute("style", `${BUTTON_BASE_STYLE} flex: 0 0 auto;`);
+    nodeRow.append(nodeInput, detectBtn);
+    const nodeHint = document.createElement("p");
+    nodeHint.className = "zotero-ai-field__hint";
+    nodeHint.textContent = "Absolute path to a node >= 22 binary. Click Detect to rescan.";
+    nodeHint.setAttribute(
+      "style",
+      `margin: 2px 0 0 0; font-size: 11px; color: ${FG_MUTED}; line-height: 1.3;`
+    );
+    nodeGroup.append(nodeLabel, nodeRow, nodeHint);
+    section.append(nodeGroup);
     const hiddenScript = document.createElement("input");
     hiddenScript.type = "hidden";
     hiddenScript.name = "proxyServerScriptPath";
     hiddenScript.value = state.serverScriptPath;
     section.append(hiddenScript);
     section.append(makeField("proxyPort", "Proxy port", String(state.port)));
+    const autoStartRow = document.createElement("label");
+    autoStartRow.className = "zotero-ai-proxy__autostart";
+    autoStartRow.setAttribute(
+      "style",
+      "display: flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer;"
+    );
+    const autoStartBox = document.createElement("input");
+    autoStartBox.type = "checkbox";
+    autoStartBox.name = "proxyAutoStart";
+    autoStartBox.dataset.role = "proxy-autostart";
+    autoStartBox.checked = state.autoStart !== false;
+    applyFocusRing(autoStartBox);
+    const autoStartLabel = document.createElement("span");
+    autoStartLabel.textContent = "Start on Zotero launch";
+    autoStartRow.append(autoStartBox, autoStartLabel);
+    section.append(autoStartRow);
     if (state.diagnostics !== void 0) {
       section.append(renderProxyDiagnostics(state.diagnostics));
     }
@@ -1807,7 +1883,7 @@ ${para}`;
     heading.setAttribute("style", SECTION_HEADING_STYLE);
     const blurb = document.createElement("p");
     blurb.className = "zotero-ai-preset__blurb";
-    blurb.textContent = "Pick a preset to fill every field below in one click. Editing any field switches to Custom.";
+    blurb.textContent = "One-click setup. Switches to Custom on any edit.";
     blurb.setAttribute("style", SECTION_BLURB_STYLE);
     const select = makeSelect(
       "preset",
@@ -1826,8 +1902,7 @@ ${para}`;
       "chatProvider",
       "Chat backend",
       profile.chatProvider,
-      CHAT_PROVIDER_OPTIONS,
-      "Routes the 'Explain with AI' requests."
+      CHAT_PROVIDER_OPTIONS
     );
     const chatUrl = makeField("chatBaseUrl", "Chat URL", ollama.chatBaseUrl);
     const chatModel = makeModelField({
@@ -1853,7 +1928,7 @@ ${para}`;
     return makeSection({
       className: "zotero-ai-chat-section",
       heading: "Chat Backend",
-      blurb: "Routes the 'Explain with AI' requests. Codex/Claude via proxy use your existing subscription; OpenAI/Anthropic direct require an API key; Ollama is local and free.",
+      blurb: "Backend that answers Explain / Ask requests.",
       children: [chatProvider, chatUrl, chatModel, openaiKey, anthropicKey]
     });
   }
@@ -1862,8 +1937,7 @@ ${para}`;
       "embedProvider",
       "Embedding backend",
       profile.embedProvider,
-      EMBED_PROVIDER_OPTIONS,
-      "Selects which embedding service builds the library index."
+      EMBED_PROVIDER_OPTIONS
     );
     const embedUrl = makeField("embedBaseUrl", "Embedding URL", ollama.embedBaseUrl);
     const embedModel = makeModelField({
@@ -1882,7 +1956,7 @@ ${para}`;
     return makeSection({
       className: "zotero-ai-embed-section",
       heading: "Embedding Backend",
-      blurb: "Used for library indexing and semantic search. Each model produces a different index file, so switching providers preserves your other indexes.",
+      blurb: "Backend that builds and queries the library index.",
       children: [embedProvider, embedUrl, embedModel, geminiKey]
     });
   }
@@ -1892,7 +1966,7 @@ ${para}`;
     element.setAttribute("style", `${ROOT_STYLE} ${FORM_STACK_STYLE}`);
     const intro = document.createElement("p");
     intro.className = "zotero-ai-settings__intro";
-    intro.textContent = "Pick a preset for a one-click setup, or fine-tune each section below.";
+    intro.textContent = "Pick a preset for a one-click setup, or fine-tune below.";
     intro.setAttribute("style", `${MUTED_TEXT_STYLE} line-height: 1.4;`);
     const privacy = document.createElement("p");
     privacy.className = "zotero-ai-settings__privacy";
@@ -1928,7 +2002,7 @@ ${para}`;
       element.append(renderEmbedSection(inputData.settings, inputData.providerProfile));
       const apiWarning = document.createElement("p");
       apiWarning.className = "zotero-ai-providers__warning";
-      apiWarning.textContent = "API keys are stored locally in Zotero's preferences file (plain text inside your OS user profile). Treat this machine as trusted.";
+      apiWarning.textContent = "API keys are stored in plain text in Zotero's preferences.";
       apiWarning.setAttribute("style", SECTION_BLURB_STYLE);
       element.append(apiWarning);
       updateApiKeyVisibility(element, {
@@ -1952,10 +2026,10 @@ ${para}`;
     indexHeading.setAttribute("style", SECTION_HEADING_STYLE);
     const indexBlurb = document.createElement("p");
     indexBlurb.className = "zotero-ai-library-index__blurb";
-    indexBlurb.textContent = "Indexes title + abstract + cached PDF text per item. Run once after setting up; subsequent runs resume.";
+    indexBlurb.textContent = "Embeds your library for retrieval. Resumes on re-run.";
     indexBlurb.setAttribute("style", SECTION_BLURB_STYLE);
     indexSection.append(indexHeading, indexBlurb, renderIndexControls(inputData.indexStatus));
-    element.append(actions, privacy, indexSection);
+    element.append(indexSection, actions, privacy);
     if (inputData.providerProfile === void 0 && inputData.proxy !== void 0) {
       element.append(renderProxySection(inputData.proxy));
     }
@@ -2264,6 +2338,7 @@ ${para}`;
         picker.disabled = false;
         return;
       }
+      const valueIsKnown = state.models.includes(currentValue);
       if (state.models.length === 0) {
         const placeholder = document.createElement("option");
         placeholder.value = "";
@@ -2287,8 +2362,21 @@ ${para}`;
       const customOpt = document.createElement("option");
       customOpt.value = MODEL_DROPDOWN_CUSTOM;
       customOpt.textContent = "Custom...";
+      if (!valueIsKnown && currentValue.length > 0) {
+        customOpt.selected = true;
+      }
       picker.append(customOpt);
       picker.disabled = false;
+      syncCustomInputVisibility(target);
+    }
+    function syncCustomInputVisibility(target) {
+      const picker = root.querySelector(
+        `[data-role="model-picker"][data-target-input="${target}"]`
+      );
+      const field = inputs[target];
+      if (picker === null || field === null) return;
+      const showInput = picker.value === MODEL_DROPDOWN_CUSTOM || picker.value === "";
+      field.hidden = !showInput;
     }
     function triggerDiscovery(target) {
       if (discovery === void 0) return;
@@ -2347,13 +2435,18 @@ ${para}`;
       const handler = () => {
         const v = picker.value;
         if (v === MODEL_DROPDOWN_CUSTOM) {
+          targetInput.hidden = false;
           targetInput.value = "";
           targetInput.focus();
           markPresetCustom();
           return;
         }
-        if (v === "") return;
+        if (v === "") {
+          targetInput.hidden = false;
+          return;
+        }
         targetInput.value = v;
+        targetInput.hidden = true;
         markPresetCustom();
       };
       picker.addEventListener("change", handler);
@@ -2365,7 +2458,8 @@ ${para}`;
     }
     const proxyButtons = {
       start: root.querySelector('[data-action="start-proxy"]'),
-      stop: root.querySelector('[data-action="stop-proxy"]')
+      stop: root.querySelector('[data-action="stop-proxy"]'),
+      detect: root.querySelector('[data-action="detect-node"]')
     };
     const proxyStatusEl = root.querySelector('[data-role="proxy-status"]');
     const proxyMessageEl = root.querySelector('[data-role="proxy-message"]');
@@ -2448,8 +2542,29 @@ ${para}`;
         }
       })();
     };
+    const autoStartCheckbox = root.querySelector('[data-role="proxy-autostart"]');
+    const onAutoStartToggle = () => {
+      if (autoStartCheckbox === null || input.proxy?.setAutoStart === void 0) return;
+      input.proxy.setAutoStart(autoStartCheckbox.checked);
+    };
+    autoStartCheckbox?.addEventListener("change", onAutoStartToggle);
+    const onDetectNode = (event) => {
+      event.preventDefault();
+      const detect = input.proxy?.detect;
+      if (detect === void 0) return;
+      const result = detect();
+      const nodeInput = root.querySelector('[name="proxyNodeBinaryPath"]');
+      if (nodeInput !== null) {
+        nodeInput.value = result.autoDetectFailed ? "" : result.path;
+      }
+      const banner = root.querySelector('[data-role="proxy-node-banner"]');
+      if (banner !== null) {
+        banner.hidden = !result.autoDetectFailed;
+      }
+    };
     proxyButtons.start?.addEventListener("click", onStartProxy);
     proxyButtons.stop?.addEventListener("click", onStopProxy);
+    proxyButtons.detect?.addEventListener("click", onDetectNode);
     return {
       detach() {
         saveButton?.removeEventListener("click", onSaveClick);
@@ -2472,6 +2587,8 @@ ${para}`;
         pendingTimers.clear();
         proxyButtons.start?.removeEventListener("click", onStartProxy);
         proxyButtons.stop?.removeEventListener("click", onStopProxy);
+        proxyButtons.detect?.removeEventListener("click", onDetectNode);
+        autoStartCheckbox?.removeEventListener("change", onAutoStartToggle);
       }
     };
   }
@@ -2568,7 +2685,7 @@ ${para}`;
     if (state.externallyManaged === true) return `External on :${String(state.port)}`;
     return `Running on :${String(state.port)}`;
   }
-  var SETTINGS_FIELDS, MODEL_DROPDOWN_CUSTOM, ERROR_COLOR, SUCCESS_COLOR, ERROR_TEXT_STYLE, STATUS_TEXT_STYLE, STATUS_PILL_BASE_STYLE, STATUS_PILL_RUNNING_STYLE, STATUS_PILL_STOPPED_STYLE, MODEL_ROW_STYLE, MODEL_INPUT_STYLE, MODEL_SELECT_STYLE, CHAT_PROVIDER_OPTIONS, EMBED_PROVIDER_OPTIONS;
+  var SETTINGS_FIELDS, MODEL_DROPDOWN_CUSTOM, ERROR_COLOR, SUCCESS_COLOR, ERROR_TEXT_STYLE, STATUS_TEXT_STYLE, STATUS_PILL_BASE_STYLE, STATUS_PILL_RUNNING_STYLE, STATUS_PILL_STOPPED_STYLE, MODEL_ROW_STYLE, MODEL_SELECT_STYLE, CHAT_PROVIDER_OPTIONS, EMBED_PROVIDER_OPTIONS;
   var init_settings_view = __esm({
     "src/ui/settings-view.ts"() {
       "use strict";
@@ -2596,8 +2713,7 @@ ${para}`;
       STATUS_PILL_RUNNING_STYLE = `${STATUS_PILL_BASE_STYLE} background: rgba(29, 131, 72, 0.15); color: var(--accent-green, #1d8348);`;
       STATUS_PILL_STOPPED_STYLE = `${STATUS_PILL_BASE_STYLE} background: rgba(127, 127, 127, 0.15); color: ${FG_MUTED};`;
       MODEL_ROW_STYLE = "display: flex; gap: 6px; align-items: stretch; flex-wrap: wrap;";
-      MODEL_INPUT_STYLE = `${FIELD_INPUT_STYLE} flex: 1 1 200px; min-width: 0;`;
-      MODEL_SELECT_STYLE = `${FIELD_INPUT_STYLE} flex: 0 1 220px; min-width: 0;`;
+      MODEL_SELECT_STYLE = `${FIELD_INPUT_STYLE} flex: 1 1 200px; min-width: 0;`;
       CHAT_PROVIDER_OPTIONS = [
         { value: "ollama", label: "Ollama (local)" },
         { value: "codex-cli", label: "Codex CLI (via proxy)" },
@@ -3254,6 +3370,13 @@ ${para}`;
   function computeIndexFileName(input) {
     return `${FILE_PREFIX}-${input.provider}-${slugifyModel(input.model)}.json`;
   }
+  function computeIndexDirName(input) {
+    return `${FILE_PREFIX}-${input.provider}-${slugifyModel(input.model)}`;
+  }
+  function computeItemFileName(itemKey) {
+    return `${itemKey}.json`;
+  }
+  var META_FILE_NAME = "_meta.json";
   var LEGACY_INDEX_FILE_NAME = LEGACY_FILE_NAME;
 
   // src/indexing/index-storage.ts
@@ -3272,19 +3395,129 @@ ${para}`;
     return true;
   }
   function createIndexStorage(deps) {
-    const fileName = deps.embedProvider !== void 0 ? computeIndexFileName({
-      provider: deps.embedProvider.kind,
-      model: deps.embedProvider.model
-    }) : LEGACY_FILE_NAME2;
+    const providerInput = deps.embedProvider !== void 0 ? { provider: deps.embedProvider.kind, model: deps.embedProvider.model } : null;
+    const fileName = providerInput !== null ? computeIndexFileName(providerInput) : LEGACY_FILE_NAME2;
     const filePath = joinPath(deps.zotero.DataDirectory.dir, fileName);
-    const legacyFilePath = joinPath(deps.zotero.DataDirectory.dir, LEGACY_FILE_NAME2);
     const metaPath = `${filePath.replace(/\.json$/u, "")}.meta.json`;
     const tmpPath = `${filePath}.tmp`;
     const markerPath = `${filePath}.migrating`;
-    function isLegacyEligible() {
-      if (deps.embedProvider === void 0) return false;
-      if (deps.embedProvider.kind !== "ollama") return false;
-      return deps.embedProvider.model.trim().toLowerCase() === "embeddinggemma";
+    const dirName = providerInput !== null ? computeIndexDirName(providerInput) : LEGACY_FILE_NAME2.replace(/\.json$/u, "");
+    const dirPath = joinPath(deps.zotero.DataDirectory.dir, dirName);
+    const dirMetaPath = joinPath(dirPath, META_FILE_NAME);
+    async function writeDirFileAtomic(path, contents) {
+      await deps.io.writeString(path, contents);
+    }
+    let dirEnsured = false;
+    let dirMetaCache = null;
+    let knownItemKeys = null;
+    let opsQueue = Promise.resolve();
+    function enqueueOp(task) {
+      const next = opsQueue.then(task, task);
+      opsQueue = next.catch(() => void 0);
+      return next;
+    }
+    async function ensureDir() {
+      if (dirEnsured) return;
+      if (typeof deps.io.makeDirectory !== "function") {
+        dirEnsured = true;
+        return;
+      }
+      try {
+        await deps.io.makeDirectory(dirPath);
+      } catch {
+      }
+      dirEnsured = true;
+    }
+    async function readDirMeta() {
+      if (!await deps.io.exists(dirMetaPath)) return null;
+      try {
+        const raw = await deps.io.readString(dirMetaPath);
+        const parsed = JSON.parse(raw);
+        if (typeof parsed !== "object" || parsed === null) return null;
+        const rec = parsed;
+        const itemCount = typeof rec.itemCount === "number" && Number.isFinite(rec.itemCount) && rec.itemCount >= 0 ? rec.itemCount : 0;
+        const indexedAt = typeof rec.indexedAt === "string" ? rec.indexedAt : "";
+        const schemaVersion = typeof rec.schemaVersion === "number" ? rec.schemaVersion : void 0;
+        return {
+          itemCount,
+          indexedAt,
+          ...schemaVersion !== void 0 ? { schemaVersion } : {}
+        };
+      } catch {
+        return null;
+      }
+    }
+    async function readFromDir() {
+      if (typeof deps.io.listChildren !== "function") return null;
+      if (!await deps.io.exists(dirPath)) return null;
+      const names = await deps.io.listChildren(dirPath);
+      if (names === null) return null;
+      const targets = names.filter((n) => n !== META_FILE_NAME && n.endsWith(".json")).filter((n) => isSafeItemFileName(n)).slice().sort();
+      const entries = await Promise.all(
+        targets.map(async (name) => {
+          const itemKey = name.slice(0, -".json".length);
+          try {
+            const raw = await deps.io.readString(joinPath(dirPath, name));
+            const parsed = JSON.parse(raw);
+            if (typeof parsed !== "object" || parsed === null) return null;
+            const rec = parsed;
+            const title = typeof rec.title === "string" ? rec.title : "";
+            const chunks = Array.isArray(rec.chunks) ? rec.chunks : [];
+            return [itemKey, { title, chunks }];
+          } catch {
+            return null;
+          }
+        })
+      );
+      const items = {};
+      for (const entry of entries) {
+        if (entry === null) continue;
+        const [k, v] = entry;
+        items[k] = v;
+      }
+      const meta = await readDirMeta();
+      return {
+        schemaVersion: meta?.schemaVersion ?? CURRENT_SCHEMA_VERSION,
+        items,
+        indexedAt: meta?.indexedAt && meta.indexedAt.length > 0 ? meta.indexedAt : (/* @__PURE__ */ new Date(0)).toISOString()
+      };
+    }
+    function isSafeItemFileName(name) {
+      if (!name.endsWith(".json")) return false;
+      const stem = name.slice(0, -".json".length);
+      if (stem.length === 0) return false;
+      if (stem.includes("/") || stem.includes("\\")) return false;
+      if (stem === "." || stem === "..") return false;
+      if (stem.startsWith(".") || stem.startsWith("_")) return false;
+      const reserved = /* @__PURE__ */ new Set([
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        "com1",
+        "com2",
+        "com3",
+        "com4",
+        "com5",
+        "com6",
+        "com7",
+        "com8",
+        "com9",
+        "lpt1",
+        "lpt2",
+        "lpt3",
+        "lpt4",
+        "lpt5",
+        "lpt6",
+        "lpt7",
+        "lpt8",
+        "lpt9"
+      ]);
+      if (reserved.has(stem.toLowerCase())) return false;
+      return true;
+    }
+    function isSafeItemKey(itemKey) {
+      return isSafeItemFileName(`${itemKey}.json`);
     }
     async function tryReadParsed(path) {
       if (!await deps.io.exists(path)) {
@@ -3308,14 +3541,15 @@ ${para}`;
       return parsed;
     }
     async function readPure() {
+      const fromDir = await readFromDir();
+      if (fromDir !== null && Object.keys(fromDir.items).length > 0) {
+        return fromDir;
+      }
       const primary = await tryReadParsed(filePath);
       if (primary !== null) {
         return primary;
       }
-      if (filePath === legacyFilePath || !isLegacyEligible()) {
-        return null;
-      }
-      return tryReadParsed(legacyFilePath);
+      return fromDir;
     }
     async function removeMarkerImpl() {
       if (await deps.io.exists(markerPath)) {
@@ -3342,124 +3576,310 @@ ${para}`;
       } catch {
         metaComponent = "absent";
       }
+      let dirMetaSize = -1;
+      let dirMetaLastModified = -1;
+      try {
+        const s = await deps.io.stat(dirMetaPath);
+        if (s !== null) {
+          dirMetaSize = s.size;
+          if (typeof s.lastModified === "number" && Number.isFinite(s.lastModified)) {
+            dirMetaLastModified = s.lastModified;
+          }
+        }
+      } catch {
+      }
+      let dirChildCount = -1;
+      if (typeof deps.io.listChildren === "function") {
+        try {
+          if (await deps.io.exists(dirPath)) {
+            const names = await deps.io.listChildren(dirPath);
+            if (names !== null) {
+              let n = 0;
+              for (const name of names) {
+                if (name === META_FILE_NAME) continue;
+                if (!name.endsWith(".json")) continue;
+                n += 1;
+              }
+              dirChildCount = n;
+            }
+          }
+        } catch {
+        }
+      }
       return JSON.stringify({
         meta: metaComponent,
         size: primaryStat.size,
         // Guaranteed a finite number by the guard above.
-        lastModified: primaryStat.lastModified
+        lastModified: primaryStat.lastModified,
+        dirMetaSize,
+        dirMetaLastModified,
+        dirChildCount
       });
     }
     function invalidateCache() {
       cache = null;
     }
+    async function readItemCountImpl() {
+      if (typeof deps.io.listChildren === "function") {
+        const dirExists = await deps.io.exists(dirPath);
+        if (dirExists) {
+          const meta = await readDirMeta();
+          let actualCount;
+          if (knownItemKeys !== null) {
+            actualCount = knownItemKeys.size;
+          } else {
+            const names = await deps.io.listChildren(dirPath);
+            if (names === null) {
+              if (meta !== null) return meta.itemCount;
+              return 0;
+            }
+            let count = 0;
+            for (const name of names) {
+              if (name === META_FILE_NAME) continue;
+              if (!isSafeItemFileName(name)) continue;
+              count += 1;
+            }
+            actualCount = count;
+          }
+          if (meta?.itemCount !== actualCount) {
+            const healed = {
+              schemaVersion: meta?.schemaVersion ?? CURRENT_SCHEMA_VERSION,
+              indexedAt: meta?.indexedAt ?? (/* @__PURE__ */ new Date(0)).toISOString(),
+              itemCount: actualCount
+            };
+            try {
+              await writeDirFileAtomic(dirMetaPath, JSON.stringify(healed));
+              dirMetaCache = { ...healed };
+            } catch {
+            }
+          }
+          return actualCount;
+        }
+      }
+      const primaryExists = await deps.io.exists(filePath);
+      if (primaryExists && await deps.io.exists(metaPath)) {
+        try {
+          const raw = await deps.io.readString(metaPath);
+          const parsed = JSON.parse(raw);
+          if (typeof parsed === "object" && parsed !== null && "itemCount" in parsed) {
+            const candidate = parsed.itemCount;
+            if (typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0) {
+              return candidate;
+            }
+          }
+        } catch {
+        }
+      }
+      const file = await tryReadParsed(filePath);
+      if (file === null) return 0;
+      const itemCount = Object.keys(file.items).length;
+      if (itemCount > 0) {
+        try {
+          const meta = { itemCount, indexedAt: file.indexedAt };
+          await deps.io.writeString(metaPath, JSON.stringify(meta));
+        } catch {
+        }
+      }
+      return itemCount;
+    }
     return {
       path() {
         return filePath;
       },
-      async read() {
-        const fingerprint = await computeFingerprint();
-        if (fingerprint !== null && cache !== null && cache.fingerprint === fingerprint) {
-          return cache.file;
-        }
-        const file = await readPure();
-        if (fingerprint !== null && file !== null) {
-          cache = { fingerprint, file };
-        } else {
-          cache = null;
-        }
-        return file;
-      },
-      async readItemCount() {
-        const primaryExists = await deps.io.exists(filePath);
-        if (primaryExists && await deps.io.exists(metaPath)) {
-          try {
-            const raw = await deps.io.readString(metaPath);
-            const parsed = JSON.parse(raw);
-            if (typeof parsed === "object" && parsed !== null && "itemCount" in parsed) {
-              const candidate = parsed.itemCount;
-              if (typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0) {
-                return candidate;
-              }
-            }
-          } catch {
+      read() {
+        return enqueueOp(async () => {
+          const fingerprint = await computeFingerprint();
+          if (fingerprint !== null && cache !== null && cache.fingerprint === fingerprint) {
+            return cache.file;
           }
-        }
-        const file = await (async () => {
-          const primary = await tryReadParsed(filePath);
-          if (primary !== null) return primary;
-          if (filePath === legacyFilePath || !isLegacyEligible()) return null;
-          return tryReadParsed(legacyFilePath);
-        })();
-        if (file === null) return 0;
-        const itemCount = Object.keys(file.items).length;
-        if (itemCount > 0) {
-          try {
-            const meta = { itemCount, indexedAt: file.indexedAt };
-            await deps.io.writeString(metaPath, JSON.stringify(meta));
-          } catch {
+          const file = await readPure();
+          if (fingerprint !== null && file !== null) {
+            cache = { fingerprint, file };
+          } else {
+            cache = null;
           }
-        }
-        return itemCount;
+          return file;
+        });
       },
-      async readWithMigration() {
-        const file = await readPure();
-        const markerPresent = await deps.io.exists(markerPath);
-        const schemaVersion = file?.schemaVersion ?? 1;
-        const migrationPending = markerPresent || schemaVersion < CURRENT_SCHEMA_VERSION;
-        return { file, migrationPending };
+      readItemCount() {
+        return enqueueOp(readItemCountImpl);
       },
-      async writeTmp(file) {
-        await deps.io.writeString(tmpPath, JSON.stringify(file));
+      readWithMigration() {
+        return enqueueOp(async () => {
+          const file = await readPure();
+          const markerPresent = await deps.io.exists(markerPath);
+          const schemaVersion = file?.schemaVersion ?? 1;
+          const migrationPending = markerPresent || schemaVersion < CURRENT_SCHEMA_VERSION;
+          return { file, migrationPending };
+        });
       },
-      async commitMigration() {
-        await deps.io.rename(tmpPath, filePath);
-        invalidateCache();
-        await removeMarkerImpl();
+      writeTmp(file) {
+        return enqueueOp(async () => {
+          await deps.io.writeString(tmpPath, JSON.stringify(file));
+        });
       },
-      async abandonMigration() {
-        if (await deps.io.exists(tmpPath)) {
-          try {
-            await deps.io.remove(tmpPath);
-          } catch {
-          }
-        }
+      commitMigration() {
+        return enqueueOp(async () => {
+          await deps.io.rename(tmpPath, filePath);
+          invalidateCache();
+          dirMetaCache = null;
+          knownItemKeys = null;
+          await removeMarkerImpl();
+        });
       },
-      async writeMarker() {
-        await deps.io.writeString(markerPath, (/* @__PURE__ */ new Date()).toISOString());
-      },
-      removeMarker() {
-        return removeMarkerImpl();
-      },
-      hasMarker() {
-        return deps.io.exists(markerPath);
-      },
-      async write(file) {
-        invalidateCache();
-        const serialized = JSON.stringify(file);
-        await deps.io.writeString(filePath, serialized);
-        try {
-          const meta = {
-            itemCount: Object.keys(file.items).length,
-            indexedAt: file.indexedAt
-          };
-          await deps.io.writeString(metaPath, JSON.stringify(meta));
-        } catch {
-        }
-      },
-      async clear() {
-        invalidateCache();
-        const removeIfPresent = async (path) => {
-          if (await deps.io.exists(path)) {
+      abandonMigration() {
+        return enqueueOp(async () => {
+          if (await deps.io.exists(tmpPath)) {
             try {
-              await deps.io.remove(path);
+              await deps.io.remove(tmpPath);
             } catch {
             }
           }
-        };
-        await removeIfPresent(filePath);
-        await removeIfPresent(metaPath);
-        await removeIfPresent(tmpPath);
-        await removeIfPresent(markerPath);
+        });
+      },
+      writeMarker() {
+        return enqueueOp(async () => {
+          await deps.io.writeString(markerPath, (/* @__PURE__ */ new Date()).toISOString());
+        });
+      },
+      removeMarker() {
+        return enqueueOp(removeMarkerImpl);
+      },
+      hasMarker() {
+        return enqueueOp(() => deps.io.exists(markerPath));
+      },
+      write(file) {
+        return enqueueOp(async () => {
+          invalidateCache();
+          dirMetaCache = null;
+          const incomingKeys = new Set(Object.keys(file.items).filter(isSafeItemKey));
+          await ensureDir();
+          if (typeof deps.io.listChildren === "function") {
+            const existingNames = await deps.io.listChildren(dirPath);
+            if (existingNames !== null) {
+              for (const name of existingNames) {
+                if (name === META_FILE_NAME) continue;
+                if (!isSafeItemFileName(name)) continue;
+                const k = name.slice(0, -".json".length);
+                if (incomingKeys.has(k)) continue;
+                try {
+                  await deps.io.remove(joinPath(dirPath, name));
+                } catch (cause) {
+                  throw new Error(
+                    `index-storage.write: failed to remove orphaned per-item file ${name} \u2014 refusing to complete write (a silent success would resurrect deleted items on the next read).`,
+                    { cause: cause instanceof Error ? cause : new Error(String(cause)) }
+                  );
+                }
+              }
+            }
+          }
+          knownItemKeys = new Set(incomingKeys);
+          for (const [itemKey, entry] of Object.entries(file.items)) {
+            if (!isSafeItemKey(itemKey)) continue;
+            const itemPath = joinPath(dirPath, computeItemFileName(itemKey));
+            await writeDirFileAtomic(itemPath, JSON.stringify(entry));
+          }
+          const dirMeta = {
+            schemaVersion: file.schemaVersion,
+            indexedAt: file.indexedAt,
+            itemCount: incomingKeys.size
+          };
+          try {
+            await writeDirFileAtomic(dirMetaPath, JSON.stringify(dirMeta));
+          } catch {
+          }
+          dirMetaCache = { ...dirMeta };
+          const serialized = JSON.stringify(file);
+          await deps.io.writeString(filePath, serialized);
+          try {
+            const meta = {
+              itemCount: incomingKeys.size,
+              indexedAt: file.indexedAt
+            };
+            await deps.io.writeString(metaPath, JSON.stringify(meta));
+          } catch {
+          }
+        });
+      },
+      writeItem(itemKey, entry) {
+        return enqueueOp(async () => {
+          if (!isSafeItemKey(itemKey)) {
+            throw new Error(`Refusing to persist unsafe itemKey: ${JSON.stringify(itemKey)}`);
+          }
+          invalidateCache();
+          await ensureDir();
+          const itemPath = joinPath(dirPath, computeItemFileName(itemKey));
+          if (knownItemKeys === null) {
+            const names = typeof deps.io.listChildren === "function" ? await deps.io.listChildren(dirPath) : null;
+            const keys = /* @__PURE__ */ new Set();
+            for (const name of names ?? []) {
+              if (name === META_FILE_NAME) continue;
+              if (!isSafeItemFileName(name)) continue;
+              keys.add(name.slice(0, -".json".length));
+            }
+            knownItemKeys = keys;
+          }
+          if (dirMetaCache === null) {
+            const onDisk = await readDirMeta();
+            dirMetaCache = onDisk !== null ? {
+              schemaVersion: onDisk.schemaVersion ?? CURRENT_SCHEMA_VERSION,
+              indexedAt: onDisk.indexedAt,
+              itemCount: onDisk.itemCount
+            } : {
+              schemaVersion: CURRENT_SCHEMA_VERSION,
+              indexedAt: (/* @__PURE__ */ new Date(0)).toISOString(),
+              itemCount: knownItemKeys.size
+            };
+          }
+          const keyExisted = knownItemKeys.has(itemKey);
+          await writeDirFileAtomic(itemPath, JSON.stringify(entry));
+          knownItemKeys.add(itemKey);
+          const nextMeta = {
+            schemaVersion: dirMetaCache.schemaVersion,
+            indexedAt: (/* @__PURE__ */ new Date()).toISOString(),
+            itemCount: keyExisted ? dirMetaCache.itemCount : dirMetaCache.itemCount + 1
+          };
+          dirMetaCache = nextMeta;
+          try {
+            await writeDirFileAtomic(dirMetaPath, JSON.stringify(nextMeta));
+          } catch {
+          }
+        });
+      },
+      clear() {
+        return enqueueOp(async () => {
+          invalidateCache();
+          dirEnsured = false;
+          dirMetaCache = null;
+          knownItemKeys = null;
+          const removeIfPresent = async (path) => {
+            if (await deps.io.exists(path)) {
+              try {
+                await deps.io.remove(path);
+              } catch {
+              }
+            }
+          };
+          if (typeof deps.io.removeDirectory === "function") {
+            try {
+              await deps.io.removeDirectory(dirPath);
+            } catch {
+            }
+          }
+          if (typeof deps.io.listChildren === "function" && await deps.io.exists(dirPath)) {
+            const names = await deps.io.listChildren(dirPath);
+            if (names !== null) {
+              for (const name of names) {
+                await removeIfPresent(joinPath(dirPath, name));
+              }
+            }
+          }
+          await removeIfPresent(dirMetaPath);
+          await removeIfPresent(filePath);
+          await removeIfPresent(metaPath);
+          await removeIfPresent(tmpPath);
+          await removeIfPresent(markerPath);
+        });
       }
     };
   }
@@ -4278,7 +4698,36 @@ Question: ${input.question}`;
       `display: flex; flex-direction: column; height: 100%; font-family: ${FONT_STACK};`
     );
     const styleTag = document.createElement("style");
-    styleTag.textContent = MARKDOWN_CSS;
+    styleTag.textContent = `${MARKDOWN_CSS}
+    .zotero-ai-explain-sidebar__turn {
+      max-width: 88%;
+      padding: 8px 12px;
+      border-radius: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .zotero-ai-explain-sidebar__turn[data-role="assistant"] {
+      align-self: flex-start;
+      background: rgba(127, 127, 127, 0.15);
+      border-bottom-left-radius: 4px;
+    }
+    .zotero-ai-explain-sidebar__turn[data-role="user"] {
+      align-self: flex-end;
+      background: rgba(64, 128, 255, 0.22);
+      border-bottom-right-radius: 4px;
+    }
+    .zotero-ai-explain-sidebar__role {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      margin: -1px;
+      padding: 0;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }`;
     const header = document.createElement("header");
     header.className = "zotero-ai-explain-sidebar__header";
     header.setAttribute(
@@ -4317,6 +4766,7 @@ Question: ${input.question}`;
       "list-style: none; margin: 0; padding: 12px 16px; flex: 1 1 auto; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;"
     );
     for (const message of input.messages) {
+      if (message.role === "system") continue;
       messages.append(renderMessage2(message));
     }
     const form = document.createElement("form");
@@ -4342,8 +4792,8 @@ Question: ${input.question}`;
   }
   function renderMessage2(message) {
     const row = document.createElement("li");
+    row.className = "zotero-ai-explain-sidebar__turn";
     row.dataset.role = message.role;
-    row.setAttribute("style", "display: flex; flex-direction: column; gap: 2px;");
     const attribution = document.createElement("span");
     attribution.className = "zotero-ai-explain-sidebar__role";
     attribution.textContent = `${message.role}: `;
@@ -6079,8 +6529,28 @@ Question: First question about the passage?`
   var NODE_BINARY_CANDIDATES = [
     "/opt/homebrew/bin/node",
     "/usr/local/bin/node",
-    "/usr/bin/node"
+    "/usr/bin/node",
+    // Windows: default Program Files install location for both the
+    // official MSI and Chocolatey package. Subprocess.call accepts the
+    // full path; %PATH% is not searched in chrome context.
+    "C:\\Program Files\\nodejs\\node.exe",
+    "C:\\Program Files (x86)\\nodejs\\node.exe"
   ];
+  function homeRelativeNodeCandidates(homeDir) {
+    const sep = homeDir.includes("\\") ? "\\" : "/";
+    const join = (...parts) => [homeDir, ...parts].join(sep);
+    return [
+      // volta — single canonical bin shim that resolves the active version.
+      join(".volta", "bin", "node"),
+      // asdf — shim file dispatches to whichever version is active in the
+      // user's `.tool-versions`. Reliable across version changes.
+      join(".asdf", "shims", "node"),
+      // fnm — `default` alias is the shell-default Node binary.
+      join(".local", "share", "fnm", "aliases", "default", "bin", "node"),
+      // n (TJ's manager) — installs to ~/n/bin in single-user mode.
+      join("n", "bin", "node")
+    ];
+  }
   function wireProxyLifecycle(deps) {
     const debug = deps.debug ?? (() => void 0);
     const pathExists = deps.pathExists ?? (() => {
@@ -6089,25 +6559,26 @@ Question: First question about the passage?`
     const persistedNode = trimOrUndefined(deps.prefs?.get(PROXY_NODE_BINARY_PREF));
     const persistedScript = trimOrUndefined(deps.prefs?.get(PROXY_SERVER_SCRIPT_PREF));
     const persistedPort = parsePort(deps.prefs?.get(PROXY_PORT_PREF));
-    const detection = persistedNode !== void 0 ? { path: persistedNode, autoDetectFailed: false } : detectNodeBinaryWithStatus({
+    const runDetection = () => detectNodeBinaryWithStatus({
       ...deps.whichRunner !== void 0 ? { whichRunner: deps.whichRunner } : {},
+      ...deps.homeDir !== void 0 ? { homeDir: deps.homeDir } : {},
       pathExists
     });
+    const detection = persistedNode !== void 0 ? { path: persistedNode, autoDetectFailed: false } : runDetection();
     let nodeBinaryPath = detection.path;
     let nodeAutoDetectFailed = detection.autoDetectFailed;
     let serverScriptPath = persistedScript ?? deps.defaultServerScriptPath ?? "";
     let port = persistedPort ?? DEFAULT_PROXY_PORT;
     let lastError;
     let diagnostics;
+    let spawnInFlight = false;
     let generation = 0;
     let lifecycle = buildLifecycle();
     let exitUnsub = lifecycle.onExit(handleExit);
     function readConsentEnv() {
       const value = deps.prefs?.get(PROXY_CONFIG_READ_CONSENT_PREF)?.trim();
-      if (value === "always") {
-        return { LLM_PROXY_CONFIG_READ: "allow" };
-      }
-      return void 0;
+      if (value === "never") return void 0;
+      return { LLM_PROXY_CONFIG_READ: "allow" };
     }
     function buildLifecycle() {
       const consentEnv = readConsentEnv();
@@ -6134,6 +6605,10 @@ Question: First question about the passage?`
       }
       deps.onStateChange?.(snapshot());
     }
+    function readAutoStartPref() {
+      const value = deps.prefs?.get(PROXY_AUTOSTART_PREF)?.trim();
+      return value !== "false";
+    }
     function snapshot() {
       const tracked = lifecycle.trackedPid();
       const externallyManaged = lifecycle.isExternallyManaged();
@@ -6144,6 +6619,7 @@ Question: First question about the passage?`
         serverScriptPath,
         nodeAutoDetectFailed,
         externallyManaged,
+        autoStart: readAutoStartPref(),
         ...lastError !== void 0 ? { lastError } : {},
         ...diagnostics !== void 0 ? { diagnostics } : {}
       };
@@ -6230,6 +6706,14 @@ Question: First question about the passage?`
       return false;
     }
     async function start() {
+      spawnInFlight = true;
+      try {
+        return await startInner();
+      } finally {
+        spawnInFlight = false;
+      }
+    }
+    async function startInner() {
       lastError = void 0;
       diagnostics = void 0;
       generation += 1;
@@ -6280,10 +6764,45 @@ Question: First question about the passage?`
         }
       }
       const tracked = lifecycle.trackedPid();
-      if (tracked === null) {
+      if (tracked === null && !spawnInFlight) {
         exitUnsub();
         lifecycle = buildLifecycle();
         exitUnsub = lifecycle.onExit(handleExit);
+      }
+      deps.onStateChange?.(snapshot());
+      return snapshot();
+    }
+    function redetectNode() {
+      const fresh = runDetection();
+      nodeBinaryPath = fresh.path;
+      nodeAutoDetectFailed = fresh.autoDetectFailed;
+      if (deps.prefs !== void 0 && !nodeAutoDetectFailed) {
+        try {
+          deps.prefs.set(PROXY_NODE_BINARY_PREF, nodeBinaryPath);
+        } catch (err) {
+          debug(
+            `proxy-lifecycle: pref write failed ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      }
+      const tracked = lifecycle.trackedPid();
+      if (tracked === null && !spawnInFlight) {
+        exitUnsub();
+        lifecycle = buildLifecycle();
+        exitUnsub = lifecycle.onExit(handleExit);
+      }
+      deps.onStateChange?.(snapshot());
+      return snapshot();
+    }
+    function setAutoStart(enabled) {
+      if (deps.prefs !== void 0) {
+        try {
+          deps.prefs.set(PROXY_AUTOSTART_PREF, enabled ? "true" : "false");
+        } catch (err) {
+          debug(
+            `proxy-lifecycle: pref write failed ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
       }
       deps.onStateChange?.(snapshot());
       return snapshot();
@@ -6295,7 +6814,8 @@ Question: First question about the passage?`
         exitUnsub();
       }
     }
-    const autoStart = deps.autoStartOverride ?? deps.prefs?.get(PROXY_AUTOSTART_PREF)?.trim() === "true";
+    const autoStartPref = deps.prefs?.get(PROXY_AUTOSTART_PREF)?.trim();
+    const autoStart = deps.autoStartOverride ?? autoStartPref !== "false";
     if (autoStart) {
       void start();
     }
@@ -6305,6 +6825,8 @@ Question: First question about the passage?`
       start,
       stop,
       applyValues,
+      redetectNode,
+      setAutoStart,
       shutdown: shutdown2
     };
   }
@@ -6318,7 +6840,8 @@ Question: First question about the passage?`
       } catch {
       }
     }
-    for (const candidate of NODE_BINARY_CANDIDATES) {
+    const candidates = deps.homeDir !== void 0 && deps.homeDir.length > 0 ? [...NODE_BINARY_CANDIDATES, ...homeRelativeNodeCandidates(deps.homeDir)] : NODE_BINARY_CANDIDATES;
+    for (const candidate of candidates) {
       if (deps.pathExists(candidate)) {
         return { path: candidate, autoDetectFailed: false };
       }
@@ -6823,8 +7346,9 @@ ${lines.join("\n")}`;
           if (list === null) {
             return;
           }
-          const rows = updated.messages.map((message) => {
+          const rows = updated.messages.filter((message) => message.role !== "system").map((message) => {
             const row = list.ownerDocument.createElement("li");
+            row.className = "zotero-ai-explain-sidebar__turn";
             row.dataset.role = message.role;
             const attribution = list.ownerDocument.createElement("span");
             attribution.className = "zotero-ai-explain-sidebar__role";
@@ -7287,6 +7811,16 @@ Question: ${raw.trim()}`
             },
             stop: async () => {
               await proxyHandle.stop();
+            },
+            detect: () => {
+              const snap = proxyHandle.redetectNode();
+              return {
+                path: snap.nodeBinaryPath,
+                autoDetectFailed: snap.nodeAutoDetectFailed ?? false
+              };
+            },
+            setAutoStart: (enabled) => {
+              proxyHandle.setAutoStart(enabled);
             }
           }
         } : {}
@@ -7899,6 +8433,37 @@ Question: ${raw.trim()}`
     }
     throw new Error("Ollama embedding response did not include embeddings.");
   }
+  async function* readNdjsonLines(body) {
+    if (body === null) return;
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let streamDone = false;
+    try {
+      while (!streamDone) {
+        const { value, done } = await reader.read();
+        streamDone = done;
+        if (value !== void 0) {
+          buffer += decoder.decode(value, { stream: true });
+          let newlineIdx = buffer.indexOf("\n");
+          while (newlineIdx !== -1) {
+            const line = buffer.slice(0, newlineIdx);
+            buffer = buffer.slice(newlineIdx + 1);
+            if (line.trim().length > 0) {
+              yield line;
+            }
+            newlineIdx = buffer.indexOf("\n");
+          }
+        }
+      }
+      buffer += decoder.decode();
+      if (buffer.trim().length > 0) {
+        yield buffer;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
   function readTerminalErrorMessage(payload) {
     const topLevelError = payload.error;
     if (typeof topLevelError === "string" && topLevelError.length > 0) {
@@ -7960,7 +8525,15 @@ Question: ${raw.trim()}`
             };
             return;
           }
-          for (const line of (await response.text()).split("\n").filter((entry) => entry.trim().length > 0)) {
+          if (response.body === null) {
+            yield {
+              type: "error",
+              message: `Ollama error: empty response body from ${url}`,
+              retryable: false
+            };
+            return;
+          }
+          for await (const line of readNdjsonLines(response.body)) {
             const payload = parseJsonPayload(line);
             if (isRecord(payload)) {
               const errorMessage = readTerminalErrorMessage(payload);
@@ -8956,6 +9529,16 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
         // eslint-disable-next-line @typescript-eslint/require-await
         async stat() {
           return null;
+        },
+        // AC-23: no-op directory primitives so the storage layer falls
+        // back to its legacy single-file path on hosts without IOUtils.
+        async makeDirectory() {
+        },
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async listChildren() {
+          return null;
+        },
+        async removeDirectory() {
         }
       };
     }
@@ -8994,6 +9577,47 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
           };
         } catch {
           return null;
+        }
+      },
+      // AC-23: per-item directory primitives. Optional on the storage type
+      // — when the host's `IOUtils` lacks the method we surface the
+      // absence so the storage layer can fall back to the legacy
+      // single-file path.
+      ...(() => {
+        const makeDir = utils.makeDirectory;
+        if (typeof makeDir !== "function") return {};
+        return {
+          async makeDirectory(path) {
+            try {
+              await makeDir(path, { ignoreExisting: true, createAncestors: true });
+            } catch {
+            }
+          }
+        };
+      })(),
+      ...(() => {
+        const getChildren = utils.getChildren;
+        if (typeof getChildren !== "function") return {};
+        return {
+          async listChildren(path) {
+            try {
+              const children = await getChildren(path);
+              return children.map((p) => {
+                const slash = p.lastIndexOf("/");
+                const back = p.lastIndexOf("\\");
+                const cut = Math.max(slash, back);
+                return cut >= 0 ? p.substring(cut + 1) : p;
+              });
+            } catch {
+              return null;
+            }
+          }
+        };
+      })(),
+      async removeDirectory(path) {
+        try {
+          await utils.remove(path, { ignoreAbsent: true, recursive: true });
+        } catch {
         }
       }
     };
@@ -9208,6 +9832,21 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
     }
     return `${trimmed}llm-proxy/server.mjs`;
   }
+  function readChromeHomeDir(zotero) {
+    const services = globalThis.Services;
+    const components = globalThis.Components;
+    if (services === void 0 || components === void 0) return void 0;
+    try {
+      const file = services.dirsvc.get("Home", components.interfaces.nsIFile);
+      const path = file.path.trim();
+      return path.length > 0 ? path : void 0;
+    } catch (err) {
+      zotero.debug(
+        `Zotero AI Explain: readChromeHomeDir failed ${err instanceof Error ? err.message : String(err)}`
+      );
+      return void 0;
+    }
+  }
   function makeChromePathExists(zotero) {
     const components = globalThis.Components;
     if (components === void 0) {
@@ -9367,6 +10006,7 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
       const prefReader2 = asStringPrefReader(zotero.Prefs);
       const prefWriter = asStringPrefWriter(zotero.Prefs);
       const proxyFetch = boundFetch;
+      const detectedHomeDir = readChromeHomeDir(context.Zotero);
       proxyWired = wireProxyLifecycle({
         subprocess: subprocessAdapter,
         prefs: {
@@ -9376,6 +10016,7 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
           }
         },
         pathExists: makeChromePathExists(context.Zotero),
+        ...detectedHomeDir !== void 0 ? { homeDir: detectedHomeDir } : {},
         // Developer-friendly default: the user's checkout. End users can
         // override via the settings dialog; the XPI does not ship the
         // scripts/ tree.
@@ -9484,7 +10125,9 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
             snapshot: () => wired.snapshot(),
             applyValues: (values) => wired.applyValues(values),
             start: () => wired.start(),
-            stop: () => wired.stop()
+            stop: () => wired.stop(),
+            redetectNode: () => wired.redetectNode(),
+            setAutoStart: (enabled) => wired.setAutoStart(enabled)
           }
         };
       })() : {},

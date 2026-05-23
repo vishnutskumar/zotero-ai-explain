@@ -84,23 +84,15 @@ export function describeCodexFailure({ spawnError, stderr, exitCode, codexComman
 }
 
 /**
- * Tags returned for /codex/api/tags. Kept identifier-only — Zotero only reads
- * `name`. Codex CLI accepts any model name via `--model`, so this list is just
- * the dropdown's discovery hint. The user's actual model is whatever's in
- * `~/.codex/config.toml`; a future iteration will read it with user consent.
- * Order matters: the first entry is the dropdown's default.
- *
- * Extend at proxy startup via env: `CODEX_TAGS_EXTRA=gpt-5.5,gpt-6.0`.
+ * Hardcoded fallback for /codex/api/tags when live config-read is
+ * disabled. AC-21: previously this listed speculative future names
+ * (`gpt-5.4`, `o4`, etc.) that don't exist in the real Codex CLI,
+ * which made the dropdown look authoritative when it wasn't. Trimmed
+ * to a single conservative entry; live discovery via
+ * `readDiscoveredCodexModels` is the source of truth when consent is
+ * granted, and users can extend with `CODEX_TAGS_EXTRA`.
  */
-const BUILTIN_CODEX_TAGS = [
-  "gpt-5.5",
-  "gpt-5.5-codex",
-  "gpt-5.4",
-  "gpt-5.2-codex",
-  "gpt-5.2",
-  "o4",
-  "o4-mini"
-];
+const BUILTIN_CODEX_TAGS = ["gpt-5.2-codex"];
 function readEnvExtraTags() {
   const raw = process.env.CODEX_TAGS_EXTRA;
   if (typeof raw !== "string" || raw.length === 0) return [];

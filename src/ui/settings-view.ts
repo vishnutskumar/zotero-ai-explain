@@ -89,8 +89,7 @@ const STATUS_PILL_STOPPED_STYLE = `${STATUS_PILL_BASE_STYLE} background: rgba(12
 
 /** Inline-row layout for model input + dropdown + refresh button. */
 const MODEL_ROW_STYLE = "display: flex; gap: 6px; align-items: stretch; flex-wrap: wrap;";
-const MODEL_INPUT_STYLE = `${FIELD_INPUT_STYLE} flex: 1 1 200px; min-width: 0;`;
-const MODEL_SELECT_STYLE = `${FIELD_INPUT_STYLE} flex: 0 1 220px; min-width: 0;`;
+const MODEL_SELECT_STYLE = `${FIELD_INPUT_STYLE} flex: 1 1 200px; min-width: 0;`;
 
 function makeField(name: string, labelText: string, value: string, hint?: string): HTMLElement {
   const group = document.createElement("div");
@@ -160,7 +159,7 @@ function makeModelField(input: {
 
   const labelId = `zotero-ai-field-${input.name}`;
   const label = document.createElement("label");
-  label.htmlFor = labelId;
+  label.htmlFor = `${labelId}__picker`;
   label.textContent = input.labelText;
   label.setAttribute("style", FIELD_LABEL_STYLE);
 
@@ -168,16 +167,8 @@ function makeModelField(input: {
   row.className = "zotero-ai-model-field__row";
   row.setAttribute("style", MODEL_ROW_STYLE);
 
-  const field = document.createElement("input");
-  field.id = labelId;
-  field.name = input.name;
-  field.value = input.value;
-  field.type = "text";
-  field.spellcheck = false;
-  field.setAttribute("style", MODEL_INPUT_STYLE);
-  applyFocusRing(field);
-
   const picker = document.createElement("select");
+  picker.id = `${labelId}__picker`;
   picker.name = input.pickerName;
   picker.dataset.role = "model-picker";
   picker.dataset.targetInput = input.name;
@@ -197,7 +188,26 @@ function makeModelField(input: {
   applyFocusRing(refresh);
   applyHoverState(refresh);
 
-  row.append(field, picker, refresh);
+  row.append(picker, refresh);
+
+  // AC-22: the canonical text input lives BELOW the row and is hidden
+  // by default. paintPicker / the picker-change handler reveal it
+  // inline when the user picks "Custom..." (or when the persisted
+  // value isn't in the discovered model list).
+  const field = document.createElement("input");
+  field.id = labelId;
+  field.name = input.name;
+  field.value = input.value;
+  field.type = "text";
+  field.spellcheck = false;
+  field.dataset.role = "model-custom-input";
+  // Use FIELD_INPUT_STYLE directly — MODEL_INPUT_STYLE's `flex:1 1 200px`
+  // was sized for the picker row (width basis). Inside the parent
+  // column flex it would expand to a 200px-tall textarea-shaped box.
+  field.setAttribute("style", `${FIELD_INPUT_STYLE} margin-top: 4px;`);
+  field.setAttribute("aria-label", `${input.labelText} (custom)`);
+  field.hidden = true;
+  applyFocusRing(field);
 
   const error = document.createElement("p");
   error.className = "zotero-ai-field__error";
@@ -206,7 +216,7 @@ function makeModelField(input: {
   error.setAttribute("style", ERROR_TEXT_STYLE);
   error.hidden = true;
 
-  group.append(label, row);
+  group.append(label, row, field);
   if (input.hint !== undefined && input.hint.length > 0) {
     const hintEl = document.createElement("p");
     hintEl.className = "zotero-ai-field__hint";
@@ -406,6 +416,11 @@ export type ProxySettingsState = {
    */
   readonly externallyManaged?: boolean;
   /**
+   * Whether the proxy should start automatically when the plugin loads.
+   * Defaults to true at the wiring layer; omitted in legacy test calls.
+   */
+  readonly autoStart?: boolean;
+  /**
    * Optional /api/diagnostics snapshot from the running proxy. When
    * supplied, the renderer paints a "Discovered binaries" block so the
    * user can see whether codex / claude were found and which paths
@@ -454,9 +469,7 @@ function renderProxySection(state: ProxySettingsState): HTMLElement {
 
   const blurb = document.createElement("p");
   blurb.className = "zotero-ai-proxy__blurb";
-  blurb.textContent =
-    "Lets the plugin talk to Codex / Claude CLI tools using your existing subscription. " +
-    "Required only if you selected a *-via-Proxy preset above.";
+  blurb.textContent = "Required for Codex / Claude CLI presets. Skip otherwise.";
   blurb.setAttribute("style", SECTION_BLURB_STYLE);
 
   const statusRow = document.createElement("div");
@@ -519,39 +532,67 @@ function renderProxySection(state: ProxySettingsState): HTMLElement {
   section.setAttribute("style", `${SECTION_BLOCK_STYLE} ${SECTION_DIVIDER_STYLE}`);
   section.append(heading, blurb, statusRow, errorLine, buttons);
 
-  // Node binary path: hidden by default. Only revealed when auto-
-  // detection failed (the user typed nothing AND no candidate path
-  // exists on disk). When revealed, paint a banner so the user knows
-  // why they're seeing the field.
-  if (state.nodeAutoDetectFailed === true) {
-    const banner = document.createElement("p");
-    banner.className = "zotero-ai-proxy__node-banner";
-    banner.dataset.role = "proxy-node-banner";
-    banner.textContent =
-      "Node not found. Install Node.js, or paste the absolute path to your node binary below.";
-    banner.setAttribute(
-      "style",
-      `margin: 0; font-size: 11px; color: ${ERROR_COLOR}; line-height: 1.3;`
-    );
-    section.append(
-      banner,
-      makeField(
-        "proxyNodeBinaryPath",
-        "Node binary path",
-        state.nodeBinaryPath,
-        "Absolute path to a node >= 22 binary."
-      )
-    );
-  } else {
-    // Hidden mirror so the wiring code can still read the value
-    // without conditional null checks. The value seeds Subprocess.call
-    // arguments via `wire-proxy-lifecycle`.
-    const hidden = document.createElement("input");
-    hidden.type = "hidden";
-    hidden.name = "proxyNodeBinaryPath";
-    hidden.value = state.nodeBinaryPath;
-    section.append(hidden);
-  }
+  // AC-20: Node binary path is always visible so the user can see and
+  // override the resolved path without first hitting an auto-detect
+  // failure. The banner is also ALWAYS rendered (just hidden when
+  // detection succeeded) so a later Detect-button click that fails
+  // can reveal it — the original conditional render meant the Detect
+  // handler's `banner.hidden = false` was a no-op on initial success.
+  const banner = document.createElement("p");
+  banner.className = "zotero-ai-proxy__node-banner";
+  banner.dataset.role = "proxy-node-banner";
+  banner.textContent =
+    "Node not found. Install Node.js, click Detect to rescan, or paste the absolute path below.";
+  banner.setAttribute(
+    "style",
+    `margin: 0; font-size: 11px; color: ${ERROR_COLOR}; line-height: 1.3;`
+  );
+  banner.hidden = state.nodeAutoDetectFailed !== true;
+  section.append(banner);
+  // Custom node-field layout: label on top, then a row of [input, Detect]
+  // so the button sits BESIDE the input (not aligned with the label).
+  const nodeGroup = document.createElement("div");
+  nodeGroup.className = "zotero-ai-field zotero-ai-proxy__node";
+  nodeGroup.dataset.field = "proxyNodeBinaryPath";
+  nodeGroup.setAttribute("style", FIELD_GROUP_STYLE);
+
+  const nodeLabelId = "zotero-ai-field-proxyNodeBinaryPath";
+  const nodeLabel = document.createElement("label");
+  nodeLabel.htmlFor = nodeLabelId;
+  nodeLabel.textContent = "Node binary path";
+  nodeLabel.setAttribute("style", FIELD_LABEL_STYLE);
+
+  const nodeRow = document.createElement("div");
+  nodeRow.setAttribute(
+    "style",
+    "display: flex; gap: 8px; align-items: stretch; flex-wrap: nowrap;"
+  );
+
+  const nodeInput = document.createElement("input");
+  nodeInput.id = nodeLabelId;
+  nodeInput.name = "proxyNodeBinaryPath";
+  nodeInput.type = "text";
+  nodeInput.value = state.nodeBinaryPath;
+  nodeInput.spellcheck = false;
+  nodeInput.setAttribute("style", `${FIELD_INPUT_STYLE} flex: 1 1 auto; min-width: 0;`);
+  applyFocusRing(nodeInput);
+
+  const detectBtn = makeButton("detect-node", "Detect", false);
+  detectBtn.dataset.role = "proxy-detect-node";
+  detectBtn.setAttribute("style", `${BUTTON_BASE_STYLE} flex: 0 0 auto;`);
+
+  nodeRow.append(nodeInput, detectBtn);
+
+  const nodeHint = document.createElement("p");
+  nodeHint.className = "zotero-ai-field__hint";
+  nodeHint.textContent = "Absolute path to a node >= 22 binary. Click Detect to rescan.";
+  nodeHint.setAttribute(
+    "style",
+    `margin: 2px 0 0 0; font-size: 11px; color: ${FG_MUTED}; line-height: 1.3;`
+  );
+
+  nodeGroup.append(nodeLabel, nodeRow, nodeHint);
+  section.append(nodeGroup);
 
   // Server-script path: always hidden. It is derived from the plugin's
   // install dir at runtime; users never need to override it. Hidden
@@ -563,6 +604,27 @@ function renderProxySection(state: ProxySettingsState): HTMLElement {
   section.append(hiddenScript);
 
   section.append(makeField("proxyPort", "Proxy port", String(state.port)));
+
+  // Auto-start toggle. Defaults to checked so the proxy is ready when
+  // the user picks a codex/claude preset; unchecking it stops the
+  // auto-spawn on plugin load (the user can still hit Start manually).
+  const autoStartRow = document.createElement("label");
+  autoStartRow.className = "zotero-ai-proxy__autostart";
+  autoStartRow.setAttribute(
+    "style",
+    "display: flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer;"
+  );
+  const autoStartBox = document.createElement("input");
+  autoStartBox.type = "checkbox";
+  autoStartBox.name = "proxyAutoStart";
+  autoStartBox.dataset.role = "proxy-autostart";
+  autoStartBox.checked = state.autoStart !== false;
+  applyFocusRing(autoStartBox);
+  const autoStartLabel = document.createElement("span");
+  autoStartLabel.textContent = "Start on Zotero launch";
+  autoStartRow.append(autoStartBox, autoStartLabel);
+  section.append(autoStartRow);
+
   if (state.diagnostics !== undefined) {
     section.append(renderProxyDiagnostics(state.diagnostics));
   }
@@ -683,8 +745,7 @@ function renderPresetSection(currentPreset: PresetId): HTMLElement {
 
   const blurb = document.createElement("p");
   blurb.className = "zotero-ai-preset__blurb";
-  blurb.textContent =
-    "Pick a preset to fill every field below in one click. Editing any field switches to Custom.";
+  blurb.textContent = "One-click setup. Switches to Custom on any edit.";
   blurb.setAttribute("style", SECTION_BLURB_STYLE);
 
   const select = makeSelect(
@@ -713,8 +774,7 @@ function renderChatSection(ollama: OllamaSettings, profile: ProviderProfileSetti
     "chatProvider",
     "Chat backend",
     profile.chatProvider,
-    CHAT_PROVIDER_OPTIONS,
-    "Routes the 'Explain with AI' requests."
+    CHAT_PROVIDER_OPTIONS
   );
   const chatUrl = makeField("chatBaseUrl", "Chat URL", ollama.chatBaseUrl);
   const chatModel = makeModelField({
@@ -743,9 +803,7 @@ function renderChatSection(ollama: OllamaSettings, profile: ProviderProfileSetti
   return makeSection({
     className: "zotero-ai-chat-section",
     heading: "Chat Backend",
-    blurb:
-      "Routes the 'Explain with AI' requests. Codex/Claude via proxy use your existing subscription; " +
-      "OpenAI/Anthropic direct require an API key; Ollama is local and free.",
+    blurb: "Backend that answers Explain / Ask requests.",
     children: [chatProvider, chatUrl, chatModel, openaiKey, anthropicKey]
   });
 }
@@ -758,8 +816,7 @@ function renderEmbedSection(ollama: OllamaSettings, profile: ProviderProfileSett
     "embedProvider",
     "Embedding backend",
     profile.embedProvider,
-    EMBED_PROVIDER_OPTIONS,
-    "Selects which embedding service builds the library index."
+    EMBED_PROVIDER_OPTIONS
   );
   const embedUrl = makeField("embedBaseUrl", "Embedding URL", ollama.embedBaseUrl);
   const embedModel = makeModelField({
@@ -779,9 +836,7 @@ function renderEmbedSection(ollama: OllamaSettings, profile: ProviderProfileSett
   return makeSection({
     className: "zotero-ai-embed-section",
     heading: "Embedding Backend",
-    blurb:
-      "Used for library indexing and semantic search. Each model produces a different index file, " +
-      "so switching providers preserves your other indexes.",
+    blurb: "Backend that builds and queries the library index.",
     children: [embedProvider, embedUrl, embedModel, geminiKey]
   });
 }
@@ -811,7 +866,7 @@ export function renderSettingsView(inputData: {
 
   const intro = document.createElement("p");
   intro.className = "zotero-ai-settings__intro";
-  intro.textContent = "Pick a preset for a one-click setup, or fine-tune each section below.";
+  intro.textContent = "Pick a preset for a one-click setup, or fine-tune below.";
   intro.setAttribute("style", `${MUTED_TEXT_STYLE} line-height: 1.4;`);
 
   const privacy = document.createElement("p");
@@ -864,11 +919,10 @@ export function renderSettingsView(inputData: {
   if (inputData.providerProfile !== undefined) {
     const currentPreset = detectPreset(inputData.providerProfile);
     element.append(renderPresetSection(currentPreset));
-    // Surface the Local LLM Proxy controls AHEAD of the chat/embed
-    // sections. When the proxy isn't running, the model dropdowns below
-    // show "not available", which disoriented users who didn't realise
-    // they had to start the proxy first. Putting Start/Stop at the top
-    // of the dialog makes the dependency obvious.
+    // Proxy sits at the top so its Start/Stop pill is immediately
+    // visible — the model dropdowns below read "not available" until
+    // the proxy is running, and surfacing the dependency up front
+    // avoids that confusion.
     if (inputData.proxy !== undefined) {
       element.append(renderProxySection(inputData.proxy));
     }
@@ -877,8 +931,7 @@ export function renderSettingsView(inputData: {
 
     const apiWarning = document.createElement("p");
     apiWarning.className = "zotero-ai-providers__warning";
-    apiWarning.textContent =
-      "API keys are stored locally in Zotero's preferences file (plain text inside your OS user profile). Treat this machine as trusted.";
+    apiWarning.textContent = "API keys are stored in plain text in Zotero's preferences.";
     apiWarning.setAttribute("style", SECTION_BLURB_STYLE);
     element.append(apiWarning);
 
@@ -910,16 +963,15 @@ export function renderSettingsView(inputData: {
   indexHeading.setAttribute("style", SECTION_HEADING_STYLE);
   const indexBlurb = document.createElement("p");
   indexBlurb.className = "zotero-ai-library-index__blurb";
-  indexBlurb.textContent =
-    "Indexes title + abstract + cached PDF text per item. Run once after setting up; subsequent runs resume.";
+  indexBlurb.textContent = "Embeds your library for retrieval. Resumes on re-run.";
   indexBlurb.setAttribute("style", SECTION_BLURB_STYLE);
   indexSection.append(indexHeading, indexBlurb, renderIndexControls(inputData.indexStatus));
 
-  element.append(actions, privacy, indexSection);
+  element.append(indexSection, actions, privacy);
 
   // Legacy callers (no providerProfile) keep the historical order —
   // proxy section trails after the index controls. The sectioned-layout
-  // branch above injected it ahead of the chat dropdowns.
+  // branch above already injected it inside the Advanced disclosure.
   if (inputData.providerProfile === undefined && inputData.proxy !== undefined) {
     element.append(renderProxySection(inputData.proxy));
   }
@@ -1007,6 +1059,19 @@ export type ProxyLifecycleCallbacks = {
   readonly readValues: () => ProxySettingsFormValues;
   readonly start: (values: ProxySettingsFormValues) => Promise<void>;
   readonly stop: () => Promise<void>;
+  /**
+   * Re-run Node binary detection. The wiring layer updates the form's
+   * `proxyNodeBinaryPath` input with the resolved path; if detection
+   * fails the input stays empty and the banner above it surfaces a
+   * "still not found" hint.
+   */
+  readonly detect?: () => { readonly path: string; readonly autoDetectFailed: boolean };
+  /**
+   * Persist the autostart preference. Called on every change of the
+   * "Start on Zotero launch" checkbox; the change does not spawn or
+   * kill the running proxy — it only affects the next plugin load.
+   */
+  readonly setAutoStart?: (enabled: boolean) => void;
 };
 
 /**
@@ -1438,6 +1503,7 @@ export function wireSettingsView(input: {
       return;
     }
     // models branch
+    const valueIsKnown = state.models.includes(currentValue);
     if (state.models.length === 0) {
       const placeholder = document.createElement("option");
       placeholder.value = "";
@@ -1461,8 +1527,30 @@ export function wireSettingsView(input: {
     const customOpt = document.createElement("option");
     customOpt.value = MODEL_DROPDOWN_CUSTOM;
     customOpt.textContent = "Custom...";
+    if (!valueIsKnown && currentValue.length > 0) {
+      customOpt.selected = true;
+    }
     picker.append(customOpt);
     picker.disabled = false;
+    // AC-22: reveal the custom-text input when the persisted value
+    // isn't in the discovered model list, so the user can see (and
+    // edit) what's actually wired without diving into "Custom...".
+    syncCustomInputVisibility(target);
+  }
+
+  /**
+   * AC-22: show the canonical text input only when the picker is on
+   * "Custom..." or holds an empty selection — otherwise the dropdown
+   * value IS the canonical value and the input is redundant.
+   */
+  function syncCustomInputVisibility(target: "chatModel" | "embeddingModel"): void {
+    const picker = root.querySelector<HTMLSelectElement>(
+      `[data-role="model-picker"][data-target-input="${target}"]`
+    );
+    const field = inputs[target];
+    if (picker === null || field === null) return;
+    const showInput = picker.value === MODEL_DROPDOWN_CUSTOM || picker.value === "";
+    field.hidden = !showInput;
   }
 
   function triggerDiscovery(target: "chatModel" | "embeddingModel"): void {
@@ -1532,13 +1620,20 @@ export function wireSettingsView(input: {
     const handler: EventListener = () => {
       const v = picker.value;
       if (v === MODEL_DROPDOWN_CUSTOM) {
+        targetInput.hidden = false;
         targetInput.value = "";
         targetInput.focus();
         markPresetCustom();
         return;
       }
-      if (v === "") return;
+      if (v === "") {
+        // Heading row picked back — keep the input visible so user
+        // can see / edit the canonical value while no option is chosen.
+        targetInput.hidden = false;
+        return;
+      }
       targetInput.value = v;
+      targetInput.hidden = true;
       // Manually-picked models invalidate the preset selection.
       markPresetCustom();
     };
@@ -1558,7 +1653,8 @@ export function wireSettingsView(input: {
   // -------------------------------------------------------------------------
   const proxyButtons = {
     start: root.querySelector<HTMLButtonElement>('[data-action="start-proxy"]'),
-    stop: root.querySelector<HTMLButtonElement>('[data-action="stop-proxy"]')
+    stop: root.querySelector<HTMLButtonElement>('[data-action="stop-proxy"]'),
+    detect: root.querySelector<HTMLButtonElement>('[data-action="detect-node"]')
   };
   const proxyStatusEl = root.querySelector<HTMLElement>('[data-role="proxy-status"]');
   const proxyMessageEl = root.querySelector<HTMLElement>('[data-role="proxy-message"]');
@@ -1665,8 +1761,33 @@ export function wireSettingsView(input: {
     })();
   };
 
+  const autoStartCheckbox = root.querySelector<HTMLInputElement>('[data-role="proxy-autostart"]');
+  const onAutoStartToggle = (): void => {
+    if (autoStartCheckbox === null || input.proxy?.setAutoStart === undefined) return;
+    input.proxy.setAutoStart(autoStartCheckbox.checked);
+  };
+  autoStartCheckbox?.addEventListener("change", onAutoStartToggle);
+
+  const onDetectNode = (event: Event): void => {
+    event.preventDefault();
+    const detect = input.proxy?.detect;
+    if (detect === undefined) return;
+    const result = detect();
+    const nodeInput = root.querySelector<HTMLInputElement>('[name="proxyNodeBinaryPath"]');
+    if (nodeInput !== null) {
+      // On miss the wired layer returns "node"; the field reads better
+      // empty so the user knows nothing was found.
+      nodeInput.value = result.autoDetectFailed ? "" : result.path;
+    }
+    const banner = root.querySelector<HTMLElement>('[data-role="proxy-node-banner"]');
+    if (banner !== null) {
+      banner.hidden = !result.autoDetectFailed;
+    }
+  };
+
   proxyButtons.start?.addEventListener("click", onStartProxy);
   proxyButtons.stop?.addEventListener("click", onStopProxy);
+  proxyButtons.detect?.addEventListener("click", onDetectNode);
 
   return {
     detach() {
@@ -1690,6 +1811,8 @@ export function wireSettingsView(input: {
       pendingTimers.clear();
       proxyButtons.start?.removeEventListener("click", onStartProxy);
       proxyButtons.stop?.removeEventListener("click", onStopProxy);
+      proxyButtons.detect?.removeEventListener("click", onDetectNode);
+      autoStartCheckbox?.removeEventListener("change", onAutoStartToggle);
     }
   };
 }

@@ -33,6 +33,29 @@ function bodyText(init: RequestInit): string {
   return typeof init.body === "string" ? init.body : "";
 }
 
+function makeStreamingProvider(): {
+  provider: ReturnType<typeof createOllamaProvider>;
+  controller: ReadableStreamDefaultController<Uint8Array>;
+  encode: (input: string) => Uint8Array;
+} {
+  // `start` runs synchronously inside `new ReadableStream(...)`, so the
+  // controller is captured by the time the constructor returns.
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+    }
+  });
+  const encoder = new TextEncoder();
+  const provider = createOllamaProvider({
+    fetch: async () => {
+      await Promise.resolve();
+      return new Response(stream);
+    }
+  });
+  return { provider, controller, encode: (input) => encoder.encode(input) };
+}
+
 describe("createOllamaProvider", () => {
   it("streams chat deltas from Ollama /api/chat", async () => {
     const calls: { input: string; init: RequestInit }[] = [];
@@ -271,6 +294,50 @@ describe("createOllamaProvider", () => {
    * cheerful message_end — exactly the BUG-AC8-1 silent-empty failure
    * for proxy-routed traffic.
    */
+  it("AC-17 codex P2: yields a non-retryable error event when response.body is null", async () => {
+    const provider = createOllamaProvider({
+      fetch: async () => {
+        await Promise.resolve();
+        // A 200 OK with no body. Some misbehaving proxies return this
+        // shape; without explicit handling the iterator emitted only
+        // message_start + message_end (silent success on a protocol
+        // failure).
+        return new Response(null, { status: 200 });
+      }
+    });
+    const events = [];
+    for await (const event of provider.streamChat(request, new AbortController().signal)) {
+      events.push(event);
+    }
+    expect(events.some((e) => e.type === "message_end")).toBe(false);
+    const last = events.at(-1);
+    expect(last?.type).toBe("error");
+    if (last?.type === "error") {
+      expect(last.message.toLowerCase()).toContain("empty response body");
+      expect(last.retryable).toBe(false);
+    }
+  });
+
+  it("AC-17: decodes a multi-byte UTF-8 character split across two stream chunks", async () => {
+    const { provider, controller } = makeStreamingProvider();
+    // "你好" — the first character is U+4F60 (E4 BD A0 in UTF-8). We
+    // split between the second and third byte so the decoder MUST
+    // buffer the partial sequence across read() calls.
+    const utf8 = new Uint8Array([
+      0x7b, 0x22, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x22, 0x3a, 0x7b, 0x22, 0x63, 0x6f,
+      0x6e, 0x74, 0x65, 0x6e, 0x74, 0x22, 0x3a, 0x22, 0xe4, 0xbd, 0xa0, 0xe5, 0xa5, 0xbd, 0x22,
+      0x7d, 0x2c, 0x22, 0x64, 0x6f, 0x6e, 0x65, 0x22, 0x3a, 0x74, 0x72, 0x75, 0x65, 0x7d, 0x0a
+    ]);
+    const splitAt = 25; // mid-character (between E4 BD and A0)
+    controller.enqueue(utf8.slice(0, splitAt));
+    controller.enqueue(utf8.slice(splitAt));
+    controller.close();
+    const iter = provider.streamChat(request, new AbortController().signal)[Symbol.asyncIterator]();
+    expect((await iter.next()).value).toMatchObject({ type: "message_start" });
+    expect((await iter.next()).value).toEqual({ type: "delta", text: "你好" });
+    expect((await iter.next()).value).toEqual({ type: "message_end" });
+  });
+
   it("H2: surfaces a top-level NDJSON error chunk as a terminal error event", async () => {
     const provider = createOllamaProvider({
       fetch: async () => {
@@ -323,6 +390,42 @@ describe("createOllamaProvider", () => {
       // Fallback message when the chunk carries no detail string.
       expect(last.message).toMatch(/error/iu);
     }
+  });
+
+  it("AC-17: yields the first delta before the upstream stream closes", async () => {
+    const { provider, controller, encode } = makeStreamingProvider();
+    const enqueueLine = (line: object): void => {
+      controller.enqueue(encode(`${JSON.stringify(line)}\n`));
+    };
+    const iter = provider.streamChat(request, new AbortController().signal)[Symbol.asyncIterator]();
+
+    expect((await iter.next()).value).toMatchObject({ type: "message_start" });
+
+    enqueueLine({ message: { content: "First " }, done: false });
+    expect((await iter.next()).value).toEqual({ type: "delta", text: "First " });
+
+    enqueueLine({ message: { content: "second" }, done: true });
+    controller.close();
+
+    expect((await iter.next()).value).toEqual({ type: "delta", text: "second" });
+    expect((await iter.next()).value).toEqual({ type: "message_end" });
+    expect((await iter.next()).done).toBe(true);
+  });
+
+  it("AC-17: buffers a JSON line that spans multiple stream chunks", async () => {
+    const { provider, controller, encode } = makeStreamingProvider();
+    const iter = provider.streamChat(request, new AbortController().signal)[Symbol.asyncIterator]();
+    expect((await iter.next()).value).toMatchObject({ type: "message_start" });
+
+    const fullLine = `${JSON.stringify({ message: { content: "Hello world" }, done: true })}\n`;
+    const splitAt = Math.floor(fullLine.length / 2);
+    controller.enqueue(encode(fullLine.slice(0, splitAt)));
+    controller.enqueue(encode(fullLine.slice(splitAt)));
+    controller.close();
+
+    expect((await iter.next()).value).toEqual({ type: "delta", text: "Hello world" });
+    expect((await iter.next()).value).toEqual({ type: "message_end" });
+    expect((await iter.next()).done).toBe(true);
   });
 
   it("H2: surfaces a done_reason=error NDJSON chunk that ALSO carries an error string verbatim", async () => {

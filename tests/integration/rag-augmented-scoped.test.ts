@@ -98,6 +98,7 @@ function fakeStorage(file: IndexFile | null): IndexStorage {
     readWithMigration: () => Promise.resolve({ file, migrationPending: false }),
     readItemCount: () => Promise.resolve(file === null ? 0 : Object.keys(file.items).length),
     write: () => Promise.resolve(),
+    writeItem: () => Promise.resolve(),
     writeTmp: () => Promise.resolve(),
     commitMigration: () => Promise.resolve(),
     abandonMigration: () => Promise.resolve(),
