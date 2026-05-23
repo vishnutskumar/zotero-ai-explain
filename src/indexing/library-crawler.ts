@@ -629,16 +629,34 @@ export async function indexLibrary(
     // Chunk each source independently, stamping its provenance on every
     // resulting chunk. Whitespace-only pages (blank PDF pages) chunk to
     // `[]` and contribute nothing.
-    const sourceChunks: PerSourceChunk[] = [];
-    for (const source of sources) {
-      for (const chunk of chunkText(source.text, DEFAULT_CHUNK_BYTES)) {
-        sourceChunks.push({
-          text: chunk,
-          sourceKind: source.sourceKind,
-          ...(source.pageIndex !== undefined ? { pageIndex: source.pageIndex } : {}),
-          ...(source.attachmentKey !== undefined ? { attachmentKey: source.attachmentKey } : {})
-        });
+    //
+    // AC-16: wrap chunking in a try/catch so a memory-exhaustion error
+    // here (a single source yielding many MB of text, then chunkText's
+    // intermediate arrays pushing the chrome process past its memory
+    // cap) is contained per-item — the same way an `extractPerSourceChunks`
+    // failure already is. Without this wrap, the OOM escapes the narrow
+    // extract-only catch above and aborts the whole crawl (the user's
+    // observed "Indexing failed: out of memory" after 33 skipped items).
+    let sourceChunks: PerSourceChunk[];
+    try {
+      sourceChunks = [];
+      for (const source of sources) {
+        for (const chunk of chunkText(source.text, DEFAULT_CHUNK_BYTES)) {
+          sourceChunks.push({
+            text: chunk,
+            sourceKind: source.sourceKind,
+            ...(source.pageIndex !== undefined ? { pageIndex: source.pageIndex } : {}),
+            ...(source.attachmentKey !== undefined ? { attachmentKey: source.attachmentKey } : {})
+          });
+        }
       }
+    } catch {
+      // Memory exhaustion (or any other unexpected chunking error) for
+      // ONE item must not abort the entire crawl. Mark the item failed,
+      // advance progress, and continue.
+      failed += 1;
+      deps.onProgress(indexed, failed, total, skippedNoText);
+      continue;
     }
 
     if (sourceChunks.length === 0) {

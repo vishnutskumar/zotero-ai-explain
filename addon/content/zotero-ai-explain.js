@@ -249,6 +249,7 @@ ${para}`;
       items: {},
       indexedAt: (/* @__PURE__ */ new Date()).toISOString()
     };
+    let didWriteThisRun = false;
     let indexed = 0;
     let failed = 0;
     let skippedNoText = 0;
@@ -379,6 +380,7 @@ ${para}`;
         indexedAt: (/* @__PURE__ */ new Date()).toISOString()
       };
       await deps.storage.write(currentFile);
+      didWriteThisRun = true;
       indexed += 1;
       if (attachmentTextContributed) {
         indexedAttachments += 1;
@@ -390,6 +392,9 @@ ${para}`;
     mainWin?.debug(summary);
     const mw = mainWin?.getMainWindow?.();
     mw?.console?.error(summary);
+    if (!didWriteThisRun) {
+      await deps.storage.write(currentFile);
+    }
     return { completed: true };
   }
   var DEFAULT_CHUNK_BYTES, CIRCUIT_BREAKER_THRESHOLD, CIRCUIT_BREAKER_MESSAGE, DEFAULT_FULLTEXT_MAX_CHARS, CURRENT_SCHEMA_VERSION, EmbedCircuitBreakerError;

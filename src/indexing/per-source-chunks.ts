@@ -121,11 +121,24 @@ function isPdfContentType(contentType: string | undefined): boolean | undefined 
  */
 async function extractPdfPages(
   attachment: ZoteroItemLike,
-  pdfWorker: ZoteroPdfWorker
+  pdfWorker: ZoteroPdfWorker,
+  maxChars: number
 ): Promise<readonly string[] | null> {
   try {
     const result = await pdfWorker.getFullText(attachment.id);
-    return splitPdfWorkerText(result.text);
+    // AC-16: cap the worker output before splitting + chunking. Without
+    // this, a textbook-sized PDF can return 50+ MB of text — splitting,
+    // chunking, and embedding each chunk then OOMs the Zotero chrome
+    // process. The cap matches `readAttachmentFullText`'s for parity.
+    // Trim at the last `\f` page boundary before the cap so we never
+    // mid-cut a page (keeps page-index alignment clean).
+    let text = result.text;
+    if (text.length > maxChars) {
+      const truncated = text.substring(0, maxChars);
+      const lastBoundary = truncated.lastIndexOf("\f");
+      text = lastBoundary > 0 ? truncated.substring(0, lastBoundary) : truncated;
+    }
+    return splitPdfWorkerText(text);
   } catch {
     return null;
   }
@@ -151,7 +164,7 @@ async function* yieldAttachmentSources(
   // either says PDF or is unknown (probe it; a rejection falls through
   // to the non-PDF path).
   if (pdfWorker !== undefined && pdfByContentType !== false) {
-    const pages = await extractPdfPages(attachment, pdfWorker);
+    const pages = await extractPdfPages(attachment, pdfWorker, maxChars);
     if (pages !== null) {
       // getFullText resolved — the attachment IS a PDF. Emit one source
       // per page; `pageIndex` 0 is a VALID value, so every page is
