@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { extname } from "node:path";
 
 const MAX_FILE_SIZE_BYTES = 500 * 1024;
@@ -19,12 +19,21 @@ const YAML_EXTENSIONS = new Set([".yaml", ".yml"]);
 const JSON_EXTENSIONS = new Set([".json"]);
 const PRIVATE_KEY_PATTERN = /-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/;
 const MERGE_CONFLICT_PATTERN = /^(<{7}|={7}|>{7})/m;
+// Match user-home paths (Users/, home/) — those are the high-signal
+// cases of "a developer left their checkout path in a committed file".
+// The matching tmp + private patterns are also fair game in source
+// files, but legitimate documentation + CI workflows reference log
+// paths there; gating those patterns to non-doc files keeps the check
+// meaningful without false-positiving on prose.
 const LOCAL_PATH_PATTERNS = [
   /(?:file:\/\/)?\/Users\/[^\s)'"}>]+/u,
-  /(?:file:\/\/)?\/home\/[^\s)'"}>]+/u,
+  /(?:file:\/\/)?\/home\/[^\s)'"}>]+/u
+];
+const TMP_PATH_PATTERNS = [
   /(?:file:\/\/)?\/private\/(?:tmp|var)\/[^\s)'"}>]+/u,
   /(?:file:\/\/)?\/tmp\/[^\s)'"}>]+/u
 ];
+const DOC_EXTENSIONS = new Set([".md", ".yml", ".yaml"]);
 
 export function runUniversalChecks() {
   const gitOutput = execFileSync("git", ["ls-files", "-z"], { encoding: "utf8" });
@@ -35,6 +44,10 @@ export function runUniversalChecks() {
   const seenLowercasePaths = new Map();
 
   for (const file of files) {
+    if (!shouldCheckWorktreeFile(file)) {
+      continue;
+    }
+
     const stats = statSync(file);
     if (!stats.isFile()) {
       continue;
@@ -107,12 +120,23 @@ export function checkTextContents(file, contents) {
   if (containsLocalMachinePath(contents)) {
     errors.push(`${file}: contains a local machine path; use a repo-relative path instead`);
   }
+  if (!DOC_EXTENSIONS.has(extname(file)) && containsTmpPath(contents)) {
+    errors.push(`${file}: contains a /tmp or /private path; use a repo-relative path instead`);
+  }
 
   return errors;
 }
 
 export function containsLocalMachinePath(contents) {
   return LOCAL_PATH_PATTERNS.some((pattern) => pattern.test(contents));
+}
+
+export function containsTmpPath(contents) {
+  return TMP_PATH_PATTERNS.some((pattern) => pattern.test(contents));
+}
+
+export function shouldCheckWorktreeFile(file) {
+  return existsSync(file);
 }
 
 function validateYaml(file, errors) {

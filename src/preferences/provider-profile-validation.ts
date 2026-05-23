@@ -9,6 +9,10 @@ export function validateProviderProfile(profile: ProviderProfile): ProviderProfi
     return { ok: false, reason: "custom-http providers require a base URL." };
   }
 
+  if (profile.kind === "ollama" && profile.baseUrl === null) {
+    return { ok: false, reason: "Ollama profiles require a base URL." };
+  }
+
   if (profile.model.trim().length === 0) {
     return { ok: false, reason: "Provider profiles require a model." };
   }

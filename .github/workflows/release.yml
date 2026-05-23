@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build-release:
+    name: Build XPI Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Wait for required CI checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          REQUIRED=("CI" "Zotero E2E" "E2E Cross-Platform")
+          TIMEOUT_MIN=60
+          POLL_SECONDS=30
+          deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
+
+          echo "Gating release on ${SHA:0:7}; required workflows: ${REQUIRED[*]}"
+
+          while :; do
+            now=$(date +%s)
+            if (( now > deadline )); then
+              echo "::error::Timeout after ${TIMEOUT_MIN}m waiting for required checks"
+              exit 1
+            fi
+
+            runs_json="$(gh api "repos/${REPO}/actions/runs?head_sha=${SHA}&per_page=100")"
+
+            all_done=true
+            any_failed=false
+
+            for wf in "${REQUIRED[@]}"; do
+              run="$(echo "$runs_json" | jq --arg name "$wf" '
+                [.workflow_runs[] | select(.name == $name)]
+                | sort_by(.run_started_at) | reverse | .[0] // null
+              ')"
+
+              if [[ "$run" == "null" ]]; then
+                echo "[$wf] no run yet on this SHA"
+                all_done=false
+                continue
+              fi
+
+              status="$(echo "$run" | jq -r '.status')"
+              conclusion="$(echo "$run" | jq -r '.conclusion // "null"')"
+              url="$(echo "$run" | jq -r '.html_url')"
+              echo "[$wf] status=$status conclusion=$conclusion ($url)"
+
+              if [[ "$status" != "completed" ]]; then
+                all_done=false
+                continue
+              fi
+
+              if [[ "$conclusion" != "success" ]]; then
+                any_failed=true
+              fi
+            done
+
+            if [[ "$any_failed" == "true" ]]; then
+              echo "::error::A required check did not succeed; aborting release"
+              exit 1
+            fi
+
+            if [[ "$all_done" == "true" ]]; then
+              echo "All required checks passed on ${SHA:0:7}"
+              exit 0
+            fi
+
+            echo "Sleeping ${POLL_SECONDS}s..."
+            sleep "$POLL_SECONDS"
+          done
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Zotero bundle
+        run: npm run build
+
+      - name: Package XPI
+        run: node scripts/package-xpi.mjs
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.xpi
+            dist/updates.json
+          body: |
+            Compatible with Zotero 8.0 through 9.99.99.
+          generate_release_notes: true

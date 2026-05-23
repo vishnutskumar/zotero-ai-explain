@@ -15,8 +15,7 @@ describe("createReaderDomAdapter", () => {
         itemKey: "ITEM",
         itemTitle: "Paper",
         attachmentKey: "ATT",
-        pageLabel: "5",
-        location: "page=5"
+        pageLabel: "5"
       }),
       onSelection: (selection) => quotes.push(selection.quote)
     });

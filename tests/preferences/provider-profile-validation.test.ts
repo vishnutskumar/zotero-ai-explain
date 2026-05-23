@@ -32,4 +32,19 @@ describe("validateProviderProfile", () => {
       })
     ).toEqual({ ok: false, reason: "custom-http providers require a base URL." });
   });
+
+  it("accepts local Ollama profiles without a secret", () => {
+    expect(
+      validateProviderProfile({
+        id: "ollama",
+        displayName: "Ollama",
+        kind: "ollama",
+        baseUrl: "http://localhost:11434",
+        model: "llama3.1",
+        secret: { kind: "none" },
+        sendMode: "local",
+        enabled: true
+      })
+    ).toEqual({ ok: true });
+  });
 });

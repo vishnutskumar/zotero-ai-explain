@@ -5,7 +5,10 @@ repos:
         name: detect-secrets
         entry: detect-secrets-hook --baseline .secrets.baseline
         language: system
-        exclude: '(\.md$|\.json$)'
+        # Narrow the skip list: only exclude noisy lockfiles + the baseline
+        # file itself. Source, JSON config, and Markdown are scanned so a
+        # credentials.json or .env.example with a real key cannot land.
+        exclude: '(package-lock\.json$|\.secrets\.baseline$)'
       - id: universal-checks
         name: universal repository checks
         entry: node scripts/precommit-universal.mjs
@@ -40,6 +43,17 @@ repos:
         entry: npm run test
         language: system
         files: \.(ts|tsx|mjs)$
+        pass_filenames: false
+        stages: [pre-push]
+      - id: coverage-gate
+        name: coverage gate (≥80% lines/statements/functions, ≥75% branches)
+        # Runs `npm run test:coverage` then `node scripts/precommit-coverage.mjs`
+        # which reads coverage/coverage-summary.json and fails the push if
+        # any threshold is breached. Pre-push (not pre-commit) so single
+        # commits stay fast; coverage is the deploy-blocking surface.
+        entry: npm run test:coverage:check
+        language: system
+        files: \.(ts|tsx|mjs|cjs|js)$
         pass_filenames: false
         stages: [pre-push]
       - id: npm-audit

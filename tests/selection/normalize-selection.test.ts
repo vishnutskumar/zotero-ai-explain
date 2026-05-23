@@ -11,8 +11,7 @@ describe("normalizeSelection", () => {
           itemKey: "ITEM1",
           itemTitle: "Biology Paper",
           attachmentKey: "ATT1",
-          pageLabel: "12",
-          location: "page=12"
+          pageLabel: "12"
         },
         anchor: { left: 10, top: 20, width: 100, height: 15 }
       })
@@ -24,8 +23,7 @@ describe("normalizeSelection", () => {
           itemKey: "ITEM1",
           itemTitle: "Biology Paper",
           attachmentKey: "ATT1",
-          pageLabel: "12",
-          location: "page=12"
+          pageLabel: "12"
         },
         anchor: { left: 10, top: 20, width: 100, height: 15 }
       }
@@ -40,8 +38,7 @@ describe("normalizeSelection", () => {
           itemKey: null,
           itemTitle: null,
           attachmentKey: null,
-          pageLabel: null,
-          location: null
+          pageLabel: null
         },
         anchor: null
       })
