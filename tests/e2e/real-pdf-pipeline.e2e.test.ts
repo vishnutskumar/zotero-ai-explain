@@ -292,36 +292,49 @@ function parseRect(csv: string | null): {
   return { left, top, width, height };
 }
 
+type PersistedIndex = {
+  items: Record<
+    string,
+    {
+      title?: string;
+      chunks?: { text?: string; embedding?: number[]; sourceKind?: string; pageIndex?: number }[];
+    }
+  >;
+  indexedAt?: string;
+};
+
 /**
- * Locate the on-disk index file the crawler persisted for this run.
+ * Load the persisted index from the Zotero profile's data directory.
  *
- * Per ADR-0002 (`docs/decisions/0002-per-provider-index-files.md`) the
- * crawler writes a per-(embed-provider, model) filename — for this
- * harness's Ollama embed provider + `embeddinggemma` model that is
- * `zotero-ai-explain-index-ollama-embeddinggemma.json`. The legacy flat
- * `zotero-ai-explain-index.json` name is a read-only back-compat alias
- * that production with an Ollama provider never writes.
+ * AC-23 (per-item file format): the crawler writes a directory
+ * `<dataDir>/zotero-ai-explain-index-<provider>-<model>/` containing
+ * one `<itemKey>.json` file per indexed item plus a `_meta.json`
+ * carrying `{ schemaVersion, indexedAt, itemCount }`. Assembles those
+ * files into the `IndexFile` shape downstream assertions consume,
+ * mirroring what `storage.read()` does at runtime.
  *
- * Rather than hardcoding either filename, glob `<profile>/data` for
- * `zotero-ai-explain-index*.json` so the assertion stays correct if the
- * harness's embed provider/model ever changes. When a stale legacy file
- * lingers alongside the per-provider file (e.g. a prior run's leftover),
- * the per-provider file wins — legacy data is by definition stale.
- *
- * Returns the absolute path, or null when no index file exists at all.
+ * Returns null when no index directory exists at all.
  */
-function locateIndexFile(profileDir: string): string | null {
+function loadPersistedIndex(profileDir: string): PersistedIndex | null {
   const dataDir = join(profileDir, "data");
   if (!existsSync(dataDir)) return null;
-  const matches = readdirSync(dataDir).filter(
-    (name) => name.startsWith("zotero-ai-explain-index") && name.endsWith(".json")
-  );
-  if (matches.length === 0) return null;
-  // Prefer a per-provider file (`...-index-<provider>-<model>.json`)
-  // over the legacy flat `zotero-ai-explain-index.json` alias.
-  const perProvider = matches.find((name) => name !== "zotero-ai-explain-index.json");
-  const chosen = perProvider ?? matches[0];
-  return chosen === undefined ? null : join(dataDir, chosen);
+  const dirs = readdirSync(dataDir).filter((name) => name.startsWith("zotero-ai-explain-index-"));
+  if (dirs.length === 0) return null;
+  const indexDir = join(dataDir, dirs[0] ?? "");
+  const childNames = readdirSync(indexDir).filter((name) => name.endsWith(".json"));
+  const items: PersistedIndex["items"] = {};
+  let indexedAt: string | undefined;
+  for (const name of childNames) {
+    const path = join(indexDir, name);
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    if (name === "_meta.json") {
+      if (typeof parsed.indexedAt === "string") indexedAt = parsed.indexedAt;
+      continue;
+    }
+    const itemKey = name.slice(0, -".json".length);
+    items[itemKey] = parsed;
+  }
+  return { items, ...(indexedAt !== undefined ? { indexedAt } : {}) };
 }
 
 beforeAll(async () => {
@@ -1026,64 +1039,38 @@ describe("real-PDF pipeline (AC2 headline suite)", () => {
       }
     });
 
-    it("a per-provider index file exists under <dataDir> with at least one item", () => {
+    it("a per-provider index directory exists under <dataDir> with at least one item", () => {
       const handle = requireHandle(state);
-      // launch.mjs:115 → dataDir = <profile>/data. Per ADR-0002 the
-      // crawler persists to a per-(embed-provider, model) filename
-      // (`zotero-ai-explain-index-ollama-embeddinggemma.json` for this
-      // harness's Ollama embed provider), so we glob rather than
-      // hardcode — see locateIndexFile.
-      const indexPath = locateIndexFile(handle.profileDir);
+      // launch.mjs:115 → dataDir = <profile>/data. AC-23: the crawler
+      // persists per-item JSON files under a per-(embed-provider, model)
+      // directory; loadPersistedIndex assembles them into IndexFile shape.
+      const parsed = loadPersistedIndex(handle.profileDir);
       expect(
-        indexPath,
-        `No zotero-ai-explain-index*.json file under ${join(handle.profileDir, "data")}. ` +
+        parsed,
+        `No zotero-ai-explain-index-<provider>-<model>/ directory under ${join(handle.profileDir, "data")}. ` +
           `AC3+AC4 crawler did not persist any items to disk. ` +
-          `Either the crawler never ran, the storage layer is broken, or the controller never wired \`storage.write\`.`
+          `Either the crawler never ran, the storage layer is broken, or the controller never wired \`storage.writeItem\`.`
       ).not.toBeNull();
-      // The `expect(...).not.toBeNull()` above already failed the test
-      // if indexPath is null; this guard narrows the type for tsc.
-      if (indexPath === null) return;
-      const raw = readFileSync(indexPath, "utf8");
-      const parsed = JSON.parse(raw) as {
-        items?: Record<
-          string,
-          { title?: string; chunks?: { text?: string; embedding?: number[] }[] }
-        >;
-        indexedAt?: string;
-      };
+      if (parsed === null) return;
       // IndexFile shape per AC3 Interfaces L993-1000.
-      expect(typeof parsed.indexedAt, "indexedAt missing").toBe("string");
-      expect(typeof parsed.items, "items missing").toBe("object");
-      const itemIds = Object.keys(parsed.items ?? {});
-      // The driver creates at least the sample-PDF parent item; depending
-      // on the test pre-seeding additional items (see AC3+AC4 driver
-      // flow), the count is N≥1. Assert at least one indexed entry.
+      expect(typeof parsed.indexedAt, "_meta.json indexedAt missing").toBe("string");
+      const itemIds = Object.keys(parsed.items);
       expect(
         itemIds.length,
-        "no items in the index file — the crawler ran zero items"
+        "no items in the index directory — the crawler ran zero items"
       ).toBeGreaterThanOrEqual(1);
     });
 
     it("every indexed item carries a non-empty `embedding` array per chunk", () => {
       const handle = requireHandle(state);
-      // Per ADR-0002 the index lives at a per-provider filename; glob
-      // for it rather than hardcoding — see locateIndexFile.
-      const indexPath = locateIndexFile(handle.profileDir);
-      if (indexPath === null) {
-        // The previous test already failed with a tailored diagnostic;
-        // throw a marker so this test's failure isn't a duplicate.
+      const parsed = loadPersistedIndex(handle.profileDir);
+      if (parsed === null) {
         throw new Error(
-          `No zotero-ai-explain-index*.json file under ${join(handle.profileDir, "data")}; ` +
+          `No zotero-ai-explain-index-<provider>-<model>/ directory under ${join(handle.profileDir, "data")}; ` +
             `cannot validate embedding payloads`
         );
       }
-      const parsed = JSON.parse(readFileSync(indexPath, "utf8")) as {
-        items?: Record<
-          string,
-          { title?: string; chunks?: { text?: string; embedding?: number[] }[] }
-        >;
-      };
-      const items = Object.values(parsed.items ?? {});
+      const items = Object.values(parsed.items);
       for (const item of items) {
         expect(item.title, "indexed item missing title").toBeDefined();
         expect(Array.isArray(item.chunks), "indexed item missing chunks array").toBe(true);
@@ -1112,23 +1099,14 @@ describe("real-PDF pipeline (AC2 headline suite)", () => {
       // deps, every PDF chunk would carry `sourceKind: "attachment"` and
       // no `pageIndex` — this assertion would go RED.
       const handle = requireHandle(state);
-      const indexPath = locateIndexFile(handle.profileDir);
-      if (indexPath === null) {
+      const parsed = loadPersistedIndex(handle.profileDir);
+      if (parsed === null) {
         throw new Error(
-          `No zotero-ai-explain-index*.json file under ${join(handle.profileDir, "data")}; ` +
+          `No zotero-ai-explain-index-<provider>-<model>/ directory under ${join(handle.profileDir, "data")}; ` +
             `cannot validate pdf-page provenance`
         );
       }
-      const parsed = JSON.parse(readFileSync(indexPath, "utf8")) as {
-        items?: Record<
-          string,
-          {
-            title?: string;
-            chunks?: { text?: string; sourceKind?: string; pageIndex?: number }[];
-          }
-        >;
-      };
-      const allChunks = Object.values(parsed.items ?? {}).flatMap((item) => item.chunks ?? []);
+      const allChunks = Object.values(parsed.items).flatMap((item) => item.chunks ?? []);
       const pdfPageChunks = allChunks.filter((chunk) => chunk.sourceKind === "pdf-page");
       expect(
         pdfPageChunks.length,

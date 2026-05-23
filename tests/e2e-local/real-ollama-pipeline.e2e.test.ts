@@ -36,24 +36,38 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+type PersistedIndex = {
+  items: Record<string, { title?: string; chunks?: { embedding?: number[] }[] }>;
+  indexedAt?: string;
+};
+
 /**
- * Locate the persisted index file. Per ADR-0002 the production
- * crawler writes a per-(embed-provider, model) filename like
- * `zotero-ai-explain-index-ollama-embeddinggemma.json`; the legacy
- * flat `zotero-ai-explain-index.json` is a read-only back-compat
- * alias the crawler never writes. Glob the data dir for any matching
- * file and prefer a per-provider name over the legacy alias.
+ * Load the persisted index. AC-23: the crawler writes a directory
+ * `<dataDir>/zotero-ai-explain-index-<provider>-<model>/` containing
+ * one `<itemKey>.json` file per item plus `_meta.json`. Assemble into
+ * IndexFile shape so downstream assertions stay the same.
  */
-function locateIndexFile(profileDir: string): string | null {
+function loadPersistedIndex(profileDir: string): PersistedIndex | null {
   const dataDir = join(profileDir, "data");
   if (!existsSync(dataDir)) return null;
-  const candidates = readdirSync(dataDir).filter(
-    (name) => name.startsWith("zotero-ai-explain-index") && name.endsWith(".json")
-  );
-  const perProvider = candidates.find((name) => name !== "zotero-ai-explain-index.json");
-  const legacy = candidates.find((name) => name === "zotero-ai-explain-index.json");
-  const chosen = perProvider ?? legacy;
-  return chosen === undefined ? null : join(dataDir, chosen);
+  const dirs = readdirSync(dataDir).filter((name) => name.startsWith("zotero-ai-explain-index-"));
+  if (dirs.length === 0) return null;
+  const indexDir = join(dataDir, dirs[0] ?? "");
+  const childNames = readdirSync(indexDir).filter((name) => name.endsWith(".json"));
+  const items: PersistedIndex["items"] = {};
+  let indexedAt: string | undefined;
+  for (const name of childNames) {
+    const parsed = JSON.parse(readFileSync(join(indexDir, name), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    if (name === "_meta.json") {
+      if (typeof parsed.indexedAt === "string") indexedAt = parsed.indexedAt;
+      continue;
+    }
+    items[name.slice(0, -".json".length)] = parsed;
+  }
+  return { items, ...(indexedAt !== undefined ? { indexedAt } : {}) };
 }
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -316,19 +330,14 @@ describe("real Ollama — indexing flow writes real embeddings", () => {
   it("index file exists with at least one item and non-empty embeddings", () => {
     if (!ensureNotSkipped()) return;
     const handle = requireHandle(indexState);
-    const indexPath = locateIndexFile(handle.profileDir);
+    const parsed = loadPersistedIndex(handle.profileDir);
     expect(
-      indexPath,
-      `no zotero-ai-explain-index*.json found under ${handle.profileDir}/data — the real indexing crawler did not persist any items`
+      parsed,
+      `no zotero-ai-explain-index-<provider>-<model>/ directory under ${handle.profileDir}/data — the real indexing crawler did not persist any items`
     ).not.toBeNull();
-    // Narrow for TS after the expect (eslint forbids both `!` and `as string`).
-    if (indexPath === null) throw new Error("unreachable: expect.not.toBeNull above");
-    const parsed = JSON.parse(readFileSync(indexPath, "utf8")) as {
-      items?: Record<string, { title?: string; chunks?: { embedding?: number[] }[] }>;
-      indexedAt?: string;
-    };
+    if (parsed === null) throw new Error("unreachable: expect.not.toBeNull above");
     expect(typeof parsed.indexedAt).toBe("string");
-    const items = Object.values(parsed.items ?? {});
+    const items = Object.values(parsed.items);
     // The e2e harness imports sample.pdf milliseconds before the
     // crawler runs. Zotero's PDF fulltext-extraction (the path
     // `Zotero.PDFWorker.getFullText` consumes) is async and may not
