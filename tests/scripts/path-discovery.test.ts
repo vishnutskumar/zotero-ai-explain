@@ -59,23 +59,34 @@ describe("shellPathQuery", () => {
 });
 
 describe("mergePathEntries", () => {
+  // These tests use POSIX-shape inputs (`/usr/bin:/bin`); pass
+  // `platform: "linux"` so the implementation uses `:` as the
+  // delimiter regardless of the host runner.
   it("appends new entries and preserves order of existing ones", () => {
-    const out = mergePathEntries("/usr/bin:/bin", "/opt/homebrew/bin:/usr/local/bin");
+    const out = mergePathEntries("/usr/bin:/bin", "/opt/homebrew/bin:/usr/local/bin", {
+      platform: "linux"
+    });
     expect(out).toBe("/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin");
   });
 
   it("dedupes — never adds an entry already present in currentPath", () => {
-    const out = mergePathEntries("/usr/bin:/bin", "/usr/bin:/opt/homebrew/bin");
+    const out = mergePathEntries("/usr/bin:/bin", "/usr/bin:/opt/homebrew/bin", {
+      platform: "linux"
+    });
     expect(out).toBe("/usr/bin:/bin:/opt/homebrew/bin");
   });
 
   it("ignores empty / whitespace entries", () => {
-    const out = mergePathEntries(":/usr/bin: ", "/bin:::/opt/homebrew/bin: ");
+    const out = mergePathEntries(":/usr/bin: ", "/bin:::/opt/homebrew/bin: ", {
+      platform: "linux"
+    });
     expect(out).toBe("/usr/bin:/bin:/opt/homebrew/bin");
   });
 
   it("accepts an iterable additions argument", () => {
-    const out = mergePathEntries("/usr/bin", ["/bin", "/opt/homebrew/bin"]);
+    const out = mergePathEntries("/usr/bin", ["/bin", "/opt/homebrew/bin"], {
+      platform: "linux"
+    });
     expect(out).toBe("/usr/bin:/bin:/opt/homebrew/bin");
   });
 });

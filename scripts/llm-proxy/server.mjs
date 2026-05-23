@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * Ollama-compatible LLM proxy.
  *

@@ -183,7 +183,15 @@ afterAll(async () => {
   }
 });
 
-describe("codex CLI proxy pipeline (real subprocess + real HTTP)", () => {
+// `writeFakeCodex` emits a `#!/bin/bash` script (cat + heredoc). The
+// shebang + bash chain works on POSIX but Windows lacks `/bin/bash`
+// and ignores shebangs at OS level — the spawn silently returns no
+// stdout. The pipeline coverage is POSIX-only; Linux + macOS CI
+// already exercise it. A future port to a Node-script fake would
+// unlock cross-platform coverage.
+const describeOnPosix = process.platform === "win32" ? describe.skip : describe;
+
+describeOnPosix("codex CLI proxy pipeline (real subprocess + real HTTP)", () => {
   it("ollama adapter pointed at /codex receives a delta with the agent_message text", async () => {
     if (proxy === null) throw new Error("proxy did not start");
     const provider = createOllamaProvider({ fetch: globalThis.fetch });
