@@ -196,7 +196,7 @@
  *    so they stay correct if the harness's embed provider/model changes.
  */
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -407,15 +407,20 @@ beforeAll(async () => {
 
 afterAll(async () => {
   if (state.handle) {
-    // DIAG: dump captured log to /tmp before cleanup so we can inspect what
-    // the production AI-EXPLAIN diag emitted during the real-bridge dispatch.
+    // Dump the captured Zotero log into a workspace-relative location
+    // so the CI artifact upload step picks it up. The previous path
+    // `/var/test-fixture/...` was a synthetic fixture-style address
+    // that didn't exist on any real runner; logs were silently
+    // dropped on every failed run. Use `.zotero-e2e/` because the
+    // workflow already globs that path (and it lives under
+    // $GITHUB_WORKSPACE which upload-artifact@v4 requires).
     try {
-      const { writeFileSync } = await import("node:fs");
       const captured = state.handle.getLog();
-      writeFileSync("/var/test-fixture/zotero-e2e-latest.log", captured);
-      process.stderr.write(
-        `[DIAG] dumped log to /var/test-fixture/zotero-e2e-latest.log (${String(captured.length)} bytes)\n`
-      );
+      const logDir = join(process.cwd(), ".zotero-e2e");
+      mkdirSync(logDir, { recursive: true });
+      const logPath = join(logDir, "zotero-test-log.txt");
+      writeFileSync(logPath, captured);
+      process.stderr.write(`[DIAG] dumped log to ${logPath} (${String(captured.length)} bytes)\n`);
     } catch (err) {
       process.stderr.write(
         `[DIAG] failed to dump log: ${err instanceof Error ? err.message : String(err)}\n`

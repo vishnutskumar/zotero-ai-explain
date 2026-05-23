@@ -437,7 +437,6 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
           path: |
-            /tmp/zotero-e2e-latest.log
             .zotero-e2e/**
             zotero-ai-explain.xpi
             dist/*.xpi
