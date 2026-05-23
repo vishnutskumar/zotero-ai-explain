@@ -33,8 +33,28 @@
  * same `extractLast` pattern the fake-Ollama suite uses.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+
+/**
+ * Locate the persisted index file. Per ADR-0002 the production
+ * crawler writes a per-(embed-provider, model) filename like
+ * `zotero-ai-explain-index-ollama-embeddinggemma.json`; the legacy
+ * flat `zotero-ai-explain-index.json` is a read-only back-compat
+ * alias the crawler never writes. Glob the data dir for any matching
+ * file and prefer a per-provider name over the legacy alias.
+ */
+function locateIndexFile(profileDir: string): string | null {
+  const dataDir = join(profileDir, "data");
+  if (!existsSync(dataDir)) return null;
+  const candidates = readdirSync(dataDir).filter(
+    (name) => name.startsWith("zotero-ai-explain-index") && name.endsWith(".json")
+  );
+  const perProvider = candidates.find((name) => name !== "zotero-ai-explain-index.json");
+  const legacy = candidates.find((name) => name === "zotero-ai-explain-index.json");
+  const chosen = perProvider ?? legacy;
+  return chosen === undefined ? null : join(dataDir, chosen);
+}
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -296,11 +316,13 @@ describe("real Ollama — indexing flow writes real embeddings", () => {
   it("index file exists with at least one item and non-empty embeddings", () => {
     if (!ensureNotSkipped()) return;
     const handle = requireHandle(indexState);
-    const indexPath = join(handle.profileDir, "data", "zotero-ai-explain-index.json");
+    const indexPath = locateIndexFile(handle.profileDir);
     expect(
-      existsSync(indexPath),
-      `index file missing at ${indexPath} — the real indexing crawler did not persist any items`
-    ).toBe(true);
+      indexPath,
+      `no zotero-ai-explain-index*.json found under ${handle.profileDir}/data — the real indexing crawler did not persist any items`
+    ).not.toBeNull();
+    // Narrow for TS after the expect (eslint forbids both `!` and `as string`).
+    if (indexPath === null) throw new Error("unreachable: expect.not.toBeNull above");
     const parsed = JSON.parse(readFileSync(indexPath, "utf8")) as {
       items?: Record<string, { title?: string; chunks?: { embedding?: number[] }[] }>;
       indexedAt?: string;

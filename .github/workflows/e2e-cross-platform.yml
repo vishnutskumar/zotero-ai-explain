@@ -63,7 +63,7 @@ jobs:
         # (8.0–9.99.99). Both pinned versions are current CDN-available
         # stable releases at workflow-author time; bump to the latest
         # available stable for each major when newer points ship.
-        zotero-version: ["8.0.4", "9.0.3"]
+        zotero-version: ["8.0.4", "9.0.4"]
 
     env:
       ZOTERO_VERSION: ${{ matrix.zotero-version }}
@@ -156,7 +156,11 @@ jobs:
           # The "Setup" exe is an NSIS-style installer that accepts /S for
           # silent install and /D=<path> (must be LAST arg, no quotes) for
           # the install directory.
-          $url = "https://download.zotero.org/client/release/$version/Zotero-${version}_setup.exe"
+          # The Windows installer is published as `Zotero-VERSION_x64_setup.exe`
+          # (the `_x64_` infix is REQUIRED — the older `Zotero-VERSION_setup.exe`
+          # pattern returns 403 on the CDN). Verified against the dl?platform
+          # redirect, which resolves to the `_x64_setup.exe` form.
+          $url = "https://download.zotero.org/client/release/$version/Zotero-${version}_x64_setup.exe"
           # The Zotero CDN intermittently returns 403 AccessDenied (we've
           # seen it on Windows multiple times). Retry with backoff before
           # failing the workflow.
