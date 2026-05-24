@@ -69,10 +69,7 @@ export type CodexBackendDeps = {
 export function createCodexBackend(deps?: CodexBackendDeps): CodexBackend;
 
 export function extractDeltaText(event: unknown): string | null;
-export function buildCodexArgs(input: {
-  readonly sessionId: string | null;
-  readonly model?: string;
-}): string[];
+export function buildCodexMcpArgs(input?: { readonly model?: string }): string[];
 
 export function describeCodexFailure(input: {
   readonly spawnError: NodeJS.ErrnoException | Error | null | undefined;

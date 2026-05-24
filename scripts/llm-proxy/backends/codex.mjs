@@ -1,38 +1,73 @@
 /**
  * Codex CLI backend for the Ollama-compatible LLM proxy.
  *
- * Translates an Ollama `/api/chat` request into a `codex exec --json` (first
- * turn) or `codex exec resume <SESSION_ID>` (subsequent turn) invocation, then
- * streams Codex's stdout back to the caller as Ollama-format NDJSON delta
- * objects.
+ * Translates an Ollama `/api/chat` request into a `codex mcp-server` spawn
+ * driven by a minimal MCP JSON-RPC handshake. The MCP server is the only
+ * non-experimental Codex subcommand that streams per-token deltas — `codex
+ * exec --json` emits a single `item.completed AgentMessage` envelope at the
+ * end of the turn (no flag / env var / PTY trick changes that), so we drive
+ * `codex mcp-server` instead.
+ *
+ * Per-turn wire shape
+ * -------------------
+ * For each turn the backend spawns a fresh `codex mcp-server` child, writes
+ * three line-delimited JSON-RPC frames to its stdin, then reads JSON-RPC
+ * notifications + the final response off its stdout:
+ *
+ *   stdin (first turn):
+ *     {"jsonrpc":"2.0","id":0,"method":"initialize",
+ *       "params":{"protocolVersion":"2024-11-05","capabilities":{},
+ *                 "clientInfo":{"name":"zotero-ai-proxy"}}}
+ *     {"jsonrpc":"2.0","method":"notifications/initialized"}
+ *     {"jsonrpc":"2.0","id":1,"method":"tools/call",
+ *       "params":{"name":"codex",
+ *                 "arguments":{"prompt":"<latest user>",
+ *                              "sandbox":"read-only",
+ *                              "approval-policy":"never",
+ *                              "cwd":"<process.cwd()>",
+ *                              "model":"<optional>"}}}
+ *
+ *   stdin (subsequent turn):
+ *     … same initialize + notifications/initialized …
+ *     {"jsonrpc":"2.0","id":1,"method":"tools/call",
+ *       "params":{"name":"codex-reply",
+ *                 "arguments":{"threadId":"<priorThreadId>","prompt":"…"}}}
+ *
+ *   stdout:
+ *     {"jsonrpc":"2.0","method":"codex/event","params":{… "msg":{…}}}
+ *       per-token deltas live at msg.type === "agent_message_content_delta"
+ *       (msg.delta carries the text fragment); every other msg.type carries
+ *       internal lifecycle / aggregated / tool data and is denied so it
+ *       never reaches the popup.
+ *     {"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"threadId":"…"}}}
+ *       arrives once the turn is done — we read the threadId here and close
+ *       stdin so the child exits.
  *
  * Multi-turn correlation
  * ----------------------
- * Codex sessions are file-backed. Each session has a `session_id` that the CLI
- * emits in its `--json` event stream. The proxy keeps an in-memory
- * `Map<conversationKey, sessionId>` where `conversationKey` is derived from
- * the SHA-256 of the first user message in the incoming `messages[]` array
- * (truncated to 16 hex chars). This is stable for the duration of the proxy
- * process — a restart drops resume state, which is acceptable because the
- * plugin can always start a fresh conversation.
+ * Codex's `threadId` replaces the legacy `session_id` 1:1: the
+ * `tools/call codex-reply { threadId }` argument accepts the same UUID
+ * shape that `codex exec resume <id>` did. We keep an in-memory
+ * `Map<conversationKey, threadId>` where `conversationKey` is derived
+ * from the SHA-256 of the first user message in the incoming `messages[]`
+ * array (truncated to 16 hex chars). This is stable for the duration of
+ * the proxy process — a restart drops resume state, which is acceptable
+ * because the plugin can always start a fresh conversation.
  *
- * Session ID discovery (defensive)
- * --------------------------------
- * The exact JSON event shape from `codex exec --json` evolves between
- * releases. To stay robust we:
+ * Thread ID discovery (defensive)
+ * -------------------------------
+ * To stay robust against minor shape changes between releases we:
  *
- * 1. Parse every stdout line as JSON; for each object we recursively walk all
- *    keys looking for `session_id` and accept the first hit (covers both
- *    top-level `{"type":"session_configured","session_id":"..."}` and nested
- *    shapes like `{"msg":{"session_id":"..."}}`).
- * 2. If stdout does not expose a session_id by the time the child exits, we
- *    fall back to scanning `~/.codex/sessions/**` for the newest `.jsonl`
- *    file modified after the spawn began, and extract the session_id from
- *    its filename (codex's documented rollout filename is
- *    `rollout-<TIMESTAMP>-<SESSION_ID>.jsonl`) or first JSONL line.
- *
- * The result record documents the actual mechanism observed on the user's
- * machine; this module supports either.
+ * 1. Read `result.structuredContent.threadId` from the `tools/call`
+ *    response (the documented MCP result shape).
+ * 2. Fall back to a recursive walk of every `codex/event` notification's
+ *    `params`, accepting the first `thread_id` / `session_id` string we
+ *    find (covers `params._meta.threadId` and `params.msg.thread_id`).
+ * 3. Final fallback: scan `~/.codex/sessions/**` for the newest `.jsonl`
+ *    file modified after the spawn began, and extract the UUID from its
+ *    `rollout-<TIMESTAMP>-<UUID>.jsonl` filename or first JSONL line.
+ *    `codex mcp-server` writes the same rollout files as `codex exec`,
+ *    so this fallback still resolves the same UUID.
  */
 
 import { spawn as defaultSpawn } from "node:child_process";
@@ -261,12 +296,12 @@ function latestUserContent(messages) {
 
 /**
  * Recursively search a parsed JSON object for the codex CLI conversation
- * id. Codex's event schema named this `session_id` in earlier releases
- * and `thread_id` in the current release (the in-process artefact is a
- * "thread" — `codex exec resume` accepts the same UUID per its help
- * text: "Conversation/session id (UUID) or thread name"). We accept
- * either field name so the proxy survives the rename without losing
- * multi-turn resume.
+ * id. Codex's event schema named this `session_id` in earlier releases,
+ * `thread_id` in the `codex exec --json` shape, and `threadId` (camelCase)
+ * in the MCP-server `_meta` envelope. The in-process artefact is a
+ * "thread" — `tools/call codex-reply { threadId }` accepts the same UUID
+ * that `codex exec resume` did. We accept any of the three field names
+ * so the proxy survives the rename without losing multi-turn resume.
  */
 function findSessionId(value) {
   if (value === null || value === undefined) return null;
@@ -280,7 +315,7 @@ function findSessionId(value) {
   }
   for (const [key, val] of Object.entries(value)) {
     if (
-      (key === "session_id" || key === "thread_id") &&
+      (key === "session_id" || key === "thread_id" || key === "threadId") &&
       typeof val === "string" &&
       val.length > 0
     ) {
@@ -294,10 +329,29 @@ function findSessionId(value) {
 
 /**
  * Event types whose payload is internal to codex's reasoning loop and
- * must never surface as assistant content. Centralised so every text-
- * extracting branch consults the same denylist — preventing the
- * "command_execution event with a top-level `delta` field" bypass that
- * an earlier per-branch denylist missed.
+ * must NEVER surface as assistant content. Includes:
+ *
+ *   - Legacy `codex exec --json` types (`command_execution`, `reasoning`,
+ *     `user_message`, `system_message`, `user_input`, `thread.started`,
+ *     `turn.started`, `turn.completed`) — retained so the test fixtures
+ *     that replay the old shape still suppress correctly.
+ *   - MCP-server-only types (`session_configured`, `mcp_startup_update`,
+ *     `task_started`, `task_complete`, `raw_response_item`, `item_started`,
+ *     `item_completed`, `agent_message`) — `item_completed` /
+ *     `raw_response_item` / `agent_message` each carry the FULL assembled
+ *     response after the per-token deltas have already streamed; surfacing
+ *     any of them would emit the final answer two or three times into the
+ *     popup.
+ *
+ * Entries are listed once in `snake_case` (the MCP wire convention).
+ * Incoming `msg.type` strings are normalized via `normalizeMsgType` at
+ * the comparison site, so PascalCase variants codex has historically
+ * emitted (e.g. `Reasoning`, `UserMessage`, `AgentMessage`) match
+ * automatically without duplicating entries here.
+ *
+ * Centralised so every text-extracting branch consults the same denylist —
+ * preventing the "command_execution event with a top-level `delta` field"
+ * bypass that an earlier per-branch denylist missed.
  */
 const NON_ASSISTANT_EVENT_TYPES = new Set([
   "command_execution",
@@ -307,21 +361,81 @@ const NON_ASSISTANT_EVENT_TYPES = new Set([
   "user_input",
   "thread.started",
   "turn.started",
-  "turn.completed"
+  "turn.completed",
+  "session_configured",
+  "mcp_startup_update",
+  "task_started",
+  "task_complete",
+  "raw_response_item",
+  "item_started",
+  "item_completed",
+  "agent_message"
 ]);
 
-/** Extract an assistant text fragment from a codex JSON event, if any. */
+/**
+ * Normalize a codex event `msg.type` string to its canonical snake_case
+ * form for set-membership lookup. Codex has shipped at least two casings
+ * for the same logical event (`agent_message` and `AgentMessage`,
+ * `reasoning` and `Reasoning`, …). Rather than maintaining both casings
+ * in `NON_ASSISTANT_EVENT_TYPES`, we keep one canonical entry and
+ * snake-case the comparand here.
+ *
+ * Examples:
+ *   "AgentMessage"  -> "agent_message"
+ *   "agent_message" -> "agent_message"
+ *   "Reasoning"     -> "reasoning"
+ *   "thread.started" -> "thread.started"  (dots / digits untouched)
+ */
+function normalizeMsgType(t) {
+  if (typeof t !== "string" || t.length === 0) return t;
+  return t.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+}
+
+/**
+ * Extract an assistant text fragment from a codex JSON event, if any.
+ *
+ * The proxy now drives `codex mcp-server`. Per-token deltas arrive as
+ * JSON-RPC notifications:
+ *   {jsonrpc:"2.0", method:"codex/event",
+ *    params:{ msg:{ type:"agent_message_content_delta", delta:"…" } } }
+ *
+ * Everything else returns null. In particular the THREE terminal envelopes
+ * `codex mcp-server` emits AFTER the deltas — `item_completed AgentMessage`,
+ * `raw_response_item`, and `agent_message` — would otherwise re-emit the
+ * full answer two or three times. They're all in `NON_ASSISTANT_EVENT_TYPES`.
+ *
+ * Legacy `codex exec --json` shapes (`agent_message_delta`,
+ * `item.completed agent_message`, top-level `content` arrays, etc.) are
+ * preserved so existing fixtures and the live-fixture integration test
+ * continue to surface their text via the same extractor.
+ */
 export function extractDeltaText(event) {
   if (!event || typeof event !== "object") return null;
-  // Shapes observed across codex CLI versions:
-  //   legacy: {type:"agent_message_delta",delta:"..."} | {type:"agent_message",message:"..."} | nested under `msg` | {content:[{type:"text",text}]}
-  //   current: {type:"item.completed",item:{type:"agent_message",text:"..."}} (or item.delta with item.delta)
+
+  // MCP-server JSON-RPC notification: descend into params.msg.
+  if (event.method === "codex/event" && event.params && typeof event.params === "object") {
+    const inner = event.params.msg;
+    if (!inner || typeof inner !== "object") return null;
+    if (
+      inner.type === "agent_message_content_delta" &&
+      typeof inner.delta === "string" &&
+      inner.delta.length > 0
+    ) {
+      return inner.delta;
+    }
+    // Every other MCP envelope (task_started, mcp_startup_update,
+    // item_completed AgentMessage, raw_response_item, …) is denied so
+    // the assembled response doesn't replay after the deltas.
+    return null;
+  }
+
+  // Legacy shapes from `codex exec --json` and from existing fixtures.
   // Tool-call and framing events carry text fields that are internal —
   // any of those reaching the popup would dump shell output / reasoning
   // into the user's explanation.
   const msg = event.msg && typeof event.msg === "object" ? event.msg : event;
   const t = typeof msg.type === "string" ? msg.type : null;
-  if (t !== null && NON_ASSISTANT_EVENT_TYPES.has(t)) return null;
+  if (t !== null && NON_ASSISTANT_EVENT_TYPES.has(normalizeMsgType(t))) return null;
 
   if ((t === "item.completed" || t === "item.delta") && msg.item && typeof msg.item === "object") {
     const item = msg.item;
@@ -404,16 +518,29 @@ async function findNewestJsonlSince(root, sinceMs, fsImpl) {
 }
 
 /**
- * Build the argv passed to `codex exec`.
- * - First turn:  ["exec", "--json", "--skip-git-repo-check", "-"]   (prompt via stdin)
- * - Resume:      ["exec", "resume", <SESSION_ID>, "--json", "--skip-git-repo-check", "-"]
+ * Build the argv passed to `codex` for the MCP-server backend.
+ * - Default:        ["mcp-server", "-c", "mcp_servers={}"]
+ * - With a model:   ["mcp-server", "-c", "mcp_servers={}", "-c", "model=<name>"]
+ *
+ * The `-c mcp_servers={}` override is always present. Codex's `-c` flag
+ * parses the value as TOML (per `codex --help`); the inline empty table
+ * `{}` overrides any `[mcp_servers]` section in `~/.codex/config.toml`,
+ * preventing user-configured MCP sidecars from spawning. We drive
+ * `codex mcp-server` purely as a streaming chat backend, so paying the
+ * startup cost of every configured MCP server (each typically 200-800 ms)
+ * would directly inflate spawn→first-delta latency without delivering
+ * any feature value. Users with 3-5 configured MCPs saw 1-3 s of avoidable
+ * startup per turn without this override.
+ *
+ * Session resume is handled inside the MCP `tools/call` arguments
+ * (`name: "codex-reply"` with `threadId`), NOT via argv — so the same
+ * argv applies to first turns and resumes.
  */
-export function buildCodexArgs({ sessionId, model }) {
-  const base = ["exec"];
-  if (sessionId) base.push("resume", sessionId);
-  base.push("--json", "--skip-git-repo-check");
-  if (model) base.push("--model", model);
-  base.push("-");
+export function buildCodexMcpArgs({ model } = {}) {
+  const base = ["mcp-server", "-c", "mcp_servers={}"];
+  if (typeof model === "string" && model.length > 0) {
+    base.push("-c", `model=${model}`);
+  }
   return base;
 }
 
@@ -481,7 +608,7 @@ export function createCodexBackend(deps = {}) {
     const key = conversationKeyFromMessages(messages);
     const isFirstTurn = !sessionMap.has(key) || messages.length <= 1;
     const sessionId = isFirstTurn ? null : sessionMap.get(key);
-    const argv = buildCodexArgs({ sessionId: sessionId ?? null, model: requestedModel });
+    const argv = buildCodexMcpArgs({ model: requestedModel });
     const prompt = latestUserContent(messages);
     const spawnStartedAtMs = now();
 
@@ -489,11 +616,58 @@ export function createCodexBackend(deps = {}) {
       stdio: ["pipe", "pipe", "pipe"]
     });
 
-    // Pipe the prompt in via stdin.
+    // Write the three MCP JSON-RPC handshake frames to stdin. The
+    // tools/call frame uses `name: "codex"` for the first turn or
+    // `name: "codex-reply"` (with the prior threadId) for resumes.
+    // After writing we keep stdin OPEN so the child can still see the
+    // notifications it expects; we close stdin once the tools/call
+    // response arrives (or the child exits / a timeout fires).
+    const TOOL_CALL_ID = 1;
+    const toolName = sessionId ? "codex-reply" : "codex";
+    const toolArguments = sessionId
+      ? { threadId: sessionId, prompt }
+      : (() => {
+          const base = {
+            prompt,
+            sandbox: "read-only",
+            "approval-policy": "never",
+            cwd: process.cwd()
+          };
+          if (typeof requestedModel === "string" && requestedModel.length > 0) {
+            base.model = requestedModel;
+          }
+          return base;
+        })();
+    const initializeFrame = {
+      jsonrpc: "2.0",
+      id: 0,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "zotero-ai-proxy" }
+      }
+    };
+    const initializedFrame = { jsonrpc: "2.0", method: "notifications/initialized" };
+    const toolCallFrame = {
+      jsonrpc: "2.0",
+      id: TOOL_CALL_ID,
+      method: "tools/call",
+      params: { name: toolName, arguments: toolArguments }
+    };
+    function closeStdin() {
+      if (!child.stdin) return;
+      try {
+        child.stdin.end();
+      } catch {
+        // ignore — child may already have exited
+      }
+    }
     if (child.stdin) {
       try {
-        child.stdin.write(prompt);
-        child.stdin.end();
+        child.stdin.write(`${JSON.stringify(initializeFrame)}\n`);
+        child.stdin.write(`${JSON.stringify(initializedFrame)}\n`);
+        child.stdin.write(`${JSON.stringify(toolCallFrame)}\n`);
       } catch {
         // child may have died before stdin was usable; surfaced via exit handling
       }
@@ -508,12 +682,13 @@ export function createCodexBackend(deps = {}) {
     let aborted = false;
     let idleTimer = null;
     let hardTimer = null;
+    let rpcErrorMessage = null;
     // AC-12: spawn-timing MEASUREMENT (not a behaviour change). `codex
-    // exec` has no daemon/persistent-process mode — every turn pays a
-    // fresh process spawn + CLI init — so AC-12 makes the spawn-vs-
-    // inference split an observable fact in the proxy logs rather than
-    // attempting an unbuildable "warm daemon". `firstDeltaLogged` gates
-    // the spawn→first-delta line to the FIRST streamed delta only.
+    // mcp-server` is spawned per turn (no daemon mode), so AC-12 makes
+    // the spawn-vs-inference split an observable fact in the proxy logs
+    // rather than attempting an unbuildable "warm daemon".
+    // `firstDeltaLogged` gates the spawn→first-delta line to the FIRST
+    // streamed delta only.
     let firstDeltaLogged = false;
 
     function emitDelta(text) {
@@ -529,6 +704,49 @@ export function createCodexBackend(deps = {}) {
         message: { role: "assistant", content: text },
         done: false
       });
+    }
+
+    function processEvent(event) {
+      // Discover the codex threadId opportunistically from any nested
+      // _meta / msg field. The recursive walker accepts session_id,
+      // thread_id and threadId.
+      if (!discoveredSessionId) {
+        const found = findSessionId(event);
+        if (found) discoveredSessionId = found;
+      }
+      // tools/call response: capture the threadId from
+      // structuredContent and close stdin so the MCP server exits
+      // cleanly. Also short-circuit any per-turn `error` field on the
+      // JSON-RPC envelope.
+      if (event && typeof event === "object" && event.id === TOOL_CALL_ID) {
+        if (event.result && typeof event.result === "object") {
+          const sc = event.result.structuredContent;
+          if (
+            sc &&
+            typeof sc === "object" &&
+            typeof sc.threadId === "string" &&
+            sc.threadId.length > 0
+          ) {
+            discoveredSessionId = sc.threadId;
+          }
+          closeStdin();
+          return;
+        }
+        if (event.error && typeof event.error === "object") {
+          rpcErrorMessage =
+            typeof event.error.message === "string" && event.error.message.length > 0
+              ? event.error.message
+              : `codex MCP error ${String(event.error.code ?? "")}`.trim();
+          // Don't flag `aborted` — that would force the fallback exit
+          // branch to label the terminal as "timeout". The RPC error is
+          // explicit and we surface it via the rpcErrorMessage branch
+          // below.
+          closeStdin();
+          return;
+        }
+      }
+      const delta = extractDeltaText(event);
+      if (delta) emitDelta(delta);
     }
 
     function handleStdoutChunk(chunk) {
@@ -550,14 +768,7 @@ export function createCodexBackend(deps = {}) {
           emitDelta(line);
           continue;
         }
-        if (!discoveredSessionId) {
-          const found = findSessionId(event);
-          if (found) discoveredSessionId = found;
-        }
-        const delta = extractDeltaText(event);
-        if (delta) emitDelta(delta);
-        // task_complete is informational; final done is emitted on child exit
-        // (so non-zero exits surface as errors rather than premature success).
+        processEvent(event);
       }
       stdoutBuffer = stdoutBuffer.slice(from);
     }
@@ -655,12 +866,7 @@ export function createCodexBackend(deps = {}) {
       const trailing = stdoutBuffer.trim();
       try {
         const event = JSON.parse(trailing);
-        if (!discoveredSessionId) {
-          const found = findSessionId(event);
-          if (found) discoveredSessionId = found;
-        }
-        const delta = extractDeltaText(event);
-        if (delta) emitDelta(delta);
+        processEvent(event);
       } catch {
         emitDelta(trailing);
       }
@@ -668,12 +874,33 @@ export function createCodexBackend(deps = {}) {
     }
 
     // Session-id fallback: scan disk if codex did not surface one in stdout.
+    // mcp-server writes the same rollout files as `codex exec`, so this
+    // fallback still resolves the same UUID when stdout didn't expose one
+    // (e.g. the tools/call response carried no structuredContent.threadId
+    // and no nested _meta.threadId / msg.thread_id).
     if (!discoveredSessionId) {
       const fromDisk = await readSessionIdFromDisk(spawnStartedAtMs, fsImpl, sessionsDir);
       if (fromDisk) discoveredSessionId = fromDisk;
     }
 
     if (discoveredSessionId) sessionMap.set(key, discoveredSessionId);
+
+    // JSON-RPC `error` envelope on the tools/call response → surface as
+    // a terminal error chunk regardless of the child's exit status. The
+    // MCP server typically exits 0 even when the tool call returned an
+    // error envelope, so a clean exit code is not by itself proof of
+    // success.
+    if (rpcErrorMessage !== null) {
+      onEvent({
+        model: requestedModel,
+        created_at: new Date().toISOString(),
+        message: { role: "assistant", content: "" },
+        done: true,
+        done_reason: "error",
+        error: rpcErrorMessage
+      });
+      return { exitCode, sessionId: discoveredSessionId, fullText, createdAt };
+    }
 
     if (exitCode !== 0) {
       const stderr = stderrBuffer.slice(0, 500).trim();

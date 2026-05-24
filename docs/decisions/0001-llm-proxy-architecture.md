@@ -16,18 +16,29 @@ neither speaks an HTTP wire protocol the plugin's existing `OllamaProvider` can 
 Ship a small Node HTTP service (`scripts/llm-proxy/server.mjs`) that exposes the **Ollama
 `/api/chat` wire protocol on the front side** and routes to one of three backends:
 
-- `POST /codex/api/chat` — `codex exec --json -` (first turn) / `codex exec resume <ID> --json -`
-  (follow-ups). Translates Codex's JSON event stream into Ollama-format NDJSON.
-- `POST /claude/api/chat` — `claude -p --output-format json --allowedTools "" -`. The empty
-  `--allowedTools` allowlist hard-disables every Claude Code tool so the CLI behaves as a pure chat
-  model. Multi-turn via `claude --resume <ID>`.
+- `POST /codex/api/chat` — `codex mcp-server -c mcp_servers={}` driven by a three-frame JSON-RPC
+  handshake (`initialize` → `notifications/initialized` → `tools/call codex` for first turns;
+  `tools/call codex-reply { threadId }` for follow-ups). Per-token deltas arrive as `codex/event`
+  notifications carrying `msg.type === "agent_message_content_delta"` and are translated into
+  Ollama-format NDJSON. The `-c mcp_servers={}` override suppresses user-configured MCP sidecars
+  since the proxy uses `codex mcp-server` purely as a streaming chat backend. The MCP server is the
+  only Codex subcommand that streams per-token; `codex exec --json` emits a single terminal envelope
+  at the end of the turn and was rejected for that reason.
+- `POST /claude/api/chat` —
+  `claude -p --output-format stream-json --verbose --include-partial-messages --allowedTools "" -`.
+  The stream-json output format emits per-chunk `content_block_delta` text frames every ~300-500 ms;
+  `--verbose` is mandatory for stream-json and `--include-partial-messages` is what enables the
+  per-chunk deltas. The empty `--allowedTools` allowlist hard-disables every Claude Code tool so the
+  CLI behaves as a pure chat model. Multi-turn via `claude --resume <ID>`.
 - `POST /ollama/api/chat` — passthrough to a real Ollama daemon.
 
 Multi-turn correlation is in the proxy: the SHA-256 of the first user message in `messages[]`
 (truncated to 16 hex chars) becomes the conversation key; the proxy stores the backend's
-`session_id` under that key in memory. Restarting the proxy drops all resume state — matching the
-plugin's "each popup is a fresh conversation" behaviour. The plugin's `OllamaProvider` needs zero
-changes; an Ollama profile's Base URL is set to `.../codex`, `.../claude`, or `.../ollama`.
+conversation id under that key in memory (the Codex `threadId` from `tools/call`'s
+`result.structuredContent`, or the Claude `session_id` from the stream-json `result` envelope).
+Restarting the proxy drops all resume state — matching the plugin's "each popup is a fresh
+conversation" behaviour. The plugin's `OllamaProvider` needs zero changes; an Ollama profile's Base
+URL is set to `.../codex`, `.../claude`, or `.../ollama`.
 
 ## Consequences
 

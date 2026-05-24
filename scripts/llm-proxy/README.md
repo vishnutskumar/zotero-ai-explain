@@ -3,14 +3,19 @@
 A small Node HTTP server that speaks the Ollama `/api/chat` wire protocol on the front side and
 routes each request to one of three backends:
 
-- **Codex CLI** (`POST /codex/api/chat`) — spawns `codex exec --json -` (or
-  `codex exec resume <SESSION_ID> --json -` for follow-up turns) and translates Codex's JSON event
-  stream into Ollama-format NDJSON chunks.
+- **Codex CLI** (`POST /codex/api/chat`) — spawns `codex mcp-server -c mcp_servers={}` and drives it
+  with a three-frame JSON-RPC handshake (`initialize` → `notifications/initialized` →
+  `tools/call codex` for first turns, `tools/call codex-reply { threadId }` for follow-up turns).
+  Per-token deltas arrive as `codex/event` notifications carrying
+  `msg.type === "agent_message_content_delta"` and are translated into Ollama-format NDJSON chunks.
+  The `-c mcp_servers={}` override suppresses any user-configured MCP sidecars (which would
+  otherwise add 1-3 s of avoidable per-turn startup) since the proxy uses `codex mcp-server` purely
+  as a streaming chat backend.
 - **Claude Code CLI** (`POST /claude/api/chat`) — spawns
-  `claude -p --output-format json --allowedTools "" -` (or
-  `claude --resume <SESSION_ID> -p --output-format json --allowedTools "" -` for follow-up turns)
-  and translates Claude's JSON output into Ollama-format NDJSON chunks. Tool use is hard-disabled
-  via the empty `--allowedTools` allowlist so Claude behaves as a pure chat model.
+  `claude -p --output-format stream-json --verbose --include-partial-messages --allowedTools "" -`
+  (or the same with a leading `--resume <SESSION_ID>` for follow-up turns) and translates the
+  incremental `content_block_delta` text frames into Ollama-format NDJSON chunks. Tool use is
+  hard-disabled via the empty `--allowedTools` allowlist so Claude behaves as a pure chat model.
 - **Real Ollama** (`POST /ollama/api/chat`) — forwards verbatim to a real Ollama daemon (default
   `http://localhost:11434`).
 
@@ -29,7 +34,7 @@ Output:
 
 ```text
 zotero-ai-llm-proxy listening on http://127.0.0.1:11400
-  /codex   → Codex CLI (multi-turn session_id resume)
+  /codex   → Codex CLI (multi-turn via codex-reply { threadId })
   /claude  → Claude Code CLI (multi-turn --resume)
   /ollama  → http://localhost:11434
 ```
@@ -38,8 +43,8 @@ zotero-ai-llm-proxy listening on http://127.0.0.1:11400
 
 | Method | Path                | Behaviour                                                    |
 | ------ | ------------------- | ------------------------------------------------------------ |
-| POST   | `/codex/api/chat`   | Ollama-compatible chat backed by `codex exec`.               |
-| POST   | `/claude/api/chat`  | Ollama-compatible chat backed by `claude -p`.                |
+| POST   | `/codex/api/chat`   | Ollama-compatible chat backed by `codex mcp-server`.         |
+| POST   | `/claude/api/chat`  | Ollama-compatible chat backed by `claude -p` (stream-json).  |
 | POST   | `/ollama/api/chat`  | Passthrough to a real Ollama daemon.                         |
 | POST   | `/ollama/api/embed` | Passthrough Ollama embeddings (Codex/Claude do not support). |
 | POST   | `/codex/api/embed`  | 501 — Codex does not support embeddings.                     |
@@ -54,17 +59,17 @@ zotero-ai-llm-proxy listening on http://127.0.0.1:11400
 
 All settings are environment variables read at startup.
 
-| Variable                 | Default                  | Purpose                                                  |
-| ------------------------ | ------------------------ | -------------------------------------------------------- |
-| `LLM_PROXY_PORT`         | `11400`                  | Listen port on `127.0.0.1`.                              |
-| `OLLAMA_BASE_URL`        | `http://localhost:11434` | Real Ollama daemon for the passthrough backend.          |
-| `CODEX_DEFAULT_MODEL`    | `gpt-5.2-codex`          | Model passed via `codex exec --model` when none in body. |
-| `CODEX_IDLE_TIMEOUT_MS`  | `60000`                  | Kill `codex` after this long with no output activity.    |
-| `CODEX_HARD_TIMEOUT_MS`  | `300000`                 | Kill `codex` after this long regardless of activity.     |
-| `CLAUDE_BINARY`          | `claude` (search `PATH`) | Path to the `claude` CLI executable.                     |
-| `CLAUDE_DEFAULT_MODEL`   | _(empty)_                | Model passed via `claude --model` when none in body.     |
-| `CLAUDE_IDLE_TIMEOUT_MS` | `60000`                  | Kill `claude` after this long with no output activity.   |
-| `CLAUDE_HARD_TIMEOUT_MS` | `300000`                 | Kill `claude` after this long regardless of activity.    |
+| Variable                 | Default                  | Purpose                                                                     |
+| ------------------------ | ------------------------ | --------------------------------------------------------------------------- |
+| `LLM_PROXY_PORT`         | `11400`                  | Listen port on `127.0.0.1`.                                                 |
+| `OLLAMA_BASE_URL`        | `http://localhost:11434` | Real Ollama daemon for the passthrough backend.                             |
+| `CODEX_DEFAULT_MODEL`    | `gpt-5.5`                | Model passed via `-c model=<name>` to `codex mcp-server` when none in body. |
+| `CODEX_IDLE_TIMEOUT_MS`  | `60000`                  | Kill `codex` after this long with no output activity.                       |
+| `CODEX_HARD_TIMEOUT_MS`  | `300000`                 | Kill `codex` after this long regardless of activity.                        |
+| `CLAUDE_BINARY`          | `claude` (search `PATH`) | Path to the `claude` CLI executable.                                        |
+| `CLAUDE_DEFAULT_MODEL`   | _(empty)_                | Model passed via `claude --model` when none in body.                        |
+| `CLAUDE_IDLE_TIMEOUT_MS` | `60000`                  | Kill `claude` after this long with no output activity.                      |
+| `CLAUDE_HARD_TIMEOUT_MS` | `300000`                 | Kill `claude` after this long regardless of activity.                       |
 
 ## Wire contract
 
@@ -102,31 +107,38 @@ When `stream: false`, the response is a single JSON object of the same shape wit
 ## Codex multi-turn
 
 The proxy correlates conversations using **the SHA-256 of the first user message in `messages[]`**
-(truncated to 16 hex chars). For each unique fingerprint, it stores the Codex `session_id` returned
-by the first invocation:
+(truncated to 16 hex chars). For each unique fingerprint, it stores the Codex `threadId` returned by
+the first invocation's `tools/call` response:
 
-1. **First turn** — `codex exec --json --skip-git-repo-check --model <M> -` with the latest user
-   message on stdin.
-2. **Subsequent turn** — `codex exec resume <SESSION_ID> --json --skip-git-repo-check --model <M> -`
-   with the latest user message on stdin.
+1. **First turn** — spawn `codex mcp-server -c mcp_servers={}` (plus an optional `-c model=<M>`) and
+   write three JSON-RPC frames to stdin: `initialize`, `notifications/initialized`, and `tools/call`
+   with `name: "codex"` whose `arguments` carry the latest user message as `prompt` (plus
+   `sandbox: "read-only"`, `approval-policy: "never"`, and `cwd: process.cwd()`).
+2. **Subsequent turn** — same `initialize` / `notifications/initialized` framing, but the
+   `tools/call` arguments use `name: "codex-reply"` with `{ threadId: "<stored>", prompt: "…" }`.
+
+`threadId` is the MCP-server's name for what `codex exec resume <SESSION_ID>` used to consume — the
+UUID shape is unchanged, only the transport. After the `id:1 tools/call` response arrives the proxy
+closes stdin so the MCP-server child exits cleanly.
 
 Session state lives in-memory only — restarting the proxy starts every conversation fresh, which
 matches the plugin's behaviour of treating each pop-up as a new conversation by default.
 
-### Session-ID discovery
+### Thread-ID discovery
 
-Codex's `--json` event stream evolves between releases. The proxy is defensive about it:
+The MCP envelope shape evolves between releases. The proxy is defensive about it:
 
-1. Every stdout line is parsed as JSON; for each parsed object we recursively search **all keys**
-   for `session_id` and accept the first hit. This covers top-level shapes
-   (`{"type":"session_configured","session_id":"…"}`) as well as nested shapes
-   (`{"msg":{"session_id":"…"}}`).
-2. If stdout does not expose a `session_id` by the time the child exits, the proxy scans
+1. The `tools/call` response carries `result.structuredContent.threadId` — this is the documented
+   MCP result shape and the primary source.
+2. Every incoming JSON-RPC frame is also walked recursively; the walker accepts any string-valued
+   `threadId` (camelCase, e.g. `params._meta.threadId`), `thread_id`, or `session_id` field. This
+   covers nested shapes some Codex releases emit via `codex/event` notifications.
+3. If neither mechanism produces an id by the time the child exits, the proxy scans
    `~/.codex/sessions/**` for the newest `*.jsonl` file modified after the spawn began and extracts
-   the UUID from either the filename (`rollout-<TIMESTAMP>-<SESSION_ID>.jsonl` — the Codex
-   documented convention) or the first JSONL line.
+   the UUID from either the filename (`rollout-<TIMESTAMP>-<UUID>.jsonl` — `codex mcp-server` writes
+   the same rollout files as `codex exec`) or the first JSONL line.
 
-If neither mechanism produces a `session_id`, follow-up turns simply fall back to starting a fresh
+If none of the three mechanisms produces an id, follow-up turns simply fall back to starting a fresh
 session (the next request still works, it just can't resume).
 
 ## Claude Code backend
@@ -154,14 +166,22 @@ Per request the proxy spawns the CLI with the prompt on stdin:
 
 ```text
 # First turn
-claude -p --output-format json --allowedTools ""
+claude -p --output-format stream-json --verbose --include-partial-messages --allowedTools ""
 
 # Subsequent turn (same conversation key — see "Multi-turn" below)
-claude --resume <SESSION_ID> -p --output-format json --allowedTools ""
+claude --resume <SESSION_ID> -p --output-format stream-json --verbose --include-partial-messages --allowedTools ""
 ```
 
 - `-p` puts the CLI in print mode (one-shot, non-interactive).
-- `--output-format json` returns one structured object containing `session_id` and the result text.
+- `--output-format stream-json` emits a sequence of JSON objects — `system_init`, `stream_event`
+  (carrying incremental `content_block_delta` text fragments every ~300-500 ms), the terminal
+  `assistant` envelope with the full assembled message, and a final `result` envelope with
+  `session_id` and usage. The proxy extracts only the per-token deltas; the terminal `assistant` /
+  `system` / `result` envelopes are denied so the assembled response is not re-emitted.
+- `--verbose` is mandatory whenever `--output-format stream-json` is used — the Claude CLI rejects
+  stream-json without it.
+- `--include-partial-messages` is what turns on the per-chunk `content_block_delta` frames; without
+  it stream-json would only emit the final assembled `assistant` envelope.
 - `--allowedTools ""` passes an **empty allowlist** — this disables ALL built-in tools
   (Read/Bash/Edit/etc.), so Claude behaves as a pure chat model. This is a hard requirement of the
   Zotero plugin's contract (the popup and sidebar are conversational explainers, not agents) and is

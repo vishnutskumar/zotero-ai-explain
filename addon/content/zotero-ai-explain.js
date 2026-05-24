@@ -3383,7 +3383,9 @@ ${para}`;
   init_library_crawler();
   var LEGACY_FILE_NAME2 = LEGACY_INDEX_FILE_NAME;
   function joinPath(dir, name) {
-    return dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`;
+    const isWindows = /^[A-Za-z]:[\\/]/u.test(dir);
+    const sep = isWindows ? "\\" : "/";
+    return dir.endsWith(sep) ? `${dir}${name}` : `${dir}${sep}${name}`;
   }
   function isIndexFile(value) {
     if (typeof value !== "object" || value === null) return false;

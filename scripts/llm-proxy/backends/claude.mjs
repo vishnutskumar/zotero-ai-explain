@@ -2,10 +2,11 @@
  * Claude Code CLI backend for the Ollama-compatible LLM proxy.
  *
  * Translates an Ollama `/api/chat` request into a `claude -p --output-format
- * json --allowedTools "" -` (first turn) or `claude --resume <SESSION_ID> -p
- * --output-format json --allowedTools "" -` (subsequent turn) invocation, then
- * streams Claude's stdout back to the caller as Ollama-format NDJSON delta
- * objects.
+ * stream-json --verbose --include-partial-messages --allowedTools "" -`
+ * (first turn) or `claude --resume <SESSION_ID> -p --output-format stream-json
+ * --verbose --include-partial-messages --allowedTools "" -` (subsequent turn)
+ * invocation, then streams Claude's stdout back to the caller as Ollama-format
+ * NDJSON delta objects.
  *
  * Tool use is hard-disabled
  * -------------------------
@@ -25,20 +26,27 @@
  *
  * Session ID discovery
  * --------------------
- * `claude -p --output-format json` emits structured JSON that contains a
- * `session_id` field. To stay robust against minor shape changes between
- * releases we recursively walk every parsed JSON object on stdout and accept
- * the first `session_id` string we find (covers both top-level
+ * `claude -p --output-format stream-json` emits a sequence of JSON objects
+ * (one per line) that contain a `session_id` field at the top level or
+ * nested in framing envelopes. To stay robust against minor shape changes
+ * between releases we recursively walk every parsed JSON object on stdout
+ * and accept the first `session_id` string we find (covers both top-level
  * `{"session_id":"…"}` and nested shapes like `{"meta":{"session_id":"…"}}`).
  *
  * Output shape
  * ------------
- * With `--output-format json`, Claude prints a single JSON object containing
- * the final result. We extract any text from it (recursive search of `text`,
- * `result`, `content[].text`, etc.) and emit it as one or more Ollama
- * `done:false` delta chunks. Non-JSON banner lines (e.g. version notices) are
- * surfaced as raw text deltas — same policy as the codex backend — so users
- * see authentication-related diagnostics in the popup rather than nothing.
+ * With `--output-format stream-json --verbose --include-partial-messages`,
+ * Claude prints one JSON object per line:
+ *   - per-token deltas wrapped in
+ *     `{"type":"stream_event","event":{"type":"content_block_delta",
+ *       "delta":{"type":"text_delta","text":"…"}}}`
+ *   - framing envelopes (`system`, `result`, `rate_limit_event`) and a
+ *     final aggregated `assistant` envelope carrying the full message —
+ *     all denied by `extractDeltaText` so the assembled response is not
+ *     emitted a second time.
+ * Non-JSON banner lines (e.g. version notices) are surfaced as raw text
+ * deltas — same policy as the codex backend — so users see authentication-
+ * related diagnostics in the popup rather than nothing.
  */
 
 import { spawn as defaultSpawn } from "node:child_process";
@@ -253,26 +261,83 @@ function findSessionId(value) {
 }
 
 /**
+ * Envelope `type` values that carry no assistant text. `system` /
+ * `result` / `rate_limit_event` are framing envelopes from stream-json;
+ * `assistant` is the final aggregated message that arrives AFTER all the
+ * incremental `content_block_delta` chunks — surfacing it would duplicate
+ * the streamed text. The pre-existing `user` / `user_message` / `user_input`
+ * filters are retained so we don't echo the user's prompt back.
+ */
+const NON_ASSISTANT_ENVELOPE_TYPES = new Set([
+  "user",
+  "user_message",
+  "user_input",
+  "system",
+  "result",
+  "rate_limit_event",
+  "assistant"
+]);
+
+/**
  * Extract an assistant text fragment from a claude JSON event, if any.
  *
- * `claude -p --output-format json` returns a single object with the final
- * result. Stream-json mode (not used here) emits incremental deltas. We accept
- * either shape so we can co-exist with future versions that switch defaults.
+ * `claude -p --output-format stream-json --verbose --include-partial-messages`
+ * emits a sequence of envelopes. The incremental per-token chunks arrive as
+ *   {"type":"stream_event","event":{"type":"content_block_delta",
+ *     "delta":{"type":"text_delta","text":"…"}}}
+ *
+ * The legacy single-shot `{"type":"result","result":"…"}` shape (older
+ * `--output-format json` runs and existing test fixtures) is also accepted
+ * so we don't break replay-style tests; in stream-json mode the `result`
+ * envelope is denied because the deltas already carried the full text.
  *
  * Recognised shapes:
- *   {"result":"..."}                      (default --output-format json)
- *   {"text":"..."}                        (alternate result wrapper)
- *   {"delta":"..."}                       (stream-json incremental)
+ *   {"type":"stream_event","event":{"type":"content_block_delta",
+ *     "delta":{"type":"text_delta","text":"..."}}}    (stream-json incremental)
+ *   {"type":"result","result":"..."}                  (legacy single-shot; preserved for fixtures)
+ *   {"text":"..."}                                    (alternate result wrapper)
+ *   {"delta":"..."}                                   (untyped incremental)
  *   {"message":{"content":[{"type":"text","text":"..."}]}}  (anthropic shape)
  *   {"content":[{"type":"text","text":"..."}]}              (top-level content)
  *
- * `type === "user"` / `"user_message"` events are ignored so we don't echo
- * the user's own prompt back as assistant text.
+ * Framing / aggregated envelopes (`system`, `result` in stream-json,
+ * `rate_limit_event`, `assistant`, plus `user*`) are denied via the
+ * `NON_ASSISTANT_ENVELOPE_TYPES` set above.
  */
 export function extractDeltaText(event) {
   if (!event || typeof event !== "object") return null;
   const t = typeof event.type === "string" ? event.type : "";
-  if (t === "user" || t === "user_message" || t === "user_input") return null;
+
+  // Stream-json per-token chunk:
+  //   {type:"stream_event", event:{type:"content_block_delta",
+  //                                delta:{type:"text_delta", text:"…"}}}
+  if (t === "stream_event" && event.event && typeof event.event === "object") {
+    const inner = event.event;
+    if (
+      inner.type === "content_block_delta" &&
+      inner.delta &&
+      typeof inner.delta === "object" &&
+      inner.delta.type === "text_delta" &&
+      typeof inner.delta.text === "string" &&
+      inner.delta.text.length > 0
+    ) {
+      return inner.delta.text;
+    }
+    return null;
+  }
+
+  // Legacy single-shot result envelope: preserved so existing fixtures
+  // that emit {type:"result", result:"…"} still surface a delta. In
+  // stream-json runs the deltas already carried the full text so an
+  // additional `result` envelope would duplicate; tests that rely on
+  // the legacy shape pass `type:"result"` with a non-empty `result`
+  // field, while live stream-json `result` envelopes carry usage /
+  // metadata (no `result` string) and fall through to the denylist.
+  if (t === "result" && typeof event.result === "string" && event.result.length > 0) {
+    return event.result;
+  }
+
+  if (NON_ASSISTANT_ENVELOPE_TYPES.has(t)) return null;
 
   if (typeof event.delta === "string" && event.delta.length > 0) return event.delta;
   if (typeof event.result === "string" && event.result.length > 0) return event.result;
@@ -294,17 +359,30 @@ export function extractDeltaText(event) {
 
 /**
  * Build the argv passed to the `claude` CLI.
- * - First turn:  ["-p","--output-format","json","--allowedTools",""]
+ * - First turn:  ["-p","--output-format","stream-json","--verbose",
+ *                 "--include-partial-messages","--allowedTools",""]
  *                (+ optional ["--model", model])
- * - Resume:      ["--resume", <SESSION_ID>, "-p","--output-format","json","--allowedTools",""]
+ * - Resume:      ["--resume", <SESSION_ID>, "-p","--output-format","stream-json",
+ *                 "--verbose","--include-partial-messages","--allowedTools",""]
  *
- * The prompt is delivered via stdin (claude reads stdin when no positional
- * prompt argument is provided).
+ * `--verbose` is mandatory for `stream-json` (the Claude CLI rejects
+ * stream-json without it). `--include-partial-messages` is what turns on
+ * the per-chunk `content_block_delta` frames; without it stream-json still
+ * emits only the aggregated message. The prompt is delivered via stdin
+ * (claude reads stdin when no positional prompt argument is provided).
  */
 export function buildClaudeArgs({ sessionId, model }) {
   const args = [];
   if (sessionId) args.push("--resume", sessionId);
-  args.push("-p", "--output-format", "json", "--allowedTools", "");
+  args.push(
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--include-partial-messages",
+    "--allowedTools",
+    ""
+  );
   if (model) args.push("--model", model);
   return args;
 }
