@@ -250,7 +250,12 @@ beforeAll(async () => {
     embedModel: OLLAMA_EMBED_MODEL,
     trigger: "explain",
     waitForPattern: /e2e:phase=explain:done/u,
-    waitTimeoutMs: 180_000
+    // CPU-bound `gemma3:1b` first-token latency on the slower
+    // GitHub-hosted macOS runners (intel, shared, noisy-neighbor
+    // throttling) swings 30s–180s run-to-run. 180s was right at the
+    // edge and tripped repeatedly. 360s gives ~2x margin without
+    // letting a real hang consume the 45-min job timeout.
+    waitTimeoutMs: 360_000
   });
 
   // Spawn B: full pipeline so the real-PDF-setup prelude imports an item
@@ -264,7 +269,7 @@ beforeAll(async () => {
     embedModel: OLLAMA_EMBED_MODEL,
     trigger: "all",
     waitForPattern: /e2e:index:final-status=/u,
-    waitTimeoutMs: 240_000
+    waitTimeoutMs: 420_000
   });
 
   // Spawn C1: nonexistent chat model.
