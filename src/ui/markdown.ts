@@ -20,7 +20,18 @@
  * `<script>` and `<img onerror>` in model output render as literal text.
  */
 
+import { parseCitationToken, resolveCitation, type CitationLookup } from "./citation-lookup.js";
+import type { CitationClick } from "./library-chat-view.js";
+
 const ALLOWED_URL_SCHEMES = new Set<string>(["http:", "https:", "mailto:"]);
+
+/**
+ * Citation token shape: `[ABCD1234]` (legacy) or `[ABCD1234#3]`
+ * (chunk-scoped). The item key is exactly 8 uppercase-alphanumeric
+ * chars — the shape Zotero assigns. Stays in sync with the regex used
+ * by `appendWithCitations` in `library-chat-view.ts`.
+ */
+const CITATION_PATTERN = /\[([A-Z0-9]{8})(?:#(\d+))?\]/gu;
 
 type Block =
   | { readonly kind: "heading"; readonly level: 1 | 2 | 3 | 4; readonly text: string }
@@ -170,27 +181,33 @@ function parseBlocks(source: string): readonly Block[] {
   return blocks;
 }
 
-function renderBlock(doc: Document, block: Block): HTMLElement {
+function renderBlock(
+  doc: Document,
+  block: Block,
+  emitText: (target: HTMLElement, text: string) => void = appendPlainText
+): HTMLElement {
   switch (block.kind) {
     case "heading": {
       const element = doc.createElement(`h${String(block.level)}`);
-      renderInline(doc, element, block.text);
+      renderInline(doc, element, block.text, emitText);
       return element;
     }
     case "paragraph": {
       const element = doc.createElement("p");
-      renderInline(doc, element, block.text);
+      renderInline(doc, element, block.text, emitText);
       return element;
     }
     case "blockquote": {
       const element = doc.createElement("blockquote");
-      renderInline(doc, element, block.text);
+      renderInline(doc, element, block.text, emitText);
       return element;
     }
     case "code": {
       // <pre><code>…</code></pre> is the conventional fenced-code shape.
       // The text is set via `textContent` (no HTML interpretation) so any
-      // markup inside the code block renders verbatim.
+      // markup inside the code block renders verbatim. Citation tokens
+      // inside a code block stay literal — they are quoted source code,
+      // not links.
       const pre = doc.createElement("pre");
       const code = doc.createElement("code");
       if (block.language !== null) {
@@ -204,7 +221,7 @@ function renderBlock(doc: Document, block: Block): HTMLElement {
       const list = doc.createElement(block.ordered ? "ol" : "ul");
       for (const item of block.items) {
         const li = doc.createElement("li");
-        renderInline(doc, li, item);
+        renderInline(doc, li, item, emitText);
         list.append(li);
       }
       return list;
@@ -224,17 +241,38 @@ type InlineToken =
  * `` `code` ``, and `[text](url)`. Tokens are matched greedily left-to-right
  * using a single scanner so we never recurse and never construct an
  * intermediate HTML string.
+ *
+ * `emitText` is the leaf text-emitter. By default it appends a single
+ * text node; `renderMarkdownWithCitations` swaps in a citation-aware
+ * variant that splits each text token on `CITATION_PATTERN` and emits
+ * `<a data-item-key>` anchors for matched tokens.
  */
-function renderInline(doc: Document, target: HTMLElement, source: string): void {
+function renderInline(
+  doc: Document,
+  target: HTMLElement,
+  source: string,
+  emitText: (target: HTMLElement, text: string) => void = appendPlainText
+): void {
   const tokens = tokeniseInline(source);
   for (const token of tokens) {
+    if (token.kind === "text") {
+      emitText(target, token.text);
+      continue;
+    }
     target.append(renderInlineToken(doc, token));
   }
+}
+
+function appendPlainText(target: HTMLElement, text: string): void {
+  target.append(target.ownerDocument.createTextNode(text));
 }
 
 function renderInlineToken(doc: Document, token: InlineToken): Node {
   switch (token.kind) {
     case "text":
+      // Unreached: `renderInline` now routes text tokens through
+      // `emitText` directly. Kept for switch-exhaustiveness so a future
+      // refactor cannot accidentally drop the text branch.
       return doc.createTextNode(token.text);
     case "code": {
       const element = doc.createElement("code");
@@ -370,6 +408,129 @@ function findMatchingItalicClose(source: string, from: number): number {
     i += 1;
   }
   return -1;
+}
+
+/**
+ * Citation-aware variant of `renderMarkdown`. Identical block/inline
+ * markdown handling, plus: every plain-text fragment is scanned for
+ * `[itemKey]` / `[itemKey#chunkIndex]` tokens and matching tokens become
+ * `<a data-item-key=... data-chunk-index=...>` anchors.
+ *
+ * Anchor emission rules:
+ *
+ *   - `opts.lookup === undefined` (the caller has no retrieval lookup
+ *     yet) → no tokenization; every text fragment renders as a literal
+ *     text node, matching the legacy `renderMarkdown` behaviour. This is
+ *     the popup/sidebar's pre-retrieval state.
+ *   - `opts.lookup` defined AND `resolveCitation(parsed, lookup)` returns
+ *     an entry → emit an `<a>` carrying `data-item-key`, optional
+ *     `data-chunk-index`, `data-attachment-key`, and `data-page-index`.
+ *     The caller is responsible for wiring a delegated click handler
+ *     that reads those attributes and invokes `opts.onCitationClick`.
+ *   - `opts.lookup` defined but `resolveCitation` returns undefined
+ *     (hallucinated itemKey, out-of-range chunk index) → emit the literal
+ *     `[itemKey#…]` token as text. The README contract is "inert text on
+ *     a hallucination" so a clickable-but-misdirected link is never
+ *     produced.
+ *
+ * Click handling is intentionally NOT attached inside this function —
+ * the caller mounts a delegated `click` listener on the popup/sidebar
+ * root (mirroring `wireLibraryChatView`) so re-renders that `replaceChildren`
+ * the message body don't have to re-bind per-anchor listeners.
+ *
+ * `opts.onCitationClick` is currently unused inside the renderer; it is
+ * accepted on the type so future migrations (and the type-tested wiring
+ * site in zotero-runtime) can carry the same options bag through.
+ */
+export type CitationRenderOptions = {
+  readonly lookup?: CitationLookup;
+  readonly onCitationClick?: (citation: CitationClick) => void;
+};
+
+export function renderMarkdownWithCitations(
+  target: HTMLElement,
+  source: string,
+  opts?: CitationRenderOptions
+): void {
+  target.replaceChildren();
+  const doc = target.ownerDocument;
+  const blocks = parseBlocks(source);
+  const lookup = opts?.lookup;
+  // The text emitter is the only behaviour difference between
+  // renderMarkdown and renderMarkdownWithCitations. When no lookup is
+  // available we fall back to plain text so the popup/sidebar's
+  // pre-retrieval render path stays byte-identical to the existing
+  // renderMarkdown output.
+  const emitText: (target: HTMLElement, text: string) => void =
+    lookup === undefined
+      ? appendPlainText
+      : (host, text): void => {
+          emitTextWithCitations(host, text, lookup);
+        };
+  for (const block of blocks) {
+    target.append(renderBlock(doc, block, emitText));
+  }
+}
+
+/**
+ * Walk `text`, split on `CITATION_PATTERN`, and emit either a text node
+ * or a citation anchor for each piece. Exported only via
+ * `renderMarkdownWithCitations`; not a public helper.
+ */
+function emitTextWithCitations(host: HTMLElement, text: string, lookup: CitationLookup): void {
+  const doc = host.ownerDocument;
+  CITATION_PATTERN.lastIndex = 0;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = CITATION_PATTERN.exec(text)) !== null) {
+    if (match.index > cursor) {
+      host.append(doc.createTextNode(text.slice(cursor, match.index)));
+    }
+    // Round-trip through the canonical parser so the alphabet /
+    // chunk-index handling stays single-sourced in citation-lookup.ts.
+    const parsed = parseCitationToken(match[0]);
+    const entry = parsed !== null ? resolveCitation(parsed, lookup) : undefined;
+    if (entry === undefined || parsed === null) {
+      // Hallucinated key (or malformed token, which CITATION_PATTERN
+      // never matches but defended against here) — render the original
+      // token verbatim so the user sees what the model emitted.
+      host.append(doc.createTextNode(match[0]));
+    } else {
+      host.append(renderCitationAnchor(doc, parsed.itemKey, match[2], entry));
+    }
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < text.length) {
+    host.append(doc.createTextNode(text.slice(cursor)));
+  }
+}
+
+function renderCitationAnchor(
+  doc: Document,
+  itemKey: string,
+  rawChunkIndex: string | undefined,
+  entry: { readonly attachmentKey?: string; readonly pageIndex?: number }
+): HTMLAnchorElement {
+  const link = doc.createElement("a");
+  link.dataset.itemKey = itemKey;
+  // Stamp the chunk-scoped data attributes only when the renderer
+  // actually had them. A legacy / fallback citation (no chunkIndex in
+  // the token, no per-page entry data) emits just `data-item-key`,
+  // matching `library-chat-view.ts`'s fallback shape.
+  if (rawChunkIndex !== undefined) {
+    link.dataset.chunkIndex = rawChunkIndex;
+  }
+  if (entry.attachmentKey !== undefined) {
+    link.dataset.attachmentKey = entry.attachmentKey;
+  }
+  if (typeof entry.pageIndex === "number") {
+    link.dataset.pageIndex = String(entry.pageIndex);
+  }
+  // `#` keeps the anchor from navigating; the wiring layer's click
+  // handler calls preventDefault and dispatches to `onCitationClick`.
+  link.setAttribute("href", "#");
+  link.textContent = `[${itemKey}${rawChunkIndex !== undefined ? `#${rawChunkIndex}` : ""}]`;
+  return link;
 }
 
 function safeHref(raw: string): string | null {

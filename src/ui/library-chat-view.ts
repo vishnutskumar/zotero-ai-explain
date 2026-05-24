@@ -15,6 +15,7 @@
 
 import type { ChatMessage } from "../providers/provider-types.js";
 import type { RetrievedChunk } from "../indexing/index-search.js";
+import { attachCitationClickHandler } from "./citation-click.js";
 import type { CitationLookup, CitationLookupEntry } from "./citation-lookup.js";
 import {
   ACCENT,
@@ -270,6 +271,17 @@ function renderMessage(message: ChatMessage, lookup?: CitationLookup): HTMLLIEle
  *
  * Exported separately from `renderMessage` to keep the helper unit-
  * testable without a full view render.
+ *
+ * FOLLOW-UP (P5 quality H3 / reuse M1): this renderer is structurally
+ * identical to `emitTextWithCitations` in `src/ui/markdown.ts`. Both
+ * walk `CITATION_PATTERN` and stamp the same anchor shape, but they
+ * differ in two visible ways: (1) `appendWithCitations` never resolves
+ * a bare-key `[itemKey]` token to a clickable anchor, whereas the
+ * markdown renderer routes through `resolveCitation` and produces a
+ * fallback entry; (2) the anchor's visible text differs (this file
+ * shows `itemKey`, markdown.ts shows the bracketed token). Collapsing
+ * the two surfaces into a single tokenizer is deferred — see the
+ * popup-correctness P5 review (HIGH-3) for the full proposal.
  */
 export function appendWithCitations(
   target: HTMLElement,
@@ -374,33 +386,12 @@ export function wireLibraryChatView(input: WireLibraryChatInput): LibraryChatDet
     onReset();
   };
 
-  // Delegate citation clicks at the view root so re-renders (which
-  // replace `.zotero-ai-library-chat__messages` children) keep working
-  // without re-binding.
-  const handleClick = (event: MouseEvent): void => {
-    const target = event.target as HTMLElement | null;
-    if (target === null) return;
-    const link = target.closest<HTMLAnchorElement>("a[data-item-key]");
-    if (link === null) return;
-    event.preventDefault();
-    const key = link.dataset.itemKey ?? "";
-    if (key.length === 0) {
-      return;
-    }
-    // Read the chunk-scoped data attributes the renderer stamped on a
-    // hit. A legacy / fallback link carries only `data-item-key`, so
-    // `attachmentKey`/`pageIndex` drop off the emitted citation. The
-    // page-index parse guards against a non-numeric attribute value.
-    const attachmentKey = link.dataset.attachmentKey;
-    const rawPageIndex = link.dataset.pageIndex;
-    const pageIndex =
-      rawPageIndex !== undefined && /^\d+$/u.test(rawPageIndex) ? Number(rawPageIndex) : undefined;
-    onCitationClick({
-      itemKey: key,
-      ...(attachmentKey !== undefined ? { attachmentKey } : {}),
-      ...(pageIndex !== undefined ? { pageIndex } : {})
-    });
-  };
+  // Delegate citation clicks at the view root via the shared
+  // `attachCitationClickHandler` helper so re-renders (which replace
+  // `.zotero-ai-library-chat__messages` children) keep working without
+  // re-binding, and the click semantics stay byte-identical to the
+  // popup/sidebar delegations in `zotero-runtime.ts`.
+  const detachCitationClicks = attachCitationClickHandler(view, onCitationClick);
 
   // Enter submits; Shift+Enter inserts a newline. Same convention as
   // the popup so users don't have to mouse to "Ask" for every question.
@@ -413,13 +404,12 @@ export function wireLibraryChatView(input: WireLibraryChatInput): LibraryChatDet
 
   form?.addEventListener("submit", handleSubmit);
   reset?.addEventListener("click", handleReset);
-  view.addEventListener("click", handleClick);
   textarea?.addEventListener("keydown", handleKeydown);
 
   return () => {
     form?.removeEventListener("submit", handleSubmit);
     reset?.removeEventListener("click", handleReset);
-    view.removeEventListener("click", handleClick);
+    detachCitationClicks();
     textarea?.removeEventListener("keydown", handleKeydown);
   };
 }

@@ -15,8 +15,8 @@ scripts/
   llm-proxy/                      # Bundled Node HTTP service (see below)
     server.mjs, server.d.mts
     backends/
-      codex.mjs, codex.d.mts      # codex mcp-server backend (tools/call codex / codex-reply)
-      claude.mjs, claude.d.mts    # claude -p --output-format stream-json --allowedTools "" backend
+      codex.mjs, codex.d.mts      # codex mcp-server backend (tools/call codex / codex-reply); spawns in isolated $HOME / $CODEX_HOME tmpdir
+      claude.mjs, claude.d.mts    # claude -p stream-json backend; --allowedTools "" + --setting-sources user + --strict-mcp-config + --disable-slash-commands + --system-prompt isolate from user config
       ollama.mjs, ollama.d.mts    # Passthrough to a real Ollama daemon
     README.md                     # Configuration, wire format, smoke tests, troubleshooting
   zotero-e2e/                     # Real-Zotero spawn harness for tests/e2e/

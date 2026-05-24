@@ -66,3 +66,39 @@ URL is set to `.../codex`, `.../claude`, or `.../ollama`.
   convenient stdout-line streaming, and the resume logic is non-trivial state to maintain in the
   privileged scope. Keeping the proxy as a sibling process limits the blast radius of any
   subprocess-handling bug.
+
+## Addendum — 2026-05-24: Subprocess isolation
+
+Both CLIs load extensive user developer configuration by default (`~/.codex/AGENTS.md`,
+`~/.claude/CLAUDE.md`, settings layers, MCP sidecars, custom skills, slash commands). Any of these
+can warp Zotero responses — e.g. a user "act as a senior code reviewer" CLAUDE.md instruction
+reframes every popup explanation. The proxy now isolates each CLI from that configuration at spawn
+time.
+
+**Codex.** Each backend instance lazily creates `/tmp/zotero-ai-codex-*` via `mkdtemp` and
+best-effort copies `~/.codex/auth.json` into it (silently skipped on `ENOENT`). `codex mcp-server`
+is then spawned with `env.HOME = <tmpdir>`, `env.CODEX_HOME = <tmpdir>`, and `cwd = <tmpdir>` (also
+reflected in the `tools/call codex` arguments' `cwd` field). Pointing both `HOME` and `CODEX_HOME`
+at a fresh empty directory neutralises `AGENTS.md`, `config.toml`, and per-project skills lookup;
+copying `auth.json` preserves the user's ChatGPT OAuth.
+
+**Claude.** Each backend instance lazily creates `/tmp/zotero-ai-claude-*`. `claude -p …` is spawned
+with `cwd = <tmpdir>` plus four argv flags: `--setting-sources user` (restricts to the user-global
+settings layer), `--strict-mcp-config` (refuses to load MCP sidecars from settings),
+`--disable-slash-commands` (turns off slash dispatch entirely), and
+`--system-prompt <NEUTRAL_PREFACE>` (replaces the user's default system prompt). `HOME` is
+**deliberately not overridden** because subscription auth resolves through the OS keychain via
+`$HOME`-scoped paths; overriding it would break authentication.
+
+**Accepted limitations.** Two pollution sources remain:
+
+- _Bundled codex `.system` skills._ Codex ships five baked-in skills (imagegen, openai-docs,
+  plugin-creator, skill-creator, skill-installer) compiled into the binary that environment
+  isolation cannot suppress.
+- _Claude SessionStart hooks._ The four isolation flags do not block SessionStart hooks from firing;
+  the neutral `--system-prompt` is the bias against the model treating any resulting output as
+  instructions.
+
+Both are acceptable because the residual surface is narrow relative to the unisolated state, and
+plugging them would require either upstream changes to the CLIs or chrome-side spawning (which the
+original decision rejected on blast-radius grounds).

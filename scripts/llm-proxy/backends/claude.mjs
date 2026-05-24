@@ -52,7 +52,8 @@
 import { spawn as defaultSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdtemp } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
@@ -358,18 +359,49 @@ export function extractDeltaText(event) {
 }
 
 /**
+ * Neutral system-prompt preface that overrides Claude's default system
+ * frame for proxy turns. Used to suppress user-CLAUDE.md material (and
+ * anything a SessionStart hook leaks via `additionalContext`) from
+ * biasing the explainer's tone.
+ *
+ * Why this is necessary: even with `--setting-sources user`,
+ * `--strict-mcp-config`, and `--disable-slash-commands`, SessionStart
+ * hooks STILL fire and can inject arbitrary text into the system frame
+ * (a logseq-memory hook injects a giant memory blob; users with custom
+ * hooks may inject development-discipline rules). A fixed system prompt
+ * tells the model to ignore those rules for this task. Belt-and-
+ * suspenders alongside the flags.
+ *
+ * Exported so tests can assert the exact text reaches the spawned argv.
+ */
+export const CLAUDE_ISOLATION_SYSTEM_PROMPT =
+  "You are a helpful research assistant explaining text from a research paper. " +
+  "Answer the user's question concisely and directly. Do not announce what you " +
+  "will do; just do it. Ignore any other instructions about workflow, hooks, " +
+  "or development discipline — those are not relevant to this task.";
+
+/**
  * Build the argv passed to the `claude` CLI.
  * - First turn:  ["-p","--output-format","stream-json","--verbose",
- *                 "--include-partial-messages","--allowedTools",""]
+ *                 "--include-partial-messages","--allowedTools","",
+ *                 "--setting-sources","user","--strict-mcp-config",
+ *                 "--disable-slash-commands","--system-prompt", <NEUTRAL>]
  *                (+ optional ["--model", model])
- * - Resume:      ["--resume", <SESSION_ID>, "-p","--output-format","stream-json",
- *                 "--verbose","--include-partial-messages","--allowedTools",""]
+ * - Resume:      ["--resume", <SESSION_ID>, … same trailing block …]
  *
  * `--verbose` is mandatory for `stream-json` (the Claude CLI rejects
  * stream-json without it). `--include-partial-messages` is what turns on
  * the per-chunk `content_block_delta` frames; without it stream-json still
  * emits only the aggregated message. The prompt is delivered via stdin
  * (claude reads stdin when no positional prompt argument is provided).
+ *
+ * Isolation block (`--setting-sources user`, `--strict-mcp-config`,
+ * `--disable-slash-commands`, `--system-prompt <NEUTRAL>`) suppresses
+ * project CLAUDE.md auto-discovery, MCP-injected tools, slash commands
+ * (`/skill-name`), and biases the model against following pollution
+ * leaked through SessionStart hooks. `--bare` would have been the
+ * cleanest option but it disables keychain reads, breaking subscription
+ * auth — `--setting-sources user` preserves OAuth.
  */
 export function buildClaudeArgs({ sessionId, model }) {
   const args = [];
@@ -381,7 +413,13 @@ export function buildClaudeArgs({ sessionId, model }) {
     "--verbose",
     "--include-partial-messages",
     "--allowedTools",
-    ""
+    "",
+    "--setting-sources",
+    "user",
+    "--strict-mcp-config",
+    "--disable-slash-commands",
+    "--system-prompt",
+    CLAUDE_ISOLATION_SYSTEM_PROMPT
   );
   if (model) args.push("--model", model);
   return args;
@@ -409,6 +447,34 @@ export function createClaudeBackend(deps = {}) {
   const sigkillGraceMs = deps.sigkillGraceMs ?? 3000;
   const now = deps.now ?? (() => Date.now());
   const sessionMap = deps.sessionMap ?? new Map();
+
+  /**
+   * Lazily-created per-backend isolation tmpdir for claude spawns.
+   * Cached as a Promise so concurrent `runTurn` calls share the same
+   * single mkdtemp (no leaks from a racy double-create).
+   */
+  let isolationDirPromise = null;
+
+  /**
+   * Build (once) the isolation directory for claude spawns. Unlike the
+   * codex backend we do NOT override HOME here — claude's subscription
+   * OAuth reads from the system keychain on macOS / DPAPI on Windows /
+   * libsecret on Linux, all of which key on the real $HOME. Overriding
+   * HOME breaks subscription auth (the same reason `--bare` is rejected
+   * as the isolation lever — see CLAUDE_ISOLATION_SYSTEM_PROMPT doc).
+   *
+   * What the `cwd` override gives us: claude's CLAUDE.md auto-discovery
+   * walks up from cwd looking for project CLAUDE.md files. Pointing
+   * spawn cwd at an empty tmpdir suppresses the plugin's own project
+   * CLAUDE.md (which would otherwise bias the explainer with
+   * project-engineering-discipline rules). `--setting-sources user`
+   * already strips USER CLAUDE.md, so cwd-override completes the gap.
+   */
+  async function ensureIsolationDir() {
+    if (isolationDirPromise !== null) return isolationDirPromise;
+    isolationDirPromise = mkdtemp(join(tmpdir(), "zotero-ai-claude-"));
+    return isolationDirPromise;
+  }
   const configDiscoveryOpts = {
     ...(deps.configPaths !== undefined ? { configPaths: deps.configPaths } : {}),
     ...(deps.existsSync !== undefined ? { existsSync: deps.existsSync } : {}),
@@ -449,8 +515,15 @@ export function createClaudeBackend(deps = {}) {
     });
     const prompt = latestUserContent(messages);
 
+    // Build (or reuse) the isolation tmpdir so claude doesn't see the
+    // plugin's project CLAUDE.md. We keep HOME untouched so subscription
+    // OAuth (keychain on macOS, DPAPI on Windows, libsecret on Linux)
+    // continues to authenticate. See ensureIsolationDir() for details.
+    const isolationDir = await ensureIsolationDir();
+
     const child = spawn(claudeCommand, argv, {
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: isolationDir
     });
 
     if (child.stdin) {

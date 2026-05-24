@@ -1,7 +1,9 @@
-import { topKChunks } from "../indexing/index-search.js";
+import { topKChunks, type RetrievedChunk } from "../indexing/index-search.js";
 import type { IndexFile } from "../indexing/library-crawler.js";
 import type { IndexStorage } from "../indexing/index-storage.js";
 import type { ChatMessage, EmbeddingProvider, ModelProvider } from "./provider-types.js";
+
+export type { RetrievedChunk };
 
 /**
  * Wrap a `ModelProvider` so every `streamChat` request gets a
@@ -27,6 +29,19 @@ export type RagAugmentedProviderDeps = {
   readonly topK?: number;
   /** Optional debug sink for retrieval diagnostics. */
   readonly debug?: (message: string) => void;
+  /**
+   * Optional sink fired once per request with the chunks that retrieval
+   * pulled BEFORE the first delta streams to the caller. Used by the
+   * popup/sidebar to build a per-conversation citation lookup table the
+   * markdown renderer consults to linkify `[itemKey#chunkIndex]` tokens.
+   *
+   * **Contract — must complete synchronously.** The callback runs inside
+   * `streamChat`'s preamble; any pending DOM write must land before the
+   * first delta paints, otherwise the first-delta render pass sees an
+   * empty lookup and the citation renders as inert text. Wrapped in
+   * try/catch so a throw never breaks streaming.
+   */
+  readonly onRetrieved?: (chunks: readonly RetrievedChunk[]) => void;
 };
 
 const DEFAULT_TOP_K = 6;
@@ -104,6 +119,15 @@ async function augmentMessages(
     return messages;
   }
   if (retrieved.length === 0) return messages;
+  // Surface the retrieved chunks BEFORE constructing the augmented
+  // prompt so the popup/sidebar can build a per-turn citation lookup
+  // table the renderer will consult on the very first delta. A
+  // throwing callback must never break streaming, hence the swallow.
+  try {
+    deps.onRetrieved?.(retrieved);
+  } catch {
+    // Intentional swallow — the callback's job is best-effort wiring.
+  }
   // Excerpt body is wrapped in explicit untrusted-content delimiters so
   // a hostile paper text (`"ignore previous instructions, ..."`) cannot
   // be confused with an operator instruction by the model.

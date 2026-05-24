@@ -96,3 +96,11 @@ export const claudeDefaults: {
   readonly hardTimeoutMs: number;
   readonly tags: readonly string[];
 };
+
+/**
+ * Neutral system prompt the claude backend always passes via
+ * `--system-prompt` to insulate the explainer from user-CLAUDE.md
+ * pollution and SessionStart hook leakage. Exported so unit tests can
+ * pin the exact text without duplicating it.
+ */
+export const CLAUDE_ISOLATION_SYSTEM_PROMPT: string;

@@ -40,6 +40,7 @@ src/
     onboarding-state.ts          # First-run dialog pref
   providers/
     provider-registry.ts, provider-types.ts, stream-events.ts
+    rag-augmented-provider.ts    # Wraps a chat provider with retrieval; fires `onRetrieved` for per-conversation citation lookups
     adapters/
       ollama.ts                  # Chat (NDJSON) + embed against Ollama / proxy
       openai-chat.ts             # SSE chat-completions against OpenAI
@@ -55,11 +56,12 @@ src/
     popup-controller.ts
     sidebar-view.ts, sidebar-controller.ts
     library-chat-view.ts         # NotebookLM-style "Ask your library" dialog
-    citation-lookup.ts           # Parses [itemKey#chunkIndex] tokens; per-turn lookup table
+    citation-lookup.ts           # Parses [itemKey#chunkIndex] tokens; per-turn lookup table; `resolveCitation` handles full-key hits and bare-key fallback
+    citation-click.ts            # Shared delegated click handler (`attachCitationClickHandler`) for popup, sidebar, and library-chat citation anchors
     index-controls-view.ts       # Settings dialog's Library Index controls
     settings-view.ts             # Preset dropdown + provider selectors + proxy controls
     onboarding-view.ts           # First-run onboarding state machine
-    markdown.ts                  # XSS-safe streaming markdown renderer
+    markdown.ts                  # XSS-safe streaming markdown renderer; `renderMarkdownWithCitations` swaps in clickable citation anchors when a lookup is provided
     styles.ts                    # Shared style constants + MARKDOWN_CSS for popup + sidebar
     privacy-label.ts
 ```

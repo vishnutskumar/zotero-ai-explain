@@ -66,8 +66,9 @@ windows asking questions about two different PDFs never cross-contaminate.
 
 ### Citation jump-to-page
 
-Library-chat citations are chunk-scoped. Each chunk knows its source PDF page, so clicking a
-citation opens (or navigates an already-open reader to) the exact cited page via
+Citations are chunk-scoped and clickable from every chat surface — the library-chat dialog, the
+reader popup, and the sidebar. Each chunk knows its source PDF page, so clicking a citation opens
+(or navigates an already-open reader to) the exact cited page via
 `Zotero.Reader.open(attachmentId, { pageIndex })`. Two citations from different pages of the same
 paper navigate the same reader tab rather than spawning duplicates. A hallucinated or legacy
 citation token falls back gracefully — it opens the item at page 1 or renders inert, never silently
@@ -93,7 +94,10 @@ sidecar marker, and concurrent readers always see a fully-populated file.
 A small Node HTTP service ships inside the XPI. It speaks the Ollama wire protocol on the front side
 and routes each request to the **Codex CLI**, the **Claude Code CLI**, or a real **Ollama** daemon.
 The plugin auto-spawns it from the settings dialog. This lets you plug a ChatGPT or Claude
-subscription into the plugin without ever pasting an API key.
+subscription into the plugin without ever pasting an API key. The proxy spawns each CLI in an
+isolated environment so the user's developer config (`~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md`,
+custom skills, MCP sidecars, slash commands) does not bleed into Zotero responses — see
+[`scripts/llm-proxy/README.md#subprocess-isolation`](scripts/llm-proxy/README.md#subprocess-isolation).
 
 ### Keyboard shortcuts
 
@@ -110,7 +114,24 @@ Zotero **8.0 – 9.99.99** (the plugin manifest's `strict_min_version` / `strict
 
 ## Install
 
-The plugin is installed as an XPI built from this repository:
+### Download the latest release (recommended)
+
+1. Open <https://github.com/vishnutskumar/zotero-ai-explain/releases/latest>.
+2. Download the `zotero-ai-explain-v<version>.xpi` asset.
+3. In Zotero: **Tools → Plugins → gear menu → Install Plugin From File…** and pick the `.xpi`.
+4. Restart Zotero if prompted.
+
+Future versions arrive automatically for Zotero installs with automatic-update enabled — the plugin
+manifest's `update_url` points at
+`https://github.com/vishnutskumar/zotero-ai-explain/releases/latest/download/updates.json`.
+
+If you intend to use the Codex or Claude backends, you also need **Node.js ≥ 22** installed on the
+machine — the bundled proxy runs under your system Node (see [Configuration](#configuration)).
+
+### Build from source (contributors / unreleased changes)
+
+If you want to install the latest unreleased changes or you are developing against the plugin, build
+the XPI from this repository:
 
 ```bash
 npm install
@@ -118,11 +139,8 @@ npm run build      # esbuild → addon/content/zotero-ai-explain.js
 npm run package    # zip addon/ + bundled llm-proxy/ → zotero-ai-explain.xpi
 ```
 
-Then in Zotero: **Tools → Plugins → gear menu → Install Plugin From File…** and pick
-`zotero-ai-explain.xpi`. Restart Zotero if prompted.
-
-If you intend to use the Codex or Claude backends, you also need **Node.js ≥ 22** installed on the
-machine — the bundled proxy runs under your system Node (see [Configuration](#configuration)).
+Then install the freshly built `zotero-ai-explain.xpi` via the same **Tools → Plugins → gear menu →
+Install Plugin From File…** flow.
 
 ## Configuration
 

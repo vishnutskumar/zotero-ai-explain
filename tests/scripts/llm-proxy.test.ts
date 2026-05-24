@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   buildClaudeArgs,
+  CLAUDE_ISOLATION_SYSTEM_PROMPT,
   createClaudeBackend,
   describeClaudeFailure,
   extractDeltaText as extractClaudeDeltaText,
@@ -35,6 +36,10 @@ type SpawnCall = {
   readonly cmd: string;
   readonly args: readonly string[];
   readonly stdin: string;
+  // Spawn options captured so isolation tests can assert env / cwd.
+  // Empty/undefined when the caller didn't pass any (existing tests).
+  readonly env: Record<string, string | undefined> | undefined;
+  readonly cwd: string | undefined;
 };
 
 function makeFakeChild(opts: FakeChildOptions) {
@@ -84,13 +89,23 @@ function makeFakeChild(opts: FakeChildOptions) {
 function makeSpawnRecorder(scripts: readonly FakeChildOptions[]) {
   const calls: SpawnCall[] = [];
   let i = 0;
-  function spawn(cmd: string, args: readonly string[]): unknown {
+  function spawn(
+    cmd: string,
+    args: readonly string[],
+    opts?: { env?: Record<string, string | undefined>; cwd?: string }
+  ): unknown {
     const script = scripts[Math.min(i, scripts.length - 1)] ?? { stdoutLines: [] };
     i++;
     const { child, getStdin } = makeFakeChild(script);
     // Capture stdin after the child consumes it (settled on next tick).
     setImmediate(() => {
-      calls.push({ cmd, args: [...args], stdin: getStdin() });
+      calls.push({
+        cmd,
+        args: [...args],
+        stdin: getStdin(),
+        env: opts?.env,
+        cwd: opts?.cwd
+      });
     });
     return child;
   }
@@ -1531,7 +1546,7 @@ describe("llm-proxy / claude backend", () => {
         origKill(sig);
       };
       setImmediate(() => {
-        calls.push({ cmd, args: [...args], stdin: getStdin() });
+        calls.push({ cmd, args: [...args], stdin: getStdin(), env: undefined, cwd: undefined });
       });
       return child;
     }
@@ -1585,7 +1600,7 @@ describe("llm-proxy / claude backend", () => {
 
     // Pure-function check: buildClaudeArgs always emits the empty
     // allowlist AND the stream-json triple (--output-format stream-json,
-    // --verbose, --include-partial-messages).
+    // --verbose, --include-partial-messages) AND the isolation block.
     const noSession = buildClaudeArgs({ sessionId: null });
     expect(noSession).toContain("--allowedTools");
     expect(noSession[noSession.indexOf("--allowedTools") + 1]).toBe("");
@@ -1593,6 +1608,12 @@ describe("llm-proxy / claude backend", () => {
     expect(noSession[noSession.indexOf("--output-format") + 1]).toBe("stream-json");
     expect(noSession).toContain("--verbose");
     expect(noSession).toContain("--include-partial-messages");
+    // Isolation block — always present (no per-call gating).
+    expect(noSession).toContain("--setting-sources");
+    expect(noSession[noSession.indexOf("--setting-sources") + 1]).toBe("user");
+    expect(noSession).toContain("--strict-mcp-config");
+    expect(noSession).toContain("--disable-slash-commands");
+    expect(noSession).toContain("--system-prompt");
     const withSession = buildClaudeArgs({ sessionId: "abc", model: "opus" });
     expect(withSession[0]).toBe("--resume");
     expect(withSession[1]).toBe("abc");
@@ -1602,6 +1623,10 @@ describe("llm-proxy / claude backend", () => {
     expect(withSession[withSession.indexOf("--output-format") + 1]).toBe("stream-json");
     expect(withSession).toContain("--verbose");
     expect(withSession).toContain("--include-partial-messages");
+    expect(withSession).toContain("--setting-sources");
+    expect(withSession).toContain("--strict-mcp-config");
+    expect(withSession).toContain("--disable-slash-commands");
+    expect(withSession).toContain("--system-prompt");
     expect(withSession).toContain("--model");
     expect(withSession[withSession.indexOf("--model") + 1]).toBe("opus");
   });
@@ -2196,5 +2221,123 @@ describe("llm-proxy / /api/diagnostics (Bug B2)", () => {
     } finally {
       await proxy.close();
     }
+  });
+});
+
+// -----------------------------------------------------------------------
+// CLI subprocess config isolation (Bug A)
+//
+// `codex mcp-server` and `claude -p` each have no flag to suppress the
+// user's global config / skills / hooks. The fix is environment-based:
+//   - codex: HOME + CODEX_HOME both pointed at an empty tmpdir on spawn,
+//            with ~/.codex/auth.json copied in so OAuth still works; the
+//            tools/call `cwd` argument also points at the tmpdir.
+//   - claude: spawn cwd pointed at an empty tmpdir (HOME left intact so
+//            subscription-OAuth keychain reads keep working) + a fixed
+//            isolation system prompt overrides any pollution that leaks
+//            through SessionStart hooks.
+//
+// The four tests below pin those behaviors against the mock-spawn harness.
+// -----------------------------------------------------------------------
+describe("llm-proxy / CLI isolation (Bug A)", () => {
+  it("A1: codex runTurn spawn env carries HOME + CODEX_HOME pointing at the same isolation tmpdir", async () => {
+    const recorder = makeSpawnRecorder([
+      {
+        stdoutLines: [
+          mcpFraming({ type: "session_configured", session_id: "iso-1" }),
+          mcpDelta("ok"),
+          mcpToolCallResponse("iso-1")
+        ]
+      }
+    ]);
+    const codexBackend = createCodexBackend({ spawn: recorder.spawn });
+    await codexBackend.runTurn({
+      messages: [{ role: "user", content: "hi" }],
+      onEvent: () => undefined
+    });
+    await new Promise((r) => setImmediate(r));
+    const env = recorder.calls[0]?.env ?? {};
+    // Both HOME and CODEX_HOME must point at the same tmpdir-shaped path
+    // — the exact dir name varies per run (mkdtemp template), so we
+    // assert on the `zotero-ai-codex-` prefix.
+    expect(env.HOME).toEqual(expect.stringMatching(/zotero-ai-codex-/u));
+    expect(env.CODEX_HOME).toEqual(expect.stringMatching(/zotero-ai-codex-/u));
+    expect(env.HOME).toBe(env.CODEX_HOME);
+  });
+
+  it("A2: codex tools/call arguments carry cwd matching the isolation tmpdir (not process.cwd())", async () => {
+    const recorder = makeSpawnRecorder([
+      {
+        stdoutLines: [
+          mcpFraming({ type: "session_configured", session_id: "iso-2" }),
+          mcpDelta("ok"),
+          mcpToolCallResponse("iso-2")
+        ]
+      }
+    ]);
+    const codexBackend = createCodexBackend({ spawn: recorder.spawn });
+    await codexBackend.runTurn({
+      messages: [{ role: "user", content: "hi" }],
+      onEvent: () => undefined
+    });
+    await new Promise((r) => setImmediate(r));
+    const stdin = recorder.calls[0]?.stdin ?? "";
+    const toolCall = stdin
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map(
+        (l) =>
+          JSON.parse(l) as {
+            method?: string;
+            params?: { name?: string; arguments?: Record<string, unknown> };
+          }
+      )
+      .find((m) => m.method === "tools/call");
+    expect(toolCall).toBeDefined();
+    const args = toolCall?.params?.arguments ?? {};
+    expect(args.cwd).toEqual(expect.stringMatching(/zotero-ai-codex-/u));
+    // Same tmpdir as the spawn env — codex's tools/call cwd MUST match
+    // the spawn cwd, otherwise AGENTS.md from the spawn cwd still leaks.
+    expect(args.cwd).toBe(recorder.calls[0]?.env?.HOME);
+  });
+
+  it("A3: claude buildClaudeArgs always emits the isolation flags + CLAUDE_ISOLATION_SYSTEM_PROMPT", () => {
+    const argv = buildClaudeArgs({ sessionId: null });
+    // The four isolation flags appear in fixed order: --setting-sources
+    // user, --strict-mcp-config, --disable-slash-commands, --system-prompt
+    // <NEUTRAL>.
+    const idxSettingSources = argv.indexOf("--setting-sources");
+    expect(idxSettingSources).toBeGreaterThanOrEqual(0);
+    expect(argv[idxSettingSources + 1]).toBe("user");
+    expect(argv).toContain("--strict-mcp-config");
+    expect(argv).toContain("--disable-slash-commands");
+    const idxSystemPrompt = argv.indexOf("--system-prompt");
+    expect(idxSystemPrompt).toBeGreaterThanOrEqual(0);
+    expect(argv[idxSystemPrompt + 1]).toBe(CLAUDE_ISOLATION_SYSTEM_PROMPT);
+    // Sanity: the prompt itself is non-empty and starts with the
+    // research-assistant framing.
+    expect(CLAUDE_ISOLATION_SYSTEM_PROMPT.length).toBeGreaterThan(0);
+    expect(CLAUDE_ISOLATION_SYSTEM_PROMPT).toMatch(/research/u);
+  });
+
+  it("A4: claude runTurn spawn options carry cwd matching the isolation tmpdir", async () => {
+    const recorder = makeSpawnRecorder([
+      {
+        stdoutLines: [JSON.stringify({ type: "result", session_id: "claude-iso", result: "ok" })]
+      }
+    ]);
+    const claudeBackend = createClaudeBackend({ spawn: recorder.spawn });
+    await claudeBackend.runTurn({
+      messages: [{ role: "user", content: "hi" }],
+      onEvent: () => undefined
+    });
+    await new Promise((r) => setImmediate(r));
+    const cwd = recorder.calls[0]?.cwd;
+    expect(cwd).toEqual(expect.stringMatching(/zotero-ai-claude-/u));
+    // We deliberately do NOT override HOME for claude — subscription
+    // OAuth needs the real $HOME to reach the keychain. Asserting `env`
+    // is undefined (the spawn call passed no env override) keeps the
+    // backend honest about that choice.
+    expect(recorder.calls[0]?.env).toBeUndefined();
   });
 });

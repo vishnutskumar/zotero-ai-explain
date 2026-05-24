@@ -87,6 +87,55 @@ export function parseCitationToken(token: string): {
  * arrives without a `chunkIndex` is skipped rather than keyed under
  * `${itemKey}#undefined`.
  */
+/**
+ * Resolve a parsed `[itemKey]` / `[itemKey#chunkIndex]` token against the
+ * per-turn citation lookup, applying the README contract:
+ *
+ *   - **Full-key hit.** `parsed.chunkIndex !== undefined` AND
+ *     `${itemKey}#${chunkIndex}` is in `lookup` → return the matched
+ *     entry verbatim (carries `attachmentKey`/`pageIndex` so the caller
+ *     can jump to the cited page).
+ *   - **Legacy / bare-key fallback.** `parsed.chunkIndex === undefined`
+ *     (the LLM emitted `[itemKey]` without a chunk index) → return a
+ *     minimal entry `{ itemKey, text }` whenever ANY chunk in the lookup
+ *     shares this `itemKey`. No `pageIndex` / `attachmentKey` on the
+ *     fallback entry — downstream `citation-open.ts` opens the
+ *     attachment at page 1 when `pageIndex` is undefined, matching the
+ *     v0.2.0 "open the document, don't pick a specific page" behavior.
+ *     The `text` field is borrowed from the first matching chunk so the
+ *     popup/sidebar tooltip can still show a snippet.
+ *   - **Hallucinated key.** Either `parsed.chunkIndex` is set and the
+ *     full-key composition misses, OR `parsed.chunkIndex` is unset and
+ *     no chunk shares this `itemKey` → return `undefined`. The caller
+ *     renders the original `[itemKey#…]` token as inert text (no anchor)
+ *     so a model hallucination does not become a clickable but
+ *     misdirected link.
+ *
+ * Pure / DOM-free so it can be exercised without jsdom.
+ */
+export function resolveCitation(
+  parsed: { readonly itemKey: string; readonly chunkIndex?: number },
+  lookup: CitationLookup
+): CitationLookupEntry | undefined {
+  if (parsed.chunkIndex !== undefined) {
+    // Full-key path — straight lookup. Misses (out-of-range chunk index,
+    // hallucinated itemKey) drop through to `undefined` per contract.
+    return lookup.get(`${parsed.itemKey}#${String(parsed.chunkIndex)}`);
+  }
+  // Legacy `[itemKey]` shape: scan for ANY chunk sharing this itemKey.
+  // We synthesize a fallback entry rather than returning the first
+  // matching chunk verbatim because a single itemKey can have many
+  // chunks at different pages — silently picking one would route the
+  // click to an arbitrary chunk. The empty-page-index fallback opens
+  // the attachment at page 1, which is the README-documented intent.
+  for (const entry of lookup.values()) {
+    if (entry.itemKey === parsed.itemKey) {
+      return { itemKey: parsed.itemKey, text: entry.text };
+    }
+  }
+  return undefined;
+}
+
 export function buildCitationLookup(chunks: readonly RetrievedChunk[]): CitationLookup {
   const lookup = new Map<string, CitationLookupEntry>();
   for (const chunk of chunks) {

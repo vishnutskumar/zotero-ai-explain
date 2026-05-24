@@ -5,7 +5,11 @@ import { describe, expect, it, vi } from "vitest";
 import { createConversationStore } from "../../src/conversation/conversation-store.js";
 import { createIndexingController } from "../../src/indexing/indexing-controller.js";
 import { controllerStubDeps } from "../indexing/controller-test-helpers.js";
-import { createZoteroRuntime, type RuntimeFetch } from "../../src/platform/zotero-runtime.js";
+import {
+  createZoteroRuntime,
+  type PopupRetrievalChannel,
+  type RuntimeFetch
+} from "../../src/platform/zotero-runtime.js";
 import type { ZoteroUiAdapter } from "../../src/platform/zotero-ui-types.js";
 import {
   createDefaultOllamaSettings,
@@ -947,5 +951,184 @@ describe("createZoteroRuntime PDF-identity prompt frame (FINDING-2 / AC-2)", () 
       messages.some((m) => m.role === "user" && m.content.includes("Shortcut selection."))
     ).toBe(true);
     await shutdown();
+  });
+});
+
+/**
+ * P5 simplify HIGH (efficiency) — PopupRetrievalChannel subscriber leak.
+ *
+ * Regression: `startExplain` / `startAskQuestion` subscribed once per
+ * conversation to the popup retrieval channel and tore down the
+ * subscription in `popup.onDismiss` (and `cleanupExplain` at shutdown).
+ * The "Continue in sidebar" button programmatically unmounted the popup
+ * WITHOUT firing the popup's `onDismiss`, and the sidebar's `onDismiss`
+ * only tore down the sidebar-store subscription. Each
+ * popup → continue → sidebar → dismiss cycle therefore leaked one
+ * subscriber permanently; every subsequent publish fanned out to every
+ * leaked subscriber.
+ *
+ * These tests pin the fix:
+ *   1. After the full popup → sidebar → dismiss cycle the channel's
+ *      subscriber count drops to zero.
+ *   2. Three consecutive cycles never grow the subscriber count above
+ *      one in-flight subscriber AND finish at zero.
+ *   3. Direct popup dismissal (no sidebar transition) also drops the
+ *      subscriber count to zero.
+ */
+describe("PopupRetrievalChannel subscriber lifetime (P5 efficiency H)", () => {
+  type SubscriberCountingChannel = {
+    readonly publish: (chunks: readonly unknown[]) => void;
+    readonly subscribe: (handler: (chunks: readonly unknown[]) => void) => () => void;
+    subscriberCount(): number;
+  };
+
+  function makeCountingChannel(): SubscriberCountingChannel {
+    const handlers = new Set<(chunks: readonly unknown[]) => void>();
+    return {
+      publish(chunks) {
+        for (const h of handlers) h(chunks);
+      },
+      subscribe(handler) {
+        handlers.add(handler);
+        return () => {
+          handlers.delete(handler);
+        };
+      },
+      subscriberCount(): number {
+        return handlers.size;
+      }
+    };
+  }
+
+  function selection(): SelectionContext {
+    return {
+      quote: "Q",
+      source: {
+        itemKey: "I",
+        itemTitle: "Paper",
+        attachmentKey: "A",
+        pageLabel: "1"
+      },
+      anchor: null
+    };
+  }
+
+  async function bootWithChannel(): Promise<{
+    readonly channel: SubscriberCountingChannel;
+    readonly readerActions: ((selection: SelectionContext) => void)[];
+    readonly shutdown: () => Promise<void>;
+  }> {
+    const calls: string[] = [];
+    const { ui, readerActions } = createFakeUi(calls);
+    const store = createConversationStore();
+    const channel = makeCountingChannel();
+    const popupController: PopupController = {
+      explain: vi.fn(async () => Promise.resolve()),
+      cancel: vi.fn(),
+      retry: vi.fn(async () => Promise.resolve()),
+      // Mirror production: `continueInSidebar` mutates the store so the
+      // sidebar mount has a conversation to render against.
+      continueInSidebar: vi.fn((conversationId: string) => {
+        store.moveToSidebar(conversationId);
+      }),
+      sendFollowUp: vi.fn(async () => Promise.resolve())
+    };
+    const sidebarController: SidebarController = {
+      sendFollowUp: vi.fn(async () => Promise.resolve())
+    };
+    const runtime = createZoteroRuntime({
+      settings: createDefaultOllamaSettings(),
+      indexingController: createIndexingController({
+        logger: { debug: () => undefined },
+        ...controllerStubDeps()
+      }),
+      ui,
+      store,
+      profile: () => ollamaSettingsToProfile(createDefaultOllamaSettings()),
+      popupController,
+      sidebarController,
+      disclosure: () => "disclosure",
+      // Cast: the test counting-channel mirrors the production shape
+      // (publish + subscribe), but uses `readonly unknown[]` so the test
+      // doesn't depend on the RetrievedChunk shape.
+      popupRetrievalChannel: channel as unknown as PopupRetrievalChannel
+    });
+    await runtime.startup();
+    return { channel, readerActions, shutdown: () => runtime.shutdown() };
+  }
+
+  it("popup → continue → sidebar → dismiss tears the subscriber down", async () => {
+    const { channel, readerActions, shutdown } = await bootWithChannel();
+    try {
+      // Trigger the explain reader command; the runtime subscribes once.
+      readerActions[0]?.(selection());
+      expect(channel.subscriberCount()).toBe(1);
+
+      // Click "Continue in sidebar" — the popup unmounts and the
+      // sidebar mounts. The subscription must transfer ownership (still
+      // exactly one subscriber alive).
+      const continueButton = document.querySelector<HTMLButtonElement>(
+        '[data-action="continue-sidebar"]'
+      );
+      expect(continueButton).not.toBeNull();
+      continueButton?.click();
+      expect(channel.subscriberCount()).toBe(1);
+
+      // Click the sidebar close — the sidebar's `onDismiss` fires and
+      // must tear down the retrieval subscription.
+      const close = document.querySelector<HTMLButtonElement>('[data-action="close-sidebar"]');
+      expect(close).not.toBeNull();
+      close?.click();
+      expect(channel.subscriberCount()).toBe(0);
+    } finally {
+      await shutdown();
+      // Runtime shutdown is idempotent — count must remain zero.
+      expect(channel.subscriberCount()).toBe(0);
+    }
+  });
+
+  it("three popup → continue → sidebar → dismiss cycles leave subscriberCount at zero", async () => {
+    const { channel, readerActions, shutdown } = await bootWithChannel();
+    try {
+      for (let i = 0; i < 3; i += 1) {
+        readerActions[0]?.(selection());
+        // One subscription per active explain — the channel must never
+        // grow beyond one in-flight subscriber across the loop.
+        expect(channel.subscriberCount()).toBe(1);
+        document.querySelector<HTMLButtonElement>('[data-action="continue-sidebar"]')?.click();
+        expect(channel.subscriberCount()).toBe(1);
+        document.querySelector<HTMLButtonElement>('[data-action="close-sidebar"]')?.click();
+        expect(channel.subscriberCount()).toBe(0);
+      }
+    } finally {
+      await shutdown();
+      expect(channel.subscriberCount()).toBe(0);
+    }
+  });
+
+  it("runtime shutdown after a popup explain (no sidebar transition) tears the subscriber down", async () => {
+    // Direct popup dismissal in production fires `onDismiss`, which the
+    // fake adapter doesn't trigger; runtime shutdown calls
+    // `cleanupExplain` which routes through the same `tearDownRetrieval`
+    // owner, so the leak invariant is identical: count must reach zero
+    // after the conversation is torn down by ANY teardown path.
+    const { channel, readerActions, shutdown } = await bootWithChannel();
+    readerActions[0]?.(selection());
+    expect(channel.subscriberCount()).toBe(1);
+    await shutdown();
+    expect(channel.subscriberCount()).toBe(0);
+  });
+
+  it("ask-question flow tears the subscriber down on runtime shutdown", async () => {
+    // Ask-question subscribes through the same channel; the cleanup
+    // helper mirrors the explain path. Pin it so a future refactor that
+    // diverges the two flows can't reintroduce the leak on one side.
+    const { channel, readerActions, shutdown } = await bootWithChannel();
+    // readerActions[1] is the "Ask a question" command (registered
+    // second per the startup order asserted earlier in this file).
+    readerActions[1]?.(selection());
+    expect(channel.subscriberCount()).toBe(1);
+    await shutdown();
+    expect(channel.subscriberCount()).toBe(0);
   });
 });

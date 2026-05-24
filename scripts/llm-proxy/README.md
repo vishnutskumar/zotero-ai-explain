@@ -10,12 +10,18 @@ routes each request to one of three backends:
   `msg.type === "agent_message_content_delta"` and are translated into Ollama-format NDJSON chunks.
   The `-c mcp_servers={}` override suppresses any user-configured MCP sidecars (which would
   otherwise add 1-3 s of avoidable per-turn startup) since the proxy uses `codex mcp-server` purely
-  as a streaming chat backend.
+  as a streaming chat backend. Spawned in an isolated environment (`HOME` + `CODEX_HOME` + `cwd`
+  pointed at a per-backend tmpdir; see [Subprocess isolation](#subprocess-isolation)) so the user's
+  `~/.codex/AGENTS.md` and bundled skills do not bleed into Zotero responses.
 - **Claude Code CLI** (`POST /claude/api/chat`) — spawns
-  `claude -p --output-format stream-json --verbose --include-partial-messages --allowedTools "" -`
+  `claude -p --output-format stream-json --verbose --include-partial-messages --allowedTools "" --setting-sources user --strict-mcp-config --disable-slash-commands --system-prompt <NEUTRAL_PREFACE> -`
   (or the same with a leading `--resume <SESSION_ID>` for follow-up turns) and translates the
   incremental `content_block_delta` text frames into Ollama-format NDJSON chunks. Tool use is
-  hard-disabled via the empty `--allowedTools` allowlist so Claude behaves as a pure chat model.
+  hard-disabled via the empty `--allowedTools` allowlist so Claude behaves as a pure chat model; the
+  trailing four isolation flags suppress user-config sources, MCP sidecars, and slash commands and
+  inject a neutral system prompt (see [Subprocess isolation](#subprocess-isolation)). `cwd` is set
+  to a per-backend tmpdir; `HOME` is **not** overridden because subscription auth resolves through
+  the OS keychain.
 - **Real Ollama** (`POST /ollama/api/chat`) — forwards verbatim to a real Ollama daemon (default
   `http://localhost:11434`).
 
@@ -113,7 +119,9 @@ the first invocation's `tools/call` response:
 1. **First turn** — spawn `codex mcp-server -c mcp_servers={}` (plus an optional `-c model=<M>`) and
    write three JSON-RPC frames to stdin: `initialize`, `notifications/initialized`, and `tools/call`
    with `name: "codex"` whose `arguments` carry the latest user message as `prompt` (plus
-   `sandbox: "read-only"`, `approval-policy: "never"`, and `cwd: process.cwd()`).
+   `sandbox: "read-only"`, `approval-policy: "never"`, and `cwd: <isolationDir>` — the same
+   per-backend tmpdir the spawn's `cwd`/`HOME`/`CODEX_HOME` point at; see
+   [Subprocess isolation](#subprocess-isolation)).
 2. **Subsequent turn** — same `initialize` / `notifications/initialized` framing, but the
    `tools/call` arguments use `name: "codex-reply"` with `{ threadId: "<stored>", prompt: "…" }`.
 
@@ -166,10 +174,14 @@ Per request the proxy spawns the CLI with the prompt on stdin:
 
 ```text
 # First turn
-claude -p --output-format stream-json --verbose --include-partial-messages --allowedTools ""
+claude -p --output-format stream-json --verbose --include-partial-messages --allowedTools "" \
+  --setting-sources user --strict-mcp-config --disable-slash-commands \
+  --system-prompt <NEUTRAL_PREFACE>
 
 # Subsequent turn (same conversation key — see "Multi-turn" below)
-claude --resume <SESSION_ID> -p --output-format stream-json --verbose --include-partial-messages --allowedTools ""
+claude --resume <SESSION_ID> -p --output-format stream-json --verbose --include-partial-messages --allowedTools "" \
+  --setting-sources user --strict-mcp-config --disable-slash-commands \
+  --system-prompt <NEUTRAL_PREFACE>
 ```
 
 - `-p` puts the CLI in print mode (one-shot, non-interactive).
@@ -186,6 +198,11 @@ claude --resume <SESSION_ID> -p --output-format stream-json --verbose --include-
   (Read/Bash/Edit/etc.), so Claude behaves as a pure chat model. This is a hard requirement of the
   Zotero plugin's contract (the popup and sidebar are conversational explainers, not agents) and is
   enforced by `buildClaudeArgs` in `scripts/llm-proxy/backends/claude.mjs`.
+- `--setting-sources user --strict-mcp-config --disable-slash-commands --system-prompt <NEUTRAL>`
+  are the **isolation flags** — they suppress user-config layers (CLAUDE.md / settings.json), MCP
+  sidecars, and slash commands, and replace the user's default system prompt with a short neutral
+  preface so the model treats the proxy turn as a plain chat request. See
+  [Subprocess isolation](#subprocess-isolation) for the full rationale and accepted limitations.
 - `--model` is added only when `CLAUDE_DEFAULT_MODEL` is set (or the request body specifies one); by
   default the CLI picks the model from the user's `claude` config.
 
@@ -226,6 +243,59 @@ Expected: zero or more `done:false` chunks followed by exactly one `done:true` c
 exit the terminal chunk will have `done_reason:"error"` and an `error` field — never a silent
 `done_reason:"stop"` (this is the BUG-AC8-1 contract).
 
+## Subprocess isolation
+
+Both the Codex and Claude backends spawn CLIs that, by default, load extensive user developer
+configuration — `~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md`, settings files, MCP sidecars, custom
+skills, slash commands. None of that is appropriate for Zotero responses: a user's "act as a senior
+code reviewer" CLAUDE.md instruction would warp every popup explanation. The proxy isolates each CLI
+from that configuration at spawn time.
+
+### Codex isolation
+
+The codex backend lazily creates a per-backend tmpdir (`/tmp/zotero-ai-codex-*` via `mkdtemp`) on
+first use and best-effort copies `~/.codex/auth.json` into it (silently skipped on `ENOENT`).
+`codex mcp-server` is then spawned with:
+
+- `env.HOME = <tmpdir>` and `env.CODEX_HOME = <tmpdir>` — codex reads `AGENTS.md`, `config.toml`,
+  and per-project skills relative to `$CODEX_HOME`/`$HOME`; pointing both at a fresh empty directory
+  neutralises them.
+- `cwd = <tmpdir>` — also reflected in the `tools/call codex` arguments' `cwd` field so the model
+  cannot see the user's actual working directory.
+
+Copying `auth.json` is what lets codex remain authenticated against the user's ChatGPT login while
+running out of the isolated `$CODEX_HOME`.
+
+### Claude isolation
+
+The claude backend lazily creates a per-backend tmpdir (`/tmp/zotero-ai-claude-*`) and spawns
+`claude -p …` with:
+
+- `cwd = <tmpdir>` — keeps the CLI from picking up the user's project CLAUDE.md / .claude config.
+- `--setting-sources user` — restricts settings to the user-global layer only (no project/local).
+- `--strict-mcp-config` — refuses to load MCP sidecars from the user's settings.
+- `--disable-slash-commands` — turns off slash-command dispatch entirely.
+- `--system-prompt <NEUTRAL_PREFACE>` — replaces the user's default system prompt with a short
+  neutral preface; biases the model against treating any residual pollution as instructions.
+
+`HOME` is **deliberately not overridden** for claude. Subscription auth resolves through the OS
+keychain (macOS Keychain / libsecret / Windows Credential Manager) which the CLI accesses via
+`$HOME`-scoped paths; isolating `HOME` would break authentication.
+
+### Accepted limitations
+
+Two pollution sources are not blocked by this isolation:
+
+- **Bundled `.system` skills (codex).** Codex ships 5 baked-in skills (imagegen, openai-docs,
+  plugin-creator, skill-creator, skill-installer). They are compiled into the binary and cannot be
+  suppressed by environment isolation.
+- **SessionStart hooks (claude).** `--setting-sources user` + `--strict-mcp-config` +
+  `--disable-slash-commands` do not prevent SessionStart hooks from firing. The neutral
+  `--system-prompt` is the bias against the model treating any hook output as instructions.
+
+Both are documented as accepted limitations in ADR
+[0001 — LLM proxy architecture](../../docs/decisions/0001-llm-proxy-architecture.md).
+
 ## Smoke tests
 
 ### Codex backend
@@ -259,15 +329,15 @@ curl http://127.0.0.1:11400/api/tags
 
 ## Troubleshooting
 
-| Symptom                                  | Likely cause                                                                                      |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `Ollama unreachable at …`                | `ollama serve` not running, or wrong `OLLAMA_BASE_URL`.                                           |
-| `codex: authentication failed`           | Run `codex login`.                                                                                |
-| `codex exited with code 127`             | `codex` not on `PATH`. Install via Homebrew or the official installer.                            |
-| `claude exited with code 127`            | `claude` not on `PATH`. Set `CLAUDE_BINARY=/full/path/to/claude` or install the CLI globally.     |
-| `claude` errors with "not authenticated" | Run `claude login` in the shell that launches the proxy, then restart the proxy.                  |
-| Empty popup with no error                | Should not happen anymore — the proxy emits a `done_reason: "error"` chunk on failure.            |
-| `gpt-5.2-codex` not recognised by Codex  | Set `CODEX_DEFAULT_MODEL` to a model your `codex` CLI supports, or pass `model` in the chat body. |
+| Symptom                                  | Likely cause                                                                                                                                                                                             |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Ollama unreachable at …`                | `ollama serve` not running, or wrong `OLLAMA_BASE_URL`.                                                                                                                                                  |
+| `codex: authentication failed`           | Run `codex login`. If you have authenticated but isolation broke OAuth, confirm `~/.codex/auth.json` exists before the proxy spawns codex — the proxy copies it into the isolation tmpdir at spawn time. |
+| `codex exited with code 127`             | `codex` not on `PATH`. Install via Homebrew or the official installer.                                                                                                                                   |
+| `claude exited with code 127`            | `claude` not on `PATH`. Set `CLAUDE_BINARY=/full/path/to/claude` or install the CLI globally.                                                                                                            |
+| `claude` errors with "not authenticated" | Run `claude login` in the shell that launches the proxy, then restart the proxy.                                                                                                                         |
+| Empty popup with no error                | Should not happen anymore — the proxy emits a `done_reason: "error"` chunk on failure.                                                                                                                   |
+| `gpt-5.2-codex` not recognised by Codex  | Set `CODEX_DEFAULT_MODEL` to a model your `codex` CLI supports, or pass `model` in the chat body.                                                                                                        |
 
 ## Security
 

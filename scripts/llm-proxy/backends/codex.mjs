@@ -72,8 +72,9 @@
 
 import { spawn as defaultSpawn } from "node:child_process";
 import { promises as fs, readFileSync, existsSync } from "node:fs";
+import { mkdtemp, copyFile, access } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 
 const DEFAULT_MODEL = "gpt-5.5";
@@ -570,6 +571,64 @@ export function createCodexBackend(deps = {}) {
   const sigkillGraceMs = deps.sigkillGraceMs ?? 3000;
   const now = deps.now ?? (() => Date.now());
   const sessionMap = deps.sessionMap ?? new Map();
+
+  /**
+   * Lazily-created per-backend isolation tmpdir. Reused across `runTurn`
+   * calls so we don't pay the mkdtemp cost on every turn AND so concurrent
+   * turns share the same isolated HOME (codex's auth.json is read once
+   * per spawn, but the resulting OAuth token is cached on disk — sharing
+   * the dir lets that cache survive between turns).
+   *
+   * Cached as a Promise so concurrent `runTurn` calls all await the same
+   * single mkdtemp; without the promise cache, two concurrent first turns
+   * would each spawn their own mkdtemp and one would leak.
+   */
+  let isolationDirPromise = null;
+
+  /**
+   * Build (once) the isolation directory for codex spawns and copy the
+   * user's `~/.codex/auth.json` into it so codex finds the OAuth token at
+   * `$CODEX_HOME/auth.json`. We deliberately do NOT copy `~/.codex/config.toml`
+   * or `~/.codex/AGENTS.md` — those are precisely the pollution sources
+   * (skill plugins, Superpowers preamble, user-installed skills) we are
+   * isolating from.
+   *
+   * Why this isolation matters: `codex mcp-server` (the only codex
+   * subcommand that streams per-token deltas) has no `--ephemeral` /
+   * `--ignore-user-config` flag — only `codex exec` does. The viable
+   * isolation lever is environment-based: set HOME and CODEX_HOME to an
+   * empty tmpdir at spawn time. That strips `~/.codex/AGENTS.md`,
+   * `~/.codex/config.toml`, `~/.codex/skills/*`, `~/.agents/skills/*`,
+   * and project `AGENTS.md` from process.cwd(). The 5 bundled `.system`
+   * skills (imagegen, openai-docs, plugin-creator, skill-creator,
+   * skill-installer) remain — they are baked into the codex binary, all
+   * phrased as descriptive triggers ("Use when..."), and none activate
+   * for "Explain this passage". Accepted limitation.
+   *
+   * Auth note: `~/.codex/auth.json` is the OAuth token file. If it is
+   * absent (the user authenticates via an OPENAI_API_KEY env var), we
+   * skip the copy silently — codex will still find the env var from the
+   * spawn env. We never error here: a missing auth file is the user's
+   * responsibility, and a broken isolation helper must not break every
+   * turn.
+   */
+  async function ensureIsolationDir() {
+    if (isolationDirPromise !== null) return isolationDirPromise;
+    isolationDirPromise = (async () => {
+      const dir = await mkdtemp(join(tmpdir(), "zotero-ai-codex-"));
+      const src = join(homedir(), ".codex", "auth.json");
+      try {
+        await access(src);
+        await copyFile(src, join(dir, "auth.json"));
+      } catch {
+        // Auth file absent (user uses an env-var API key) or unreadable.
+        // Codex will surface its own auth error from the isolated dir if
+        // the env var is also missing — that's the right place to report.
+      }
+      return dir;
+    })();
+    return isolationDirPromise;
+  }
   // Hooks for the live-config discovery path; injected by tests.
   const configDiscoveryOpts = {
     ...(deps.configPath !== undefined ? { configPath: deps.configPath } : {}),
@@ -612,8 +671,15 @@ export function createCodexBackend(deps = {}) {
     const prompt = latestUserContent(messages);
     const spawnStartedAtMs = now();
 
+    // Build (or reuse) the isolation tmpdir so codex doesn't see the
+    // user's ~/.codex/AGENTS.md / config.toml / skills / impeccable etc.
+    // See ensureIsolationDir() for the full rationale.
+    const isolationDir = await ensureIsolationDir();
+
     const child = spawn(codexCommand, argv, {
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: isolationDir,
+      env: { ...process.env, HOME: isolationDir, CODEX_HOME: isolationDir }
     });
 
     // Write the three MCP JSON-RPC handshake frames to stdin. The
@@ -631,7 +697,12 @@ export function createCodexBackend(deps = {}) {
             prompt,
             sandbox: "read-only",
             "approval-policy": "never",
-            cwd: process.cwd()
+            // `cwd` rides the tools/call arguments AND the spawn options
+            // for the same isolation reason: codex's `tools/call codex`
+            // resolves project AGENTS.md relative to this cwd. Pointing
+            // it at the empty isolation dir suppresses the plugin's own
+            // project AGENTS.md alongside the user's global ones.
+            cwd: isolationDir
           };
           if (typeof requestedModel === "string" && requestedModel.length > 0) {
             base.model = requestedModel;

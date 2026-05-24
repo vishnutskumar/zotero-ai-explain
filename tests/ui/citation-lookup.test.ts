@@ -50,7 +50,11 @@
 
 import { describe, expect, it } from "vitest";
 
-import { buildCitationLookup, parseCitationToken } from "../../src/ui/citation-lookup.js";
+import {
+  buildCitationLookup,
+  parseCitationToken,
+  resolveCitation
+} from "../../src/ui/citation-lookup.js";
 import type { RetrievedChunk } from "../../src/indexing/index-search.js";
 
 function chunk(over: Partial<RetrievedChunk> = {}): RetrievedChunk {
@@ -203,5 +207,64 @@ describe("buildCitationLookup", () => {
   it("returns an empty map for an empty chunk list", () => {
     const lookup = buildCitationLookup([]);
     expect(lookup.size).toBe(0);
+  });
+});
+
+describe("resolveCitation", () => {
+  it("full-key hit: returns the entry verbatim with attachmentKey + pageIndex", () => {
+    // Spec branch 1 — `[ABCD1234#3]` with a matching chunk in the
+    // lookup MUST surface the chunk-scoped fields so the click handler
+    // can jump to the cited page.
+    const lookup = buildCitationLookup([
+      chunk({
+        itemKey: "ABCD1234",
+        chunkIndex: 3,
+        attachmentKey: "ATT00007",
+        pageIndex: 16,
+        text: "page seventeen text"
+      })
+    ]);
+    const entry = resolveCitation({ itemKey: "ABCD1234", chunkIndex: 3 }, lookup);
+    expect(entry).toBeDefined();
+    expect(entry?.itemKey).toBe("ABCD1234");
+    expect(entry?.attachmentKey).toBe("ATT00007");
+    expect(entry?.pageIndex).toBe(16);
+    expect(entry?.text).toBe("page seventeen text");
+  });
+
+  it("bare-key fallback: returns a minimal entry when any chunk shares the itemKey", () => {
+    // Spec branch 2 — legacy `[ABCD1234]` shape with no chunk index.
+    // Multiple chunks may share the itemKey at different pages; the
+    // fallback intentionally drops attachmentKey/pageIndex so
+    // citation-open.ts opens the document at page 1 (the README
+    // contract). Borrowing one chunk's `text` is fine — it's used only
+    // for the tooltip and the click target is the document, not a page.
+    const lookup = buildCitationLookup([
+      chunk({ itemKey: "ABCD1234", chunkIndex: 0, pageIndex: 4, attachmentKey: "ATT0001" }),
+      chunk({ itemKey: "ABCD1234", chunkIndex: 1, pageIndex: 9, attachmentKey: "ATT0001" })
+    ]);
+    const entry = resolveCitation({ itemKey: "ABCD1234" }, lookup);
+    expect(entry).toBeDefined();
+    expect(entry?.itemKey).toBe("ABCD1234");
+    // The README-documented fallback drops chunk-scoped fields.
+    expect(entry?.pageIndex).toBeUndefined();
+    expect(entry?.attachmentKey).toBeUndefined();
+  });
+
+  it("hallucinated key: returns undefined for a full-key miss", () => {
+    // Spec branch 3a — model emitted a chunk index that wasn't in the
+    // retrieval. Returning a fallback would route the click to an
+    // arbitrary chunk; returning undefined lets the renderer emit inert
+    // text instead.
+    const lookup = buildCitationLookup([chunk({ itemKey: "ABCD1234", chunkIndex: 0 })]);
+    const entry = resolveCitation({ itemKey: "ABCD1234", chunkIndex: 99 }, lookup);
+    expect(entry).toBeUndefined();
+  });
+
+  it("hallucinated key: returns undefined for a bare token whose itemKey is absent", () => {
+    // Spec branch 3b — bare `[ZZZZZZZZ]` matches no chunk in the lookup.
+    const lookup = buildCitationLookup([chunk({ itemKey: "ABCD1234", chunkIndex: 0 })]);
+    const entry = resolveCitation({ itemKey: "ZZZZZZZZ" }, lookup);
+    expect(entry).toBeUndefined();
   });
 });

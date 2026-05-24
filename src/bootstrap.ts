@@ -7,7 +7,11 @@ import { runE2eDriver } from "./platform/e2e-driver.js";
 import type { SubprocessLike } from "./platform/proxy-lifecycle.js";
 import { dumpZoteroTokens } from "./platform/token-dump.js";
 import { wireProxyLifecycle, type WiredProxy } from "./platform/wire-proxy-lifecycle.js";
-import { createZoteroRuntime, type ZoteroRuntime } from "./platform/zotero-runtime.js";
+import {
+  createPopupRetrievalChannel,
+  createZoteroRuntime,
+  type ZoteroRuntime
+} from "./platform/zotero-runtime.js";
 import { createZoteroUiAdapter, type ZoteroGlobal } from "./platform/zotero-ui-adapter.js";
 import {
   loadOllamaSettingsFromPrefs,
@@ -1160,6 +1164,11 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
   // best-effort: missing/empty index, embedding failures, or dim-mismatch
   // all fall through to the unwrapped provider so the popup never blocks
   // on retrieval problems.
+  // Pub/sub channel for retrieved chunks. The rag provider publishes
+  // here on each request; the runtime's popup/sidebar conversations
+  // subscribe to populate per-conversation citation lookups for
+  // linkifying `[itemKey#chunkIndex]` tokens in assistant text.
+  const popupRetrievalChannel = createPopupRetrievalChannel();
   const ragProvider = createRagAugmentedProvider({
     inner: provider,
     embeddingProvider,
@@ -1167,6 +1176,9 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
     embedSettings: { baseUrl: settings.embedBaseUrl, model: settings.embeddingModel },
     debug: (msg) => {
       context.Zotero.debug(`Zotero AI Explain: ${msg}`);
+    },
+    onRetrieved: (chunks) => {
+      popupRetrievalChannel.publish(chunks);
     }
   });
   const popupController = createPopupController({ store, provider: ragProvider });
@@ -1293,6 +1305,7 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
     prefsWriter: asStringPrefWriter(zotero.Prefs),
     libraryChat: libraryChatDeps,
     zotero: context.Zotero,
+    popupRetrievalChannel,
     providerProfile,
     onProviderProfileChange: (next) => {
       context.Zotero.debug(
