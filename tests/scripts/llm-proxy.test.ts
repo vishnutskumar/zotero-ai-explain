@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   buildClaudeArgs,
@@ -2339,5 +2339,347 @@ describe("llm-proxy / CLI isolation (Bug A)", () => {
     // is undefined (the spawn call passed no env override) keeps the
     // backend honest about that choice.
     expect(recorder.calls[0]?.env).toBeUndefined();
+  });
+});
+
+// -----------------------------------------------------------------------
+// Auth + Host + Origin gate (Bug: proxy-auth)
+//
+// `enforceRequestPolicy` runs BEFORE any route dispatch. Three checks
+// in order: Host (allow loopback only), Origin (allow missing/null,
+// reject any non-empty value), bearer token (skip in dev no-auth-mode,
+// constant-time-compare otherwise). Body cap is enforced inside the
+// shared `readBody` helper as a 413.
+//
+// `AUTH_TOKEN` is captured at `createProxyServer` call time from
+// `process.env.LLM_PROXY_AUTH_TOKEN`, so each test mutates the env
+// (within a try/finally) before constructing the server.
+// -----------------------------------------------------------------------
+describe("llm-proxy / auth + host + origin gate", () => {
+  function makeStubBackends() {
+    // The auth gate fires BEFORE route dispatch, so the backends are
+    // only here to satisfy createProxyServer's type expectations. They
+    // are wired with throwing spawn fakes so a regression that bypassed
+    // the gate would surface as "backend spawn was attempted".
+    const throwingSpawn = (): never => {
+      throw new Error("auth gate must reject before reaching the backend");
+    };
+    return {
+      codexBackend: createCodexBackend({ spawn: throwingSpawn }),
+      claudeBackend: createClaudeBackend({ spawn: throwingSpawn })
+    };
+  }
+
+  function withAuthEnv<T>(token: string | null, fn: () => Promise<T>): Promise<T> {
+    const original = process.env.LLM_PROXY_AUTH_TOKEN;
+    if (token === null) delete process.env.LLM_PROXY_AUTH_TOKEN;
+    else process.env.LLM_PROXY_AUTH_TOKEN = token;
+    return fn().finally(() => {
+      if (original === undefined) delete process.env.LLM_PROXY_AUTH_TOKEN;
+      else process.env.LLM_PROXY_AUTH_TOKEN = original;
+    });
+  }
+
+  // The proxy treats any 36-char UUID-shaped string as equivalent for
+  // length-check purposes; mint two distinct ones so wrong-token vs
+  // right-token assertions don't accidentally collide.
+  const RIGHT_TOKEN = "11111111-1111-4111-8111-111111111111";
+  const WRONG_TOKEN = "22222222-2222-4222-8222-222222222222";
+
+  it("A1: rejects a request with no Authorization header in auth-enabled mode (401)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`);
+        expect(r.status).toBe(401);
+        const body = (await r.json()) as { error: string };
+        expect(body.error).toMatch(/missing bearer/u);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A2: rejects a request bearing a WRONG-token of the right length (401)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`, {
+          headers: { authorization: `Bearer ${WRONG_TOKEN}` }
+        });
+        expect(r.status).toBe(401);
+        const body = (await r.json()) as { error: string };
+        expect(body.error).toMatch(/invalid token/u);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A3: accepts a request bearing the correct token (200)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`, {
+          headers: { authorization: `Bearer ${RIGHT_TOKEN}` }
+        });
+        expect(r.status).toBe(200);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A4: rejects a request bearing a foreign Origin header (403) even with a valid token", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`, {
+          headers: {
+            authorization: `Bearer ${RIGHT_TOKEN}`,
+            origin: "https://attacker.example"
+          }
+        });
+        expect(r.status).toBe(403);
+        const body = (await r.json()) as { error: string };
+        expect(body.error).toMatch(/origin/u);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A5: rejects a request with a non-loopback Host header (403)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        // node's `fetch` derives Host from the URL; to inject an
+        // attacker Host we drop down to the raw `net` socket and
+        // hand-craft the HTTP/1.1 request line.
+        const { Socket } = await import("node:net");
+        const responseText = await new Promise<string>((resolve, reject) => {
+          const socket = new Socket();
+          let buf = "";
+          socket.on("data", (chunk) => {
+            buf += chunk.toString("utf8");
+          });
+          socket.on("end", () => {
+            resolve(buf);
+          });
+          socket.on("error", reject);
+          socket.connect(port, "127.0.0.1", () => {
+            socket.write(
+              `GET /api/tags HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer ${RIGHT_TOKEN}\r\nConnection: close\r\n\r\n`
+            );
+          });
+        });
+        const firstLine = responseText.split("\r\n", 1)[0] ?? "";
+        expect(firstLine).toMatch(/^HTTP\/1\.1 403/u);
+        expect(responseText).toMatch(/host not allowed/u);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A6: rejects a POST with a body larger than MAX_BODY_BYTES (413)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      // The default MAX_BODY_BYTES is 1 MiB. Compose a body well over
+      // that to ensure the cap fires (the JSON body is a flat string;
+      // the overflow check runs on the first chunk that pushes the
+      // total past the cap).
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        // Build a 2 MiB payload — guaranteed to overflow the 1 MiB cap.
+        const big = JSON.stringify({
+          messages: [{ role: "user", content: "x".repeat(2 * 1024 * 1024) }]
+        });
+        const r = await fetch(`http://127.0.0.1:${String(port)}/codex/api/chat`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${RIGHT_TOKEN}`
+          },
+          body: big
+        });
+        expect(r.status).toBe(413);
+        const body = (await r.json()) as { error: string };
+        expect(body.error).toMatch(/body exceeds/u);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A7: starts in no-auth mode without LLM_PROXY_AUTH_TOKEN — emits console.warn AND accepts unauthenticated requests", async () => {
+    // Capture console.warn so we can assert the canary fired. The dev
+    // path (`npm run proxy:llm`) and the integration test
+    // `codex-proxy-pipeline.test.ts` both rely on this branch.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {
+      // swallow the canary line so test output stays clean
+    });
+    try {
+      await withAuthEnv(null, async () => {
+        const proxy = createProxyServer(makeStubBackends());
+        const port = await proxy.listen(0);
+        try {
+          // Unauthenticated request should pass with 200 — the gate's
+          // bearer check is skipped entirely in no-auth mode.
+          const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`);
+          expect(r.status).toBe(200);
+          // The startup warn line fired on `listen()` resolve.
+          const warnedMessages = warnSpy.mock.calls
+            .map((args) => (typeof args[0] === "string" ? args[0] : ""))
+            .filter((m) => m.includes("llm-proxy"));
+          expect(warnedMessages.length).toBeGreaterThan(0);
+          expect(warnedMessages.some((m) => m.includes("AUTH DISABLED"))).toBe(true);
+        } finally {
+          await proxy.close();
+        }
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  // -------------------------------------------------------------------
+  // Per-route auth carve-out (A8-A11).
+  //
+  // `/api/shutdown` and `GET /` are INTENTIONALLY bearer-exempt so the
+  // orphan-takeover path in `wire-proxy-lifecycle.ts:tryTakeoverOrphan`
+  // still works after a Zotero restart (the new plugin instance has no
+  // way to know the prior session's token). The Host + Origin gates
+  // still apply, so a network attacker cannot exploit the carve-out;
+  // the only attack vector that survives is "another local process can
+  // shut us down", which is an acceptable DoS on a single-user desktop.
+  // -------------------------------------------------------------------
+  it("A8: POST /api/shutdown succeeds WITHOUT a bearer token even in auth-enabled mode", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/shutdown`, {
+          method: "POST"
+        });
+        expect(r.status).toBe(200);
+        const body = (await r.json()) as { exiting: boolean };
+        expect(body.exiting).toBe(true);
+      } finally {
+        // The shutdown handler exits the process on the next tick; in
+        // a test context we close the server explicitly so the suite
+        // doesn't kill the Vitest worker. The shutdown handler's
+        // `setTimeout(..).unref()` is the safety net for the prod path.
+        try {
+          await proxy.close();
+        } catch {
+          // already closing
+        }
+      }
+    });
+  });
+
+  it("A9: /api/shutdown still rejects a request with a foreign Host header (403)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const { Socket } = await import("node:net");
+        const responseText = await new Promise<string>((resolve, reject) => {
+          const socket = new Socket();
+          let buf = "";
+          socket.on("data", (chunk) => {
+            buf += chunk.toString("utf8");
+          });
+          socket.on("end", () => {
+            resolve(buf);
+          });
+          socket.on("error", reject);
+          socket.connect(port, "127.0.0.1", () => {
+            // Forge a non-loopback Host; the transport gate must reject
+            // this BEFORE the shutdown carve-out can grant the request.
+            socket.write(
+              `POST /api/shutdown HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`
+            );
+          });
+        });
+        const firstLine = responseText.split("\r\n", 1)[0] ?? "";
+        expect(firstLine).toMatch(/^HTTP\/1\.1 403/u);
+        expect(responseText).toMatch(/host not allowed/u);
+      } finally {
+        try {
+          await proxy.close();
+        } catch {
+          // ignore — shutdown may have already fired
+        }
+      }
+    });
+  });
+
+  it("A10: /api/shutdown still rejects a request with a foreign Origin header (403)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/shutdown`, {
+          method: "POST",
+          headers: { origin: "https://attacker.example" }
+        });
+        expect(r.status).toBe(403);
+        const body = (await r.json()) as { error: string };
+        expect(body.error).toMatch(/origin/u);
+      } finally {
+        try {
+          await proxy.close();
+        } catch {
+          // ignore
+        }
+      }
+    });
+  });
+
+  it("A11: GET / route catalog is bearer-exempt but still Host-gated (200 without auth)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        // No Authorization header — would 401 on any auth-gated route,
+        // but `/` is the public route catalog (no secrets) and is
+        // bearer-exempt.
+        const r = await fetch(`http://127.0.0.1:${String(port)}/`);
+        expect(r.status).toBe(200);
+        const body = (await r.json()) as { name: string; routes: string[] };
+        expect(body.name).toBe("zotero-ai-llm-proxy");
+        expect(Array.isArray(body.routes)).toBe(true);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A12: /api/diagnostics REMAINS bearer-gated (401 without auth)", async () => {
+    // The route is bearer-gated because the response leaks codex/claude
+    // binary paths. The plugin sends its bearer explicitly via
+    // wire-proxy-lifecycle.ts:fetchDiagnostics. A local attacker without
+    // the token must get 401.
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/diagnostics`);
+        expect(r.status).toBe(401);
+        const okResp = await fetch(`http://127.0.0.1:${String(port)}/api/diagnostics`, {
+          headers: { authorization: `Bearer ${RIGHT_TOKEN}` }
+        });
+        expect(okResp.status).toBe(200);
+      } finally {
+        await proxy.close();
+      }
+    });
   });
 });

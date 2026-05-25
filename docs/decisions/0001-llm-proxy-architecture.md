@@ -102,3 +102,52 @@ settings layer), `--strict-mcp-config` (refuses to load MCP sidecars from settin
 Both are acceptable because the residual surface is narrow relative to the unisolated state, and
 plugging them would require either upstream changes to the CLIs or chrome-side spawning (which the
 original decision rejected on blast-radius grounds).
+
+## Addendum — 2026-05-24: Proxy authentication
+
+The proxy now enforces bearer-token authentication on the sensitive routes, plus two defense layers
+(Host/Origin header gates and a 1 MiB body cap) that hold even on the bearer-exempt routes. The
+contract between the plugin and the proxy is:
+
+- **Per-spawn token.** `src/platform/wire-proxy-lifecycle.ts` mints a fresh `crypto.randomUUID()`
+  the first time it starts the child (and any time it starts after a `stop()` or unsolicited exit),
+  threads it into the child's environment under `LLM_PROXY_AUTH_TOKEN`, and clears the parent-side
+  copy on stop / exit / start-failure so `getProxyAuthToken()` correctly reports "no running proxy".
+  The token is regenerated on every fresh spawn; the same UUID is never reused across process
+  lifetimes.
+- **Shared env-var constant.** Both ends import `LLM_PROXY_AUTH_TOKEN_ENV` from
+  `scripts/llm-proxy/protocol-constants.mjs` (a new dependency-free `.mjs` with a sidecar `.d.mts`)
+  so the literal `"LLM_PROXY_AUTH_TOKEN"` is never duplicated. A typo on either side would silently
+  downgrade to no-auth mode; the round-trip test in `tests/platform/wire-proxy-lifecycle.test.ts`
+  reads the env value the parent wrote, constructs a real proxy with the same env, and asserts the
+  bearer gate accepts the wired-side token.
+- **Constant-time comparison.** The bearer check uses `crypto.timingSafeEqual` with a length
+  pre-check (to avoid `timingSafeEqual` throwing on differing-length buffers). The `Buffer.from` of
+  the configured token is precomputed at server construction time; only the per-request presented
+  token is allocated fresh.
+- **No-auth dev mode (permitted).** When `LLM_PROXY_AUTH_TOKEN` is unset (e.g. `npm run proxy:llm`
+  or existing integration tests that spawn the proxy without the env var), the bearer gate is a
+  no-op. The proxy emits a loud `console.warn` canary as the first line of process output:
+  `llm-proxy: AUTH DISABLED — set LLM_PROXY_AUTH_TOKEN to enable bearer auth`. A misconfigured
+  production spawn (env var dropped on the floor) therefore shouts in the Zotero error console
+  rather than failing silently-permissively. The dev path is preserved because forcing auth on
+  hand-run developer invocations would break the smoke-test ergonomics for negligible safety gain on
+  a single-user developer machine.
+- **Per-route carve-outs.** Two routes are exempt from the bearer gate (they remain Host/Origin
+  gated):
+  - `POST /api/shutdown` — preserves the orphan-takeover path. When the plugin starts after a Zotero
+    crash leaves an old proxy listening on the configured port, it cannot know the orphan's token
+    (the orphan was spawned by a now-dead Zotero process whose UUID was never persisted). Without
+    the carve-out, the plugin would either (a) leak orphans every time Zotero crashed, or (b)
+    require persisting the token across Zotero sessions — which would weaken the rotation guarantee.
+    Host/Origin gates still prevent network attackers, and DoS via shutdown is acceptable on a
+    single-user desktop where the worst-case is the user manually killing the proxy and restarting
+    the plugin.
+  - `GET /` (route catalogue) — kept unauthenticated so a developer poking at the proxy with `curl`
+    can discover the surface, and so trivial liveness probes do not need to know the token.
+
+The plugin-side wiring updates the ollama adapter to accept an optional
+`getProxyAuthHeader(baseUrl)` dep that adds `Authorization: Bearer <token>` only when the request
+URL matches the running proxy's `http://127.0.0.1:<port>` prefix (legacy callers, real-Ollama-daemon
+paths, and tests that omit the dep remain backward-compatible — no Authorization header is sent).
+The lifecycle's `diagnosticsFetch` threads the same bearer into the `/api/diagnostics` probe.

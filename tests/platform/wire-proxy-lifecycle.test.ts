@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { SubprocessHandle, SubprocessLike } from "../../src/platform/proxy-lifecycle.js";
 import {
   DEFAULT_PROXY_PORT,
+  LLM_PROXY_AUTH_TOKEN_ENV,
   NODE_BINARY_CANDIDATES,
   PROXY_AUTOSTART_PREF,
   PROXY_CONFIG_READ_CONSENT_PREF,
@@ -558,5 +559,206 @@ describe("wireProxyLifecycle exit diagnostics (Bug C)", () => {
     // Now start again — wiring should clear lastError before the new spawn.
     await wired.start();
     expect(wired.snapshot().lastError).toBeUndefined();
+  });
+});
+
+/**
+ * Proxy-auth wiring (C1-C4): the bearer token MUST land in the spawned
+ * proxy's environment AND be readable via `getProxyAuthToken()` for the
+ * bootstrap-side Ollama adapter closure to attach `Authorization: Bearer
+ * <token>` to its requests. The token rotates per `start()` and clears
+ * on `stop()` so a restart cleanly invalidates the old credential.
+ */
+describe("wireProxyLifecycle proxy-auth wiring", () => {
+  const UUID_V4_SHAPE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+  it("C1: subprocess.call env carries LLM_PROXY_AUTH_TOKEN in UUID v4 shape", async () => {
+    const sub = fakeSubprocess();
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      // Disable auto-start so the only spawn captured is the one we
+      // explicitly trigger from this test (auto-start would race the
+      // explicit start() and double the call count).
+      autoStartOverride: false
+    });
+    await wired.start();
+    expect(sub.calls).toHaveLength(1);
+    const env = sub.calls[0]?.env ?? {};
+    // Asserted via the shared constant so a typo on either side
+    // (parent OR child) surfaces here — see the C5 round-trip test
+    // below for the cross-side guarantee.
+    expect(env).toHaveProperty(LLM_PROXY_AUTH_TOKEN_ENV);
+    expect(env[LLM_PROXY_AUTH_TOKEN_ENV]).toMatch(UUID_V4_SHAPE);
+  });
+
+  it("C2: getProxyAuthToken() returns the same UUID after start()", async () => {
+    const sub = fakeSubprocess();
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      autoStartOverride: false
+    });
+    // Before start, no token is minted — getProxyAuthToken reports null
+    // so the bootstrap closure attaches no Authorization header.
+    expect(wired.getProxyAuthToken()).toBeNull();
+    await wired.start();
+    const fromAccessor = wired.getProxyAuthToken();
+    const fromEnv = sub.calls[0]?.env?.[LLM_PROXY_AUTH_TOKEN_ENV];
+    expect(fromAccessor).not.toBeNull();
+    expect(fromAccessor).toBe(fromEnv);
+  });
+
+  it("C3: getProxyAuthToken() returns null after stop()", async () => {
+    const ctl = controllableSubprocess();
+    const wired = wireProxyLifecycle({
+      subprocess: ctl.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      autoStartOverride: false
+    });
+    await wired.start();
+    expect(wired.getProxyAuthToken()).not.toBeNull();
+    const stopPromise = wired.stop();
+    // Release the wait() promise so doTerminate() can complete its await.
+    ctl.releaseExit(0);
+    await stopPromise;
+    expect(wired.getProxyAuthToken()).toBeNull();
+  });
+
+  it("C4: a second start() after stop() rotates the token (new UUID, not reused)", async () => {
+    const ctl = controllableSubprocess();
+    const wired = wireProxyLifecycle({
+      subprocess: ctl.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      autoStartOverride: false
+    });
+    await wired.start();
+    const tokenA = wired.getProxyAuthToken();
+    expect(tokenA).not.toBeNull();
+    const stopPromise = wired.stop();
+    ctl.releaseExit(0);
+    await stopPromise;
+    await wired.start();
+    const tokenB = wired.getProxyAuthToken();
+    expect(tokenB).not.toBeNull();
+    expect(tokenB).not.toBe(tokenA);
+    // Both spawns saw their own token in env, no carry-over.
+    expect(ctl.calls).toHaveLength(2);
+    expect(ctl.calls[0]?.env?.[LLM_PROXY_AUTH_TOKEN_ENV]).toBe(tokenA);
+    expect(ctl.calls[1]?.env?.[LLM_PROXY_AUTH_TOKEN_ENV]).toBe(tokenB);
+  });
+
+  // -------------------------------------------------------------------
+  // C5 (round-trip): the SHARED `LLM_PROXY_AUTH_TOKEN_ENV` symbol the
+  // plugin imports MUST be the exact literal the proxy child reads from
+  // `process.env`. The constant lives in `scripts/llm-proxy/protocol-
+  // constants.mjs`; both sides (wire-proxy-lifecycle.ts AND the proxy
+  // server.mjs) import it. This test feeds the spawn-environment value
+  // BACK INTO `createProxyServer` via `process.env`, constructs a real
+  // server, and asserts the bearer gate accepts a Bearer header carrying
+  // the wired-side token. If either side drifts (typo on the
+  // wire-proxy-lifecycle import path, typo on the server.mjs read), the
+  // request 401s and this test fails — catching the kind of silent
+  // no-auth-mode downgrade that the canary alone cannot.
+  // -------------------------------------------------------------------
+  it("C5: parent and child use the same env-var symbol — round-trips through createProxyServer", async () => {
+    const sub = fakeSubprocess();
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      autoStartOverride: false
+    });
+    await wired.start();
+    // Read the env the plugin handed to the spawn — under the shared
+    // symbol. A child-side typo on `process.env.LLM_PROXY_AUTH_TOKEN`
+    // would still find the value if the parent kept the matching
+    // literal, but reading via the constant on BOTH sides guarantees
+    // they're locked together.
+    const wiredEnv = sub.calls[0]?.env ?? {};
+    const wiredToken = wiredEnv[LLM_PROXY_AUTH_TOKEN_ENV];
+    expect(wiredToken).toBeDefined();
+    // Construct a real proxy with the same env applied, then drive a
+    // request through it. The proxy reads `process.env[LLM_PROXY_AUTH_
+    // TOKEN_ENV]` at createProxyServer time — same constant.
+    const { createProxyServer } = await import("../../scripts/llm-proxy/server.mjs");
+    // Sanity guard: the value the parent set must equal the literal the
+    // child reads. If a future refactor split the constant into two
+    // copies that drifted, this assertion would fail along with the
+    // bearer round-trip below.
+    expect(LLM_PROXY_AUTH_TOKEN_ENV).toBe("LLM_PROXY_AUTH_TOKEN");
+    const original = process.env.LLM_PROXY_AUTH_TOKEN;
+    process.env.LLM_PROXY_AUTH_TOKEN = wiredToken;
+    try {
+      const proxy = createProxyServer();
+      const port = await proxy.listen(0);
+      try {
+        // Correct token (wired-side) — must be accepted.
+        const okResp = await fetch(`http://127.0.0.1:${String(port)}/api/tags`, {
+          headers: { authorization: `Bearer ${String(wiredToken)}` }
+        });
+        expect(okResp.status).toBe(200);
+        // No token — must be rejected. Confirms the gate is actually on.
+        const noAuthResp = await fetch(`http://127.0.0.1:${String(port)}/api/tags`);
+        expect(noAuthResp.status).toBe(401);
+      } finally {
+        await proxy.close();
+      }
+    } finally {
+      if (original === undefined) delete process.env.LLM_PROXY_AUTH_TOKEN;
+      else process.env.LLM_PROXY_AUTH_TOKEN = original;
+    }
+  });
+
+  // -------------------------------------------------------------------
+  // C6 (diagnostics auth header): after this patch `/api/diagnostics` is
+  // bearer-gated on the proxy side (it leaks codex/claude binary paths).
+  // The plugin's own diagnosticsFetch MUST therefore include the bearer
+  // header it minted at spawn time, or it would 401 against its own
+  // child. Asserted by capturing the init object the fetch was called
+  // with and inspecting the headers.
+  // -------------------------------------------------------------------
+  it("C6: diagnosticsFetch is called with the Authorization header when auth is enabled", async () => {
+    const sub = fakeSubprocess();
+    const diagnosticsCalls: {
+      url: string;
+      init: { headers?: Record<string, string> } | undefined;
+    }[] = [];
+    const diagnosticsFetch = vi.fn((url: string, init?: { headers?: Record<string, string> }) => {
+      diagnosticsCalls.push({ url, init });
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            binaries: {
+              codex: { path: "/usr/bin/codex" },
+              claude: { path: null, searchedCount: 0 }
+            },
+            path: { enrichment: null }
+          })
+      });
+    });
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      diagnosticsFetch,
+      autoStartOverride: false
+    });
+    await wired.start();
+    const token = wired.getProxyAuthToken();
+    expect(token).not.toBeNull();
+    expect(diagnosticsCalls.length).toBeGreaterThanOrEqual(1);
+    const firstCall = diagnosticsCalls[0];
+    expect(firstCall).toBeDefined();
+    expect(firstCall?.url).toMatch(/\/api\/diagnostics$/u);
+    const headers = firstCall?.init?.headers ?? {};
+    expect(headers.Authorization).toBe(`Bearer ${String(token)}`);
   });
 });

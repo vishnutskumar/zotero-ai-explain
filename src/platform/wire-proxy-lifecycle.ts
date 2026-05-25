@@ -23,6 +23,8 @@
  * imports + calls it; no shared mutable state.
  */
 
+import { LLM_PROXY_AUTH_TOKEN_ENV } from "../../scripts/llm-proxy/protocol-constants.mjs";
+
 import {
   createProxyLifecycle,
   type ProxyFetch,
@@ -31,6 +33,11 @@ import {
   type SubprocessLike
 } from "./proxy-lifecycle.js";
 import type { Unsubscribe } from "./zotero-ui-types.js";
+
+// Re-export so downstream consumers (notably the bootstrap-side
+// `getProxyAuthHeader` closure and the test suite) can pin to the same
+// rendezvous-symbol the proxy child reads.
+export { LLM_PROXY_AUTH_TOKEN_ENV } from "../../scripts/llm-proxy/protocol-constants.mjs";
 
 /**
  * Shape returned by the proxy's `GET /api/diagnostics` route. Mirrors the
@@ -66,10 +73,20 @@ export type ProxyDiagnostics = {
  * Fetch contract for the diagnostics endpoint. Separate from
  * `ProxyFetch` because the diagnostics call returns a JSON body, while
  * the lifecycle's probe only needs `{ ok, status }`. Tests inject a stub.
+ *
+ * Accepts an optional `headers` map so wire-proxy-lifecycle can attach
+ * the bearer token it minted at spawn time (the proxy's `/api/diagnostics`
+ * is bearer-gated to avoid leaking codex/claude binary paths to other
+ * local processes). When the proxy is running in no-auth mode the
+ * caller simply omits the header.
  */
 export type DiagnosticsFetch = (
   input: string,
-  init?: { readonly signal?: AbortSignal | undefined; readonly method?: string }
+  init?: {
+    readonly signal?: AbortSignal | undefined;
+    readonly method?: string;
+    readonly headers?: Readonly<Record<string, string>>;
+  }
 ) => Promise<{
   readonly ok: boolean;
   readonly status: number;
@@ -266,6 +283,17 @@ export type WiredProxy = {
   /** Imperatively stop the proxy (used by the Stop button + shutdown). */
   readonly stop: () => Promise<void>;
   /**
+   * The bearer token the spawned proxy expects on `Authorization:
+   * Bearer <token>`. Generated as a fresh `crypto.randomUUID()` per
+   * `start()` and threaded into the child's environment as
+   * `LLM_PROXY_AUTH_TOKEN`. Returns null when the proxy is not
+   * currently running (no spawn yet, after stop(), or after an
+   * unsolicited exit). Consumers — concretely the Ollama adapter's
+   * `getProxyAuthHeader` closure in `bootstrap.ts` — read this lazily
+   * per-request so the active token rotates cleanly across restarts.
+   */
+  readonly getProxyAuthToken: () => string | null;
+  /**
    * Persist new proxy configuration values into prefs and reload the
    * in-memory cache so the next start() uses them. Returns the new
    * snapshot.
@@ -336,6 +364,15 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
   let port = persistedPort ?? DEFAULT_PROXY_PORT;
   let lastError: string | undefined;
   let diagnostics: ProxyDiagnostics | undefined;
+  /**
+   * Bearer token threaded into the spawned proxy's environment as
+   * `LLM_PROXY_AUTH_TOKEN`. Minted fresh per `start()` (so a restart
+   * rotates the token; any cached `Authorization` headers from the
+   * prior session 401 cleanly), and cleared to null on `stop()` /
+   * unsolicited exit so the bootstrap-side `getProxyAuthHeader` closure
+   * stops attaching the now-invalid header.
+   */
+  let currentAuthToken: string | null = null;
   // Codex review P1: true while `start()` is awaiting `lifecycle.start()`.
   // `redetectNode()` consults this before rebuilding the lifecycle so
   // a concurrent spawn never gets orphaned by a replaced lifecycle.
@@ -368,13 +405,25 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
 
   function buildLifecycle(): ProxyLifecycle {
     const consentEnv = readConsentEnv();
+    // Merge AUTH_TOKEN with the consent env var (if any) so the spawn
+    // surface continues to receive both keys when the user has opted
+    // into config-read consent. Order matters: AUTH_TOKEN is mandatory
+    // for the security gate, so it appears first; consent env (allow /
+    // absent) is layered on top via spread.
+    const extraEnvironment: Record<string, string> = {};
+    if (currentAuthToken !== null) {
+      extraEnvironment[LLM_PROXY_AUTH_TOKEN_ENV] = currentAuthToken;
+    }
+    if (consentEnv !== undefined) {
+      Object.assign(extraEnvironment, consentEnv);
+    }
     const cfg: ProxyLifecycleDeps = {
       subprocess: deps.subprocess,
       nodeBinaryPath,
       serverScriptPath,
       port,
       ...(deps.fetch !== undefined ? { fetch: deps.fetch } : {}),
-      ...(consentEnv !== undefined ? { extraEnvironment: consentEnv } : {}),
+      ...(Object.keys(extraEnvironment).length > 0 ? { extraEnvironment } : {}),
       debug
     };
     return createProxyLifecycle(cfg);
@@ -391,6 +440,10 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
     // a process that no longer exists.
     generation += 1;
     diagnostics = undefined;
+    // Drop the bearer token along with the dead child. The next
+    // start() mints a fresh one; any cached header from the old token
+    // would otherwise 401 on the new spawn.
+    currentAuthToken = null;
     // Only surface an error message when the lifecycle classifies this
     // exit as unexpected (the user didn't click Stop, AND either the
     // exit code is non-zero or the child died inside the early-exit
@@ -427,6 +480,18 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
   }
 
   /**
+   * Build the headers needed to talk to OUR running proxy. When we have
+   * a bearer token, attach it so the proxy's auth gate accepts the
+   * request; the proxy's `/api/diagnostics` is bearer-gated to avoid
+   * leaking codex/claude binary paths to other local processes. When
+   * we're in no-auth mode (or pre-spawn) we omit the header.
+   */
+  function proxyHeaders(): Readonly<Record<string, string>> | undefined {
+    if (currentAuthToken === null) return undefined;
+    return { Authorization: `Bearer ${currentAuthToken}` };
+  }
+
+  /**
    * Fetch /api/diagnostics from the running proxy. Best-effort:
    * timeouts, non-2xx responses, and parse errors all leave the
    * diagnostics field untouched so the settings UI just hides the
@@ -439,9 +504,13 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
       controller.abort();
     }, 1500);
     try {
+      const headers = proxyHeaders();
       const response = await deps.diagnosticsFetch(
         `http://127.0.0.1:${String(port)}/api/diagnostics`,
-        { signal: controller.signal }
+        {
+          signal: controller.signal,
+          ...(headers !== undefined ? { headers } : {})
+        }
       );
       if (!response.ok) return;
       const body = (await response.json()) as ProxyDiagnostics;
@@ -481,9 +550,19 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
         controller.abort();
       }, 1500);
       try {
+        // The orphan was spawned by a prior session; its bearer token is
+        // gone with that process. We still pass our current header (if
+        // any) for defensive consistency — the orphan will 401 and we'll
+        // conclude "not ours", leaving it for the user to clean up.
+        // `/api/shutdown` is intentionally bearer-exempt on the proxy
+        // side precisely so the takeover POST below can still succeed.
+        const headers = proxyHeaders();
         const response = await deps.diagnosticsFetch(
           `http://127.0.0.1:${String(port)}/api/diagnostics`,
-          { signal: controller.signal }
+          {
+            signal: controller.signal,
+            ...(headers !== undefined ? { headers } : {})
+          }
         );
         if (response.ok) {
           const body = await response.json();
@@ -504,6 +583,10 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
         controller.abort();
       }, 1500);
       try {
+        // No bearer header here: `/api/shutdown` is intentionally
+        // bearer-exempt on the proxy side so a new plugin instance can
+        // reclaim a port from a stale orphan whose token died with the
+        // prior process.
         await deps.diagnosticsFetch(`http://127.0.0.1:${String(port)}/api/shutdown`, {
           signal: controller.signal,
           method: "POST"
@@ -554,6 +637,20 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
     diagnostics = undefined;
     generation += 1;
     let myGeneration = generation;
+    // Mint a fresh bearer token whenever we don't already have one
+    // (first start, or post-stop / post-exit start). Token rotation
+    // happens implicitly: stop() / handleExit() clear `currentAuthToken`,
+    // so the next start mints a new UUID. Rebuild the lifecycle so the
+    // new env (carrying LLM_PROXY_AUTH_TOKEN) reaches the spawn. When
+    // a token is already in flight (re-entrant start during an inflight
+    // start, or start-while-running), keep the existing lifecycle so
+    // it can satisfy the existing `lifecycle.start()` state machine.
+    if (currentAuthToken === null) {
+      currentAuthToken = crypto.randomUUID();
+      exitUnsub();
+      lifecycle = buildLifecycle();
+      exitUnsub = lifecycle.onExit(handleExit);
+    }
     let result = await lifecycle.start();
     // Orphan-kill: if start() resolved to an external (foreign-port)
     // result AND that listener is our own proxy from a prior session,
@@ -574,6 +671,18 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
     }
     if ("error" in result) {
       lastError = result.error;
+      // invariant: `currentAuthToken` is cleared on stop() / handleExit() /
+      // this start-failure path, but persists across start() calls in
+      // between. The child process holds its OWN copy via the env at
+      // spawn time, so a parent-side clear does not invalidate an
+      // in-flight request that the child is still authoring a response
+      // for — it only changes what `getProxyAuthHeader` returns on the
+      // NEXT request.
+      //
+      // Clear the freshly-minted token so getProxyAuthToken() correctly
+      // reports "no running proxy" instead of handing the bootstrap
+      // closure a token that no child is listening for.
+      currentAuthToken = null;
     } else {
       await fetchDiagnostics(myGeneration);
     }
@@ -585,6 +694,11 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
     generation += 1;
     await lifecycle.stop();
     diagnostics = undefined;
+    // Token is per-spawn — a fresh start() mints a new one. Clearing on
+    // stop ensures the bootstrap closure stops attaching Authorization
+    // headers that would 401 against any future foreign listener on
+    // the same port.
+    currentAuthToken = null;
     deps.onStateChange?.(snapshot());
   }
 
@@ -698,7 +812,8 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
     applyValues,
     redetectNode,
     setAutoStart,
-    shutdown
+    shutdown,
+    getProxyAuthToken: () => currentAuthToken
   };
 }
 

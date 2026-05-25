@@ -19,11 +19,13 @@ scripts/
   sync-agents-from-claude.mjs     # Keep AGENTS.md mirrors in sync with CLAUDE.md
   llm-proxy/                      # Bundled Node HTTP service (see below)
     server.mjs, server.d.mts
+    protocol-constants.mjs, protocol-constants.d.mts  # Shared env-var names (LLM_PROXY_AUTH_TOKEN_ENV, LLM_PROXY_MAX_BODY_BYTES_ENV) consumed by both server.mjs and src/platform/wire-proxy-lifecycle.ts
+    path-discovery.mjs, path-discovery.d.mts          # Node binary auto-detect helper
     backends/
       codex.mjs, codex.d.mts      # codex mcp-server backend (tools/call codex / codex-reply); spawns in isolated $HOME / $CODEX_HOME tmpdir
       claude.mjs, claude.d.mts    # claude -p stream-json backend; --allowedTools "" + --setting-sources user + --strict-mcp-config + --disable-slash-commands + --system-prompt isolate from user config
       ollama.mjs, ollama.d.mts    # Passthrough to a real Ollama daemon
-    README.md                     # Configuration, wire format, smoke tests, troubleshooting
+    README.md                     # Configuration, wire format, auth, smoke tests, troubleshooting
   zotero-e2e/                     # Real-Zotero spawn harness for tests/e2e/
     spawn.mjs, launch.mjs, launch.d.mts
     marionette.mjs, marionette-raw.mjs, marionette-smoke.mjs, marionette.d.mts

@@ -12,7 +12,8 @@ into the prompt and auto-scope RAG to the open document; citations across the po
 library-chat dialog are chunk-scoped and jump the reader to the cited page. Chat and embedding
 backends are configured independently; a bundled local LLM proxy lets the plugin route through the
 Codex or Claude Code CLIs (using the user's ChatGPT/Claude subscription) or pass through to a real
-Ollama daemon.
+Ollama daemon. The proxy binds to `127.0.0.1`, authenticates plugin requests with a per-spawn bearer
+token, gates Host/Origin headers against browser DNS-rebinding, and caps request bodies at 1 MiB.
 
 ## Structure
 

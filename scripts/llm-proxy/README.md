@@ -65,17 +65,69 @@ zotero-ai-llm-proxy listening on http://127.0.0.1:11400
 
 All settings are environment variables read at startup.
 
-| Variable                 | Default                  | Purpose                                                                     |
-| ------------------------ | ------------------------ | --------------------------------------------------------------------------- |
-| `LLM_PROXY_PORT`         | `11400`                  | Listen port on `127.0.0.1`.                                                 |
-| `OLLAMA_BASE_URL`        | `http://localhost:11434` | Real Ollama daemon for the passthrough backend.                             |
-| `CODEX_DEFAULT_MODEL`    | `gpt-5.5`                | Model passed via `-c model=<name>` to `codex mcp-server` when none in body. |
-| `CODEX_IDLE_TIMEOUT_MS`  | `60000`                  | Kill `codex` after this long with no output activity.                       |
-| `CODEX_HARD_TIMEOUT_MS`  | `300000`                 | Kill `codex` after this long regardless of activity.                        |
-| `CLAUDE_BINARY`          | `claude` (search `PATH`) | Path to the `claude` CLI executable.                                        |
-| `CLAUDE_DEFAULT_MODEL`   | _(empty)_                | Model passed via `claude --model` when none in body.                        |
-| `CLAUDE_IDLE_TIMEOUT_MS` | `60000`                  | Kill `claude` after this long with no output activity.                      |
-| `CLAUDE_HARD_TIMEOUT_MS` | `300000`                 | Kill `claude` after this long regardless of activity.                       |
+| Variable                   | Default                  | Purpose                                                                                                                       |
+| -------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `LLM_PROXY_PORT`           | `11400`                  | Listen port on `127.0.0.1`.                                                                                                   |
+| `LLM_PROXY_AUTH_TOKEN`     | _(unset)_                | Bearer token the proxy requires on the auth-gated routes. Unset → no-auth dev mode (canary log). See [Auth](#authentication). |
+| `LLM_PROXY_MAX_BODY_BYTES` | `1048576` (1 MiB)        | Per-request body cap; overflow returns `413 Payload Too Large` and destroys the socket.                                       |
+| `OLLAMA_BASE_URL`          | `http://localhost:11434` | Real Ollama daemon for the passthrough backend.                                                                               |
+| `CODEX_DEFAULT_MODEL`      | `gpt-5.5`                | Model passed via `-c model=<name>` to `codex mcp-server` when none in body.                                                   |
+| `CODEX_IDLE_TIMEOUT_MS`    | `60000`                  | Kill `codex` after this long with no output activity.                                                                         |
+| `CODEX_HARD_TIMEOUT_MS`    | `300000`                 | Kill `codex` after this long regardless of activity.                                                                          |
+| `CLAUDE_BINARY`            | `claude` (search `PATH`) | Path to the `claude` CLI executable.                                                                                          |
+| `CLAUDE_DEFAULT_MODEL`     | _(empty)_                | Model passed via `claude --model` when none in body.                                                                          |
+| `CLAUDE_IDLE_TIMEOUT_MS`   | `60000`                  | Kill `claude` after this long with no output activity.                                                                        |
+| `CLAUDE_HARD_TIMEOUT_MS`   | `300000`                 | Kill `claude` after this long regardless of activity.                                                                         |
+
+The env-var names that cross the parent/child boundary (`LLM_PROXY_AUTH_TOKEN`,
+`LLM_PROXY_MAX_BODY_BYTES`) are exported as constants from
+`scripts/llm-proxy/protocol-constants.mjs` so the plugin-side wiring
+(`src/platform/wire-proxy-lifecycle.ts`) and the server consume the same literal — a typo on either
+side would silently downgrade to no-auth mode and is caught by a round-trip test.
+
+## Authentication
+
+The proxy enforces three defense layers on the sensitive routes (`/codex|claude|ollama/api/chat`,
+`/codex|claude|ollama/api/tags`, `/api/tags`, `/codex|claude|ollama/api/embed`, `/api/diagnostics`):
+
+1. **Host header gate.** The `Host` header must match `127.0.0.1:<port>` or `localhost:<port>`
+   (using the OS-assigned port after `listen()` resolves). A foreign Host returns `403`. This blocks
+   DNS-rebinding attacks where a browser is tricked into resolving an attacker-controlled name to
+   `127.0.0.1` and posting to the proxy from a malicious page.
+2. **Origin header gate.** When an `Origin` header is present it must match the loopback host
+   (`http://127.0.0.1:<port>` / `http://localhost:<port>`) or be omitted. A foreign Origin
+   (`https://attacker.example`) returns `403` even with a valid bearer token.
+3. **Bearer-token gate.** When `LLM_PROXY_AUTH_TOKEN` is set, every auth-gated route requires
+   `Authorization: Bearer <token>` and the proxy compares with `crypto.timingSafeEqual` (with a
+   length pre-check). Missing bearer → `401 missing bearer`; wrong token → `401 invalid token`.
+
+Two routes are **exempt from bearer auth** (still Host/Origin gated):
+
+- `POST /api/shutdown` — preserves the orphan-takeover path. When the plugin starts after a Zotero
+  crash leaves an old proxy listening on the configured port, it cannot know the orphan's token; the
+  Host/Origin gates still prevent network attackers, and DoS via shutdown is acceptable on a
+  single-user desktop.
+- `GET /` — the route catalogue is intentionally unauthenticated so a developer poking at the proxy
+  with `curl` can discover the surface.
+
+**No-auth dev mode.** When `LLM_PROXY_AUTH_TOKEN` is unset (e.g. `npm run proxy:llm` or existing
+integration-test paths that spawn the proxy without the env var), the bearer gate is a no-op and the
+proxy emits a loud `console.warn` on startup:
+
+```text
+llm-proxy: AUTH DISABLED — set LLM_PROXY_AUTH_TOKEN to enable bearer auth
+```
+
+When the token IS set, the corresponding canary is
+`llm-proxy: auth enabled on 127.0.0.1:<port> (token length <N>)`. Both canaries are the first line
+of process output so a misconfigured production spawn (env var dropped on the floor) shouts loudly
+in the Zotero error console.
+
+When the plugin auto-spawns the proxy via `src/platform/wire-proxy-lifecycle.ts`, a fresh
+`crypto.randomUUID()` token is minted per spawn and threaded into the child's environment under
+`LLM_PROXY_AUTH_TOKEN`; the chrome-side ollama adapter conditionally adds the
+`Authorization: Bearer <token>` header when its base URL matches the proxy's
+`http://127.0.0.1:<port>` prefix, and the lifecycle's diagnostics fetch threads the bearer too.
 
 ## Wire contract
 
@@ -329,22 +381,35 @@ curl http://127.0.0.1:11400/api/tags
 
 ## Troubleshooting
 
-| Symptom                                  | Likely cause                                                                                                                                                                                             |
-| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Ollama unreachable at …`                | `ollama serve` not running, or wrong `OLLAMA_BASE_URL`.                                                                                                                                                  |
-| `codex: authentication failed`           | Run `codex login`. If you have authenticated but isolation broke OAuth, confirm `~/.codex/auth.json` exists before the proxy spawns codex — the proxy copies it into the isolation tmpdir at spawn time. |
-| `codex exited with code 127`             | `codex` not on `PATH`. Install via Homebrew or the official installer.                                                                                                                                   |
-| `claude exited with code 127`            | `claude` not on `PATH`. Set `CLAUDE_BINARY=/full/path/to/claude` or install the CLI globally.                                                                                                            |
-| `claude` errors with "not authenticated" | Run `claude login` in the shell that launches the proxy, then restart the proxy.                                                                                                                         |
-| Empty popup with no error                | Should not happen anymore — the proxy emits a `done_reason: "error"` chunk on failure.                                                                                                                   |
-| `gpt-5.2-codex` not recognised by Codex  | Set `CODEX_DEFAULT_MODEL` to a model your `codex` CLI supports, or pass `model` in the chat body.                                                                                                        |
+| Symptom                                           | Likely cause                                                                                                                                                                                                                                                                |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Ollama unreachable at …`                         | `ollama serve` not running, or wrong `OLLAMA_BASE_URL`.                                                                                                                                                                                                                     |
+| `codex: authentication failed`                    | Run `codex login`. If you have authenticated but isolation broke OAuth, confirm `~/.codex/auth.json` exists before the proxy spawns codex — the proxy copies it into the isolation tmpdir at spawn time.                                                                    |
+| `codex exited with code 127`                      | `codex` not on `PATH`. Install via Homebrew or the official installer.                                                                                                                                                                                                      |
+| `claude exited with code 127`                     | `claude` not on `PATH`. Set `CLAUDE_BINARY=/full/path/to/claude` or install the CLI globally.                                                                                                                                                                               |
+| `claude` errors with "not authenticated"          | Run `claude login` in the shell that launches the proxy, then restart the proxy.                                                                                                                                                                                            |
+| Empty popup with no error                         | Should not happen anymore — the proxy emits a `done_reason: "error"` chunk on failure.                                                                                                                                                                                      |
+| `gpt-5.2-codex` not recognised by Codex           | Set `CODEX_DEFAULT_MODEL` to a model your `codex` CLI supports, or pass `model` in the chat body.                                                                                                                                                                           |
+| `401 missing bearer` / `401 invalid token`        | The proxy is in auth-enabled mode (`LLM_PROXY_AUTH_TOKEN` set) and the caller did not present the matching bearer. Plugin auto-spawn handles this; manual `curl` callers need `Authorization: Bearer <token>` or to start the proxy without the env var (no-auth dev mode). |
+| `403 host not allowed` / `403 origin not allowed` | Host/Origin defense-in-depth rejected the request. The proxy only accepts `Host: 127.0.0.1:<port>` / `localhost:<port>` and (when present) the same loopback Origin. Browser-origin requests from arbitrary pages are intentionally refused.                                |
+| `413 Payload Too Large`                           | The request body exceeded `LLM_PROXY_MAX_BODY_BYTES` (1 MiB default). Raise the env var if you legitimately need bigger payloads.                                                                                                                                           |
 
 ## Security
 
 - Binds to `127.0.0.1` only — never the public network.
-- No authentication on the proxy itself; assumes a single-user developer machine.
-- Forwards request bodies verbatim. Do not place the proxy behind a public reverse proxy without
-  adding authentication first.
+- Plugin-spawned: bearer-token auth is enforced. The plugin mints a fresh `crypto.randomUUID()` per
+  spawn and threads it via `LLM_PROXY_AUTH_TOKEN` so each proxy instance has a unique token; the
+  plugin's ollama adapter and diagnostics fetch carry the matching `Authorization: Bearer <token>`
+  header. The proxy also gates every auth-gated route on `Host` + `Origin` headers (blocks browser
+  DNS-rebinding attacks) and caps request bodies at 1 MiB by default (memory DoS).
+- Dev mode (`npm run proxy:llm`, integration tests): the bearer gate is permissively disabled when
+  `LLM_PROXY_AUTH_TOKEN` is unset; the proxy emits a loud `console.warn` canary at startup so a
+  misconfigured production spawn is impossible to miss. Host/Origin gates and the body cap remain in
+  force.
+- `POST /api/shutdown` and `GET /` (route catalogue) are bearer-exempt by design — see
+  [Authentication](#authentication) for the orphan-takeover rationale. They remain Host/Origin
+  gated.
+- Forwards request bodies verbatim. Do not place the proxy behind a public reverse proxy.
 
 ## Implementation notes
 

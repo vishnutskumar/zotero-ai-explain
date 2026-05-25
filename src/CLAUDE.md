@@ -29,7 +29,7 @@ src/
     citation-open.ts           # Resolves a library-chat citation click to Zotero.Reader.open
     e2e-driver.ts              # In-process driver used by the e2e suite
     proxy-lifecycle.ts         # Headless lifecycle controller for the llm-proxy child
-    wire-proxy-lifecycle.ts    # Wires Subprocess + settings prefs + Node-binary auto-detect
+    wire-proxy-lifecycle.ts    # Wires Subprocess + settings prefs + Node-binary auto-detect; mints a per-spawn `crypto.randomUUID()` auth token, threads it into the child via `LLM_PROXY_AUTH_TOKEN`, exposes a `getProxyAuthToken()` accessor, and threads the bearer into `diagnosticsFetch`
     reader-dom-adapter.ts, reader-integration.ts, zotero-env.ts, token-dump.ts
   preferences/
     provider-profile.ts          # ChatProvider + EmbedProvider + per-provider API keys
@@ -42,7 +42,7 @@ src/
     provider-registry.ts, provider-types.ts, stream-events.ts
     rag-augmented-provider.ts    # Wraps a chat provider with retrieval; fires `onRetrieved` for per-conversation citation lookups
     adapters/
-      ollama.ts                  # Chat (NDJSON) + embed against Ollama / proxy
+      ollama.ts                  # Chat (NDJSON) + embed against Ollama / proxy; accepts an optional `getProxyAuthHeader(baseUrl)` dep that conditionally adds `Authorization: Bearer <token>` when the request targets the bundled proxy prefix
       openai-chat.ts             # SSE chat-completions against OpenAI
       openai-embed.ts            # OpenAI embeddings + dim cross-check
       claude-api.ts              # Direct Anthropic /v1/messages with SSE parser

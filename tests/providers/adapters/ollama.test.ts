@@ -453,4 +453,121 @@ describe("createOllamaProvider", () => {
       expect(last.message).toContain("upstream timeout after 60s");
     }
   });
+
+  // ---------------------------------------------------------------------
+  // B1 / B2 — proxy bearer-token header injection via getProxyAuthHeader.
+  //
+  // The adapter MUST honor the optional `getProxyAuthHeader` dep so the
+  // bootstrap closure can attach `Authorization: Bearer <uuid>` for the
+  // bundled LLM proxy without leaking the header to real Ollama daemons.
+  // When the dep returns undefined (or is omitted entirely), no
+  // Authorization header is sent — that's the backward-compatible path
+  // legacy callers and direct-Ollama-daemon configurations rely on.
+  // ---------------------------------------------------------------------
+  it("B1 (streamChat): attaches Authorization header returned by getProxyAuthHeader", async () => {
+    const capturedHeaders: Record<string, string>[] = [];
+    const provider = createOllamaProvider({
+      fetch: async (_input, init) => {
+        await Promise.resolve();
+        // Normalize the headers init shape into a plain record so the
+        // assertion below can hit it without juggling Headers vs object.
+        const h: Record<string, string> = {};
+        const raw = (init.headers ?? {}) as Record<string, string>;
+        for (const [k, v] of Object.entries(raw)) h[k.toLowerCase()] = v;
+        capturedHeaders.push(h);
+        return new Response(JSON.stringify({ message: { content: "ok" }, done: true }), {
+          status: 200
+        });
+      },
+      getProxyAuthHeader: (url) => {
+        // Closure receives the normalized baseUrl (no /api/chat suffix),
+        // so the bootstrap-side prefix match can hit the configured
+        // proxy URL cleanly.
+        expect(url).toBe("http://localhost:11434");
+        return { Authorization: "Bearer test-token-aaaa" };
+      }
+    });
+    const events = [];
+    for await (const event of provider.streamChat(request, new AbortController().signal)) {
+      events.push(event);
+    }
+    expect(capturedHeaders).toHaveLength(1);
+    expect(capturedHeaders[0]?.authorization).toBe("Bearer test-token-aaaa");
+    expect(capturedHeaders[0]?.["content-type"]).toBe("application/json");
+  });
+
+  it("B1 (embedTexts): attaches Authorization header returned by getProxyAuthHeader", async () => {
+    const capturedHeaders: Record<string, string>[] = [];
+    const provider = createOllamaProvider({
+      fetch: async (_input, init) => {
+        await Promise.resolve();
+        const h: Record<string, string> = {};
+        const raw = (init.headers ?? {}) as Record<string, string>;
+        for (const [k, v] of Object.entries(raw)) h[k.toLowerCase()] = v;
+        capturedHeaders.push(h);
+        return new Response(JSON.stringify({ embeddings: [[0.1, 0.2]] }), { status: 200 });
+      },
+      getProxyAuthHeader: (url) => {
+        expect(url).toBe("http://127.0.0.1:11400/codex");
+        return { Authorization: "Bearer test-token-bbbb" };
+      }
+    });
+    await provider.embedTexts({
+      baseUrl: "http://127.0.0.1:11400/codex",
+      model: "nomic-embed-text",
+      texts: ["hello"],
+      signal: new AbortController().signal
+    });
+    expect(capturedHeaders).toHaveLength(1);
+    expect(capturedHeaders[0]?.authorization).toBe("Bearer test-token-bbbb");
+  });
+
+  it("B2 (streamChat): omits the Authorization header when getProxyAuthHeader returns undefined", async () => {
+    const capturedHeaders: Record<string, string>[] = [];
+    const provider = createOllamaProvider({
+      fetch: async (_input, init) => {
+        await Promise.resolve();
+        const h: Record<string, string> = {};
+        const raw = (init.headers ?? {}) as Record<string, string>;
+        for (const [k, v] of Object.entries(raw)) h[k.toLowerCase()] = v;
+        capturedHeaders.push(h);
+        return new Response(JSON.stringify({ message: { content: "ok" }, done: true }), {
+          status: 200
+        });
+      },
+      // The accessor exists but returns undefined — the "request is for
+      // the real Ollama daemon, not the local proxy" branch.
+      getProxyAuthHeader: () => undefined
+    });
+    const events = [];
+    for await (const event of provider.streamChat(request, new AbortController().signal)) {
+      events.push(event);
+    }
+    expect(capturedHeaders).toHaveLength(1);
+    expect(capturedHeaders[0]?.authorization).toBeUndefined();
+  });
+
+  it("B2 (embedTexts): omits the Authorization header when the dep is OMITTED entirely (backward compat)", async () => {
+    const capturedHeaders: Record<string, string>[] = [];
+    const provider = createOllamaProvider({
+      fetch: async (_input, init) => {
+        await Promise.resolve();
+        const h: Record<string, string> = {};
+        const raw = (init.headers ?? {}) as Record<string, string>;
+        for (const [k, v] of Object.entries(raw)) h[k.toLowerCase()] = v;
+        capturedHeaders.push(h);
+        return new Response(JSON.stringify({ embeddings: [[0.1, 0.2]] }), { status: 200 });
+      }
+      // No `getProxyAuthHeader` — legacy callers / tests that don't
+      // thread the proxy lifecycle must continue to work unchanged.
+    });
+    await provider.embedTexts({
+      baseUrl: "http://localhost:11434",
+      model: "nomic-embed-text",
+      texts: ["hello"],
+      signal: new AbortController().signal
+    });
+    expect(capturedHeaders).toHaveLength(1);
+    expect(capturedHeaders[0]?.authorization).toBeUndefined();
+  });
 });

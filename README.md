@@ -94,9 +94,12 @@ sidecar marker, and concurrent readers always see a fully-populated file.
 A small Node HTTP service ships inside the XPI. It speaks the Ollama wire protocol on the front side
 and routes each request to the **Codex CLI**, the **Claude Code CLI**, or a real **Ollama** daemon.
 The plugin auto-spawns it from the settings dialog. This lets you plug a ChatGPT or Claude
-subscription into the plugin without ever pasting an API key. The proxy spawns each CLI in an
-isolated environment so the user's developer config (`~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md`,
-custom skills, MCP sidecars, slash commands) does not bleed into Zotero responses — see
+subscription into the plugin without ever pasting an API key. The proxy binds to `127.0.0.1` only,
+authenticates plugin requests with a per-spawn bearer token (`crypto.randomUUID()` threaded into the
+child via `LLM_PROXY_AUTH_TOKEN`), rejects requests from foreign Hosts or Origins (blocks browser
+DNS-rebinding), and caps request bodies at 1 MiB. It also spawns each CLI in an isolated environment
+so the user's developer config (`~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md`, custom skills, MCP
+sidecars, slash commands) does not bleed into Zotero responses — see
 [`scripts/llm-proxy/README.md#subprocess-isolation`](scripts/llm-proxy/README.md#subprocess-isolation).
 
 ### Keyboard shortcuts

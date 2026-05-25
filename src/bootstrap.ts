@@ -1090,7 +1090,32 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
   }
   const boundFetch = typeof fetchFn === "function" ? fetchFn.bind(globalThis) : globalThis.fetch;
 
-  const ollamaProvider = createOllamaProvider({ fetch: boundFetch });
+  // Build the proxy auth-header closure BEFORE the ollama adapter so
+  // both can capture it. The closure must be lazy because
+  // `proxyWired` is assigned later (the subprocess adapter is built
+  // a few hundred lines down once the runtime context is ready); it
+  // also stays null on non-chrome hosts where the proxy was never
+  // wired. The accessor returns undefined on either of those branches
+  // — exactly the "no auth header" case the adapter's spread relies
+  // on.
+  const getProxyAuthHeader = (requestBaseUrl: string): Record<string, string> | undefined => {
+    const wired = proxyWired;
+    if (wired === null) return undefined;
+    const token = wired.getProxyAuthToken();
+    if (token === null) return undefined;
+    // Match against the proxy's currently-configured port. The
+    // settings dialog can rebind the port at runtime via
+    // applyValues(), and `snapshot().port` is the single source of
+    // truth that follows those edits.
+    const proxyPort = wired.snapshot().port;
+    const proxyPrefix = `http://127.0.0.1:${String(proxyPort)}`;
+    if (!requestBaseUrl.startsWith(proxyPrefix)) return undefined;
+    return { Authorization: `Bearer ${token}` };
+  };
+  const ollamaProvider = createOllamaProvider({
+    fetch: boundFetch,
+    getProxyAuthHeader
+  });
   const registry = createProviderRegistry([ollamaProvider]);
   // Resolve the prior single-chat-provider for the popup / sidebar
   // entry points. Direct-API providers replace `provider` with the

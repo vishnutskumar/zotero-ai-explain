@@ -41,7 +41,14 @@ tests/
 - **LLM proxy tests (`tests/scripts/llm-proxy.test.ts`)** — full HTTP-surface coverage of the
   bundled `scripts/llm-proxy/` server. Mocks `spawn` and `fetch` so the suite never spawns real
   `codex` / `claude` or hits real Ollama. Includes the BUG-AC8-1 contract test that asserts errors
-  surface as `done_reason: "error"` terminal chunks rather than silent empty completions.
+  surface as `done_reason: "error"` terminal chunks rather than silent empty completions, and the
+  `auth + host + origin gate` block (A1–A12) covering bearer-token auth, Host/Origin gating, the 1
+  MiB body cap, the `LLM_PROXY_AUTH_TOKEN` unset → no-auth-mode canary path, and the bearer
+  carve-outs for `POST /api/shutdown` + `GET /`. The plugin-side bearer wiring is covered in
+  `tests/providers/adapters/ollama.test.ts` (B1/B2: `getProxyAuthHeader` dep is honoured and
+  omitted-dep stays backward-compatible) and `tests/platform/wire-proxy-lifecycle.test.ts` (C1–C6:
+  per-spawn UUID rotation, parent/child env round-trip through the shared `LLM_PROXY_AUTH_TOKEN_ENV`
+  constant, and `diagnosticsFetch` bearer).
 
 ## Extending
 
