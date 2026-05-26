@@ -482,10 +482,12 @@ describe("wireProxyLifecycle exit diagnostics (Bug C)", () => {
     await wired.start();
     // Simulate an immediate non-zero exit (e.g., EADDRINUSE).
     ctl.releaseExit(1);
-    // Let the wait()-handler and onStateChange propagate.
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    // Let the wait()-handler and onStateChange propagate. The lifecycle
+    // now awaits its stderr drainer race (Promise.race against a 500ms
+    // setTimeout) before snapshotting + emitting, so we must flush both
+    // a macrotask turn AND the trailing microtask hops.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    for (let i = 0; i < 5; i++) await Promise.resolve();
     const snap = wired.snapshot();
     expect(snap.running).toBe(false);
     expect(snap.lastError).toBeDefined();
@@ -552,9 +554,10 @@ describe("wireProxyLifecycle exit diagnostics (Bug C)", () => {
     });
     await wired.start();
     ctl.releaseExit(1);
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    // Lifecycle awaits its stderr drainer race before emitting the exit;
+    // flush a macrotask + microtask hops to settle the propagation.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    for (let i = 0; i < 5; i++) await Promise.resolve();
     expect(wired.snapshot().lastError).toBeDefined();
     // Now start again — wiring should clear lastError before the new spawn.
     await wired.start();

@@ -210,6 +210,16 @@ const DEFAULT_GRACE_PERIOD_MS = 3000;
 const DEFAULT_PROBE_TIMEOUT_MS = 500;
 const DEFAULT_EARLY_EXIT_WINDOW_MS = 2000;
 const STDERR_BUFFER_LIMIT = 500;
+/**
+ * Maximum time the exit handler will wait for the stderr drainer to
+ * flush before snapshotting the buffer. Without this race-grace, a
+ * fast-crashing child's wait() resolves before drainStderr has consumed
+ * any chunks, leaving the UI's "Proxy exited (N)" message with no tail.
+ * 500ms covers the typical chrome Subprocess stream-flush window after
+ * the child terminates; if the drainer already saw EOF synchronously
+ * (the common healthy-exit case) the race resolves immediately.
+ */
+const STDERR_GRACE_MS = 500;
 
 export function createProxyLifecycle(deps: ProxyLifecycleDeps): ProxyLifecycle {
   const debug = deps.debug ?? ((): void => undefined);
@@ -236,6 +246,12 @@ export function createProxyLifecycle(deps: ProxyLifecycleDeps): ProxyLifecycle {
   // STDERR_BUFFER_LIMIT chars (sliced from the tail so the most recent
   // diagnostic — usually the actual error — survives).
   let stderrBuffer = "";
+  // Completion promise for the stderr drainer of the currently-tracked
+  // child. The exit handler races this against STDERR_GRACE_MS so a
+  // fast-crashing child doesn't lose its stderr tail to the exit-vs-
+  // drain ordering race. Null when no drainer is running (no child, or
+  // the child exposed no stderr stream).
+  let stderrDrainerDone: Promise<void> | null = null;
   // True iff the controller initiated the shutdown (stop() called).
   // Set inside doTerminate, consulted in the exit handler to decide
   // whether to flag the exit as "unexpected" for listeners.
@@ -294,11 +310,16 @@ export function createProxyLifecycle(deps: ProxyLifecycleDeps): ProxyLifecycle {
    * Errors are swallowed: a broken stderr stream must not prevent the
    * exit handler from firing. The buffer already accumulated up to the
    * failure point is still surfaced to listeners.
+   *
+   * Returns a promise that ALWAYS resolves (never rejects) when the
+   * drainer reaches EOF or hits an error. The exit handler awaits this
+   * (raced against STDERR_GRACE_MS) so a fast-crashing child's stderr
+   * chunks make it into the snapshot before listeners fire.
    */
-  function drainStderr(handle: SubprocessHandle): void {
+  function drainStderr(handle: SubprocessHandle): Promise<void> {
     const stream = handle.stderr;
-    if (stream === undefined || stream === null) return;
-    void (async () => {
+    if (stream === undefined || stream === null) return Promise.resolve();
+    return (async () => {
       try {
         if (typeof (stream as { readString?: unknown }).readString === "function") {
           const reader = stream as { readString(): Promise<string | null> };
@@ -328,6 +349,8 @@ export function createProxyLifecycle(deps: ProxyLifecycleDeps): ProxyLifecycle {
         debug(
           `proxy-lifecycle stderr drain failed: ${err instanceof Error ? err.message : String(err)}`
         );
+        // Swallow the error so the returned promise resolves cleanly —
+        // the exit handler awaits this and must never see a rejection.
       }
     })();
   }
@@ -354,9 +377,28 @@ export function createProxyLifecycle(deps: ProxyLifecycleDeps): ProxyLifecycle {
    * the tracked handle so the next start() spawns afresh.
    */
   function wireExit(handle: SubprocessHandle): Promise<{ readonly exitCode: number | null }> {
+    // Race the drainer's completion against STDERR_GRACE_MS so the
+    // exit info snapshot includes stderr that arrived just before the
+    // exit AND so a hung drainer cannot block exit notification forever.
+    // The drainer promise (set in doSpawn) is captured by reference at
+    // await time; if it's already resolved (EOF arrived synchronously)
+    // the race short-circuits immediately.
+    const awaitDrainerOrGrace = async (): Promise<void> => {
+      const drainer = stderrDrainerDone ?? Promise.resolve();
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      const graceElapsed = new Promise<void>((resolve) => {
+        graceTimer = setTimeout(resolve, STDERR_GRACE_MS);
+      });
+      try {
+        await Promise.race([drainer, graceElapsed]);
+      } finally {
+        if (graceTimer !== undefined) clearTimeout(graceTimer);
+      }
+    };
     const promise = handle
       .wait()
-      .then((result) => {
+      .then(async (result) => {
+        await awaitDrainerOrGrace();
         const info = snapshotExitInfo(result.exitCode);
         if (child === handle) {
           child = null;
@@ -372,7 +414,8 @@ export function createProxyLifecycle(deps: ProxyLifecycleDeps): ProxyLifecycle {
         emitExit(result.exitCode, info);
         return result;
       })
-      .catch((err: unknown) => {
+      .catch(async (err: unknown) => {
+        await awaitDrainerOrGrace();
         // Treat a thrown wait() as exit with unknown code so listeners fire.
         const info = snapshotExitInfo(null);
         if (child === handle) {
@@ -396,6 +439,7 @@ export function createProxyLifecycle(deps: ProxyLifecycleDeps): ProxyLifecycle {
       // Reset diagnostic state for the new child so a previous crash's
       // stderr doesn't leak into this run's exit info.
       stderrBuffer = "";
+      stderrDrainerDone = null;
       stoppingByUser = false;
       // We're claiming ownership with a fresh spawn — drop any stale
       // external-management flag from a prior probe-skip.
@@ -412,8 +456,12 @@ export function createProxyLifecycle(deps: ProxyLifecycleDeps): ProxyLifecycle {
       });
       child = handle;
       childSpawnedAtMs = now();
+      // Capture the drainer promise BEFORE wiring exit so wireExit's
+      // awaitDrainerOrGrace sees a non-null reference. (drainStderr is
+      // synchronous up to its first await, so the assignment happens
+      // before wait() can possibly resolve.)
+      stderrDrainerDone = drainStderr(handle);
       childExit = wireExit(handle);
-      drainStderr(handle);
       state = "running";
       debug(`proxy-lifecycle spawned pid=${String(handle.pid)} port=${String(deps.port)}`);
       return { pid: handle.pid };

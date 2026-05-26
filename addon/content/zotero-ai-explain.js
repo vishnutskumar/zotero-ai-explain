@@ -6330,6 +6330,7 @@ Question: First question about the passage?`
   var DEFAULT_PROBE_TIMEOUT_MS = 500;
   var DEFAULT_EARLY_EXIT_WINDOW_MS = 2e3;
   var STDERR_BUFFER_LIMIT = 500;
+  var STDERR_GRACE_MS = 500;
   function createProxyLifecycle(deps) {
     const debug = deps.debug ?? (() => void 0);
     const fetcher = deps.fetch;
@@ -6342,6 +6343,7 @@ Question: First question about the passage?`
     let childExit = null;
     let childSpawnedAtMs = 0;
     let stderrBuffer = "";
+    let stderrDrainerDone = null;
     let stoppingByUser = false;
     let inflightStart = null;
     let inflightStop = null;
@@ -6364,8 +6366,8 @@ Question: First question about the passage?`
     }
     function drainStderr(handle) {
       const stream = handle.stderr;
-      if (stream === void 0 || stream === null) return;
-      void (async () => {
+      if (stream === void 0 || stream === null) return Promise.resolve();
+      return (async () => {
         try {
           if (typeof stream.readString === "function") {
             const reader = stream;
@@ -6402,7 +6404,20 @@ Question: First question about the passage?`
       return { stderr: stderrBuffer, unexpected };
     }
     function wireExit(handle) {
-      const promise = handle.wait().then((result) => {
+      const awaitDrainerOrGrace = async () => {
+        const drainer = stderrDrainerDone ?? Promise.resolve();
+        let graceTimer;
+        const graceElapsed = new Promise((resolve) => {
+          graceTimer = setTimeout(resolve, STDERR_GRACE_MS);
+        });
+        try {
+          await Promise.race([drainer, graceElapsed]);
+        } finally {
+          if (graceTimer !== void 0) clearTimeout(graceTimer);
+        }
+      };
+      const promise = handle.wait().then(async (result) => {
+        await awaitDrainerOrGrace();
         const info = snapshotExitInfo(result.exitCode);
         if (child === handle) {
           child = null;
@@ -6413,7 +6428,8 @@ Question: First question about the passage?`
         }
         emitExit(result.exitCode, info);
         return result;
-      }).catch((err) => {
+      }).catch(async (err) => {
+        await awaitDrainerOrGrace();
         const info = snapshotExitInfo(null);
         if (child === handle) {
           child = null;
@@ -6433,6 +6449,7 @@ Question: First question about the passage?`
     async function doSpawn() {
       try {
         stderrBuffer = "";
+        stderrDrainerDone = null;
         stoppingByUser = false;
         externallyManaged = false;
         const handle = await deps.subprocess.call({
@@ -6447,8 +6464,8 @@ Question: First question about the passage?`
         });
         child = handle;
         childSpawnedAtMs = now();
+        stderrDrainerDone = drainStderr(handle);
         childExit = wireExit(handle);
-        drainStderr(handle);
         state = "running";
         debug(`proxy-lifecycle spawned pid=${String(handle.pid)} port=${String(deps.port)}`);
         return { pid: handle.pid };
