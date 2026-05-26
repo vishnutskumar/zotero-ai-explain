@@ -6774,17 +6774,12 @@ Question: First question about the passage?`
           controller.abort();
         }, 1500);
         try {
-          const headers = proxyHeaders();
-          const response = await deps.diagnosticsFetch(
-            `http://127.0.0.1:${String(port)}/api/diagnostics`,
-            {
-              signal: controller.signal,
-              ...headers !== void 0 ? { headers } : {}
-            }
-          );
+          const response = await deps.diagnosticsFetch(`http://127.0.0.1:${String(port)}/`, {
+            signal: controller.signal
+          });
           if (response.ok) {
             const body = await response.json();
-            if (typeof body === "object" && body !== null && "binaries" in body && "path" in body) {
+            if (typeof body === "object" && body !== null && body.name === "zotero-ai-llm-proxy" && Array.isArray(body.routes)) {
               isOurs = true;
             }
           }

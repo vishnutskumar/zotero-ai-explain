@@ -534,12 +534,21 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
 
   /**
    * Try to take over an externally-managed listener: ask if it's our
-   * proxy via /api/diagnostics, and if so politely POST /api/shutdown
-   * and wait for the port to release. Returns true if we successfully
-   * cleared the orphan and the caller should re-attempt the spawn;
-   * false if the listener is foreign (leave it alone) or the shutdown
-   * never released the port (so the caller's next spawn would still
-   * EADDRINUSE).
+   * proxy via the bearer-exempt `GET /` route, and if so politely POST
+   * `/api/shutdown` and wait for the port to release. Returns true if
+   * we successfully cleared the orphan and the caller should re-attempt
+   * the spawn; false if the listener is foreign (leave it alone) or the
+   * shutdown never released the port (so the caller's next spawn would
+   * still EADDRINUSE).
+   *
+   * IMPORTANT: both HTTP calls here cross plugin generations — the
+   * orphan was spawned by a PRIOR plugin session whose bearer token is
+   * gone with that process. Any probe carrying the CURRENT generation's
+   * `Authorization: Bearer` would 401 against the orphan and abort the
+   * takeover. That's why this function uses ONLY bearer-exempt proxy
+   * routes (`GET /` and `POST /api/shutdown`) and deliberately omits
+   * the `proxyHeaders()` helper. Adding a new ownership probe? Make
+   * sure the proxy route is in the bearer carve-out list.
    */
   async function tryTakeoverOrphan(): Promise<boolean> {
     if (deps.diagnosticsFetch === undefined) return false;
@@ -550,23 +559,29 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
         controller.abort();
       }, 1500);
       try {
-        // The orphan was spawned by a prior session; its bearer token is
-        // gone with that process. We still pass our current header (if
-        // any) for defensive consistency — the orphan will 401 and we'll
-        // conclude "not ours", leaving it for the user to clean up.
-        // `/api/shutdown` is intentionally bearer-exempt on the proxy
-        // side precisely so the takeover POST below can still succeed.
-        const headers = proxyHeaders();
-        const response = await deps.diagnosticsFetch(
-          `http://127.0.0.1:${String(port)}/api/diagnostics`,
-          {
-            signal: controller.signal,
-            ...(headers !== undefined ? { headers } : {})
-          }
-        );
+        // Cross-generation identity probe via the bearer-exempt `GET /`
+        // route (`scripts/llm-proxy/server.mjs` returns
+        // `{name: "zotero-ai-llm-proxy", routes: [...]}` here). No
+        // Authorization header: the orphan's bearer token died with its
+        // parent process, and `/` is intentionally carve-out so a fresh
+        // plugin generation can identify the orphan as ours without
+        // sharing a credential with it. Host/Origin gating on the proxy
+        // side still applies.
+        const response = await deps.diagnosticsFetch(`http://127.0.0.1:${String(port)}/`, {
+          signal: controller.signal
+        });
         if (response.ok) {
           const body = await response.json();
-          if (typeof body === "object" && body !== null && "binaries" in body && "path" in body) {
+          // Defensive parse: require BOTH the exact `name` string AND
+          // a `routes` array so a coincidentally-matching JSON service
+          // (e.g. something else that happens to expose a `name` field)
+          // can't fool us into shutting down a foreign listener.
+          if (
+            typeof body === "object" &&
+            body !== null &&
+            (body as { name?: unknown }).name === "zotero-ai-llm-proxy" &&
+            Array.isArray((body as { routes?: unknown }).routes)
+          ) {
             isOurs = true;
           }
         }

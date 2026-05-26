@@ -762,3 +762,267 @@ describe("wireProxyLifecycle proxy-auth wiring", () => {
     expect(headers.Authorization).toBe(`Bearer ${String(token)}`);
   });
 });
+
+/**
+ * Orphan-takeover (OT-1..OT-4) — when start() detects an externally-
+ * managed listener on the port, the takeover path identifies whether
+ * the orphan is OUR proxy (a child surviving from a prior plugin
+ * generation whose bearer token died with its parent) via the
+ * bearer-exempt `GET /` route. Bearer-gated probes break this because
+ * the orphan rejects the current generation's token.
+ */
+describe("wireProxyLifecycle orphan takeover (cross-generation)", () => {
+  /**
+   * Build a stateful fake `fetch` (the `/api/tags` probe used by
+   * `lifecycle.start()` and by `tryTakeoverOrphan`'s release-poll) that
+   * reports the orphan present until `releasePort()` is called, then
+   * reports the port free thereafter so the takeover poll resolves and
+   * the rebuild spawn succeeds without re-tripping the external probe.
+   */
+  function statefulPortProbe(): {
+    readonly fetch: (
+      input: string,
+      init?: { readonly signal?: AbortSignal }
+    ) => Promise<{
+      readonly ok: boolean;
+      readonly status: number;
+    }>;
+    readonly releasePort: () => void;
+    readonly calls: { url: string }[];
+  } {
+    let occupied = true;
+    const calls: { url: string }[] = [];
+    return {
+      fetch: (input: string) => {
+        calls.push({ url: input });
+        return Promise.resolve(occupied ? { ok: true, status: 200 } : { ok: false, status: 0 });
+      },
+      releasePort: () => {
+        occupied = false;
+      },
+      calls
+    };
+  }
+
+  it("OT-1: takes over a prior-generation orphan via bearer-exempt GET / (never hits /api/diagnostics during ownership detection)", async () => {
+    // The orphan was minted with a DIFFERENT bearer token in a prior
+    // plugin session. /api/diagnostics is bearer-gated; calling it with
+    // the new generation's token returns 401. The fix routes the
+    // ownership probe through `GET /` instead — bearer-exempt — so the
+    // takeover succeeds. This test asserts the new behavior AND that
+    // the deprecated diagnostics-based probe is no longer used.
+    const sub = fakeSubprocess();
+    const port = statefulPortProbe();
+    const diagnosticsCalls: {
+      url: string;
+      init: { headers?: Record<string, string> } | undefined;
+    }[] = [];
+    const diagnosticsFetch = vi.fn(
+      (url: string, init?: { headers?: Record<string, string>; method?: string }) => {
+        diagnosticsCalls.push({ url, init });
+        if (url.endsWith("/")) {
+          // Bearer-exempt — the orphan answers with its identity.
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () =>
+              Promise.resolve({
+                name: "zotero-ai-llm-proxy",
+                routes: ["POST /api/shutdown", "GET /api/tags"]
+              })
+          });
+        }
+        if (url.endsWith("/api/diagnostics")) {
+          // The orphan's bearer token is gone — this would 401 a
+          // cross-generation probe. Resolve as 401 so a regression that
+          // re-introduces the diagnostics-based probe FAILS this test
+          // by leaving isOurs=false and never reaching the shutdown POST.
+          return Promise.resolve({
+            ok: false,
+            status: 401,
+            json: () => Promise.resolve({ error: "unauthorized" })
+          });
+        }
+        if (url.endsWith("/api/shutdown")) {
+          // Orphan accepts the shutdown POST + releases the port.
+          port.releasePort();
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () => Promise.resolve({ exiting: true })
+          });
+        }
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          json: () => Promise.resolve({ error: "not found" })
+        });
+      }
+    );
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      fetch: port.fetch,
+      diagnosticsFetch,
+      autoStartOverride: false
+    });
+    const result = await wired.start();
+    // After takeover, lifecycle rebuilds and spawns a fresh child.
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    expect(result).toMatchObject({ pid: expect.any(Number) });
+    // The ownership probe MUST have hit `/` and MUST NOT have hit
+    // `/api/diagnostics` (the previous bearer-gated route that broke
+    // the cross-generation case). We scope this assertion to the calls
+    // that happened BEFORE the shutdown POST — after takeover succeeds,
+    // the rebuilt own-generation lifecycle is allowed (and expected)
+    // to hit /api/diagnostics with its OWN token to populate the
+    // "Discovered binaries" snapshot.
+    const shutdownIdx = diagnosticsCalls.findIndex((c) => c.url.endsWith("/api/shutdown"));
+    expect(shutdownIdx).toBeGreaterThanOrEqual(0);
+    const beforeShutdown = diagnosticsCalls.slice(0, shutdownIdx);
+    const rootProbe = beforeShutdown.find((c) => c.url.endsWith("/"));
+    expect(rootProbe).toBeDefined();
+    const diagProbeBeforeShutdown = beforeShutdown.find((c) => c.url.endsWith("/api/diagnostics"));
+    expect(diagProbeBeforeShutdown).toBeUndefined();
+    // And the ownership probe MUST NOT have carried the new
+    // generation's Authorization header — the orphan's bearer token
+    // died with its parent, so a bearer-attached probe would 401.
+    expect(rootProbe?.init?.headers ?? {}).not.toHaveProperty("Authorization");
+    // After the takeover the rebuilt lifecycle spawned exactly one child.
+    expect(sub.calls).toHaveLength(1);
+  });
+
+  it("OT-2: leaves a foreign service alone (no /api/shutdown POST) when GET / does not identify as ours", async () => {
+    // A non-zotero service on the port: GET / returns SOME other JSON
+    // (or 404, or non-JSON). The takeover MUST NOT POST /api/shutdown
+    // against it — the foreign service stays alive.
+    const sub = fakeSubprocess();
+    const port = statefulPortProbe();
+    const diagnosticsCalls: { url: string; method: string | undefined }[] = [];
+    const diagnosticsFetch = vi.fn((url: string, init?: { method?: string }) => {
+      diagnosticsCalls.push({ url, method: init?.method });
+      if (url.endsWith("/")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ some: "other-service" })
+        });
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        json: () => Promise.resolve({})
+      });
+    });
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      fetch: port.fetch,
+      diagnosticsFetch,
+      autoStartOverride: false
+    });
+    const result = await wired.start();
+    expect(result).toEqual({ external: true });
+    // We never tried to shut the foreign service down.
+    const shutdownCall = diagnosticsCalls.find((c) => c.url.endsWith("/api/shutdown"));
+    expect(shutdownCall).toBeUndefined();
+    // No new child spawned — port stayed occupied by the foreign service.
+    expect(sub.calls).toHaveLength(0);
+  });
+
+  it("OT-3: defensive parse — `name` matches but `routes` is missing/non-array → not ours, no shutdown", async () => {
+    // Coincidentally-matching JSON shouldn't fool the probe. The
+    // ownership check requires BOTH the exact `name` AND a `routes`
+    // array; a payload with the right name but no routes (or a
+    // non-array routes value) MUST be classified as foreign.
+    const sub = fakeSubprocess();
+    const port = statefulPortProbe();
+    const diagnosticsCalls: { url: string }[] = [];
+    const diagnosticsFetch = vi.fn((url: string) => {
+      diagnosticsCalls.push({ url });
+      if (url.endsWith("/")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          // Name matches but routes is the wrong shape — defensive
+          // parse must reject this.
+          json: () => Promise.resolve({ name: "zotero-ai-llm-proxy", routes: "not-an-array" })
+        });
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        json: () => Promise.resolve({})
+      });
+    });
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      fetch: port.fetch,
+      diagnosticsFetch,
+      autoStartOverride: false
+    });
+    const result = await wired.start();
+    expect(result).toEqual({ external: true });
+    const shutdownCall = diagnosticsCalls.find((c) => c.url.endsWith("/api/shutdown"));
+    expect(shutdownCall).toBeUndefined();
+    expect(sub.calls).toHaveLength(0);
+  });
+
+  it("OT-4: takeover shutdown POST omits the Authorization header (cross-generation requirement)", async () => {
+    // The orphan's bearer token died with its parent process. The
+    // shutdown POST MUST go without any Authorization header so the
+    // proxy's bearer carve-out for /api/shutdown accepts it. Asserting
+    // on the actual init object the fetch was handed.
+    const sub = fakeSubprocess();
+    const port = statefulPortProbe();
+    let shutdownInit: { headers?: Record<string, string>; method?: string } | undefined;
+    const diagnosticsFetch = vi.fn(
+      (url: string, init?: { headers?: Record<string, string>; method?: string }) => {
+        if (url.endsWith("/")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () =>
+              Promise.resolve({
+                name: "zotero-ai-llm-proxy",
+                routes: ["POST /api/shutdown"]
+              })
+          });
+        }
+        if (url.endsWith("/api/shutdown")) {
+          shutdownInit = init;
+          port.releasePort();
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () => Promise.resolve({ exiting: true })
+          });
+        }
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          json: () => Promise.resolve({})
+        });
+      }
+    );
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      fetch: port.fetch,
+      diagnosticsFetch,
+      autoStartOverride: false
+    });
+    await wired.start();
+    expect(shutdownInit).toBeDefined();
+    expect(shutdownInit?.method).toBe("POST");
+    // No Authorization header on the cross-generation shutdown POST.
+    const headers = shutdownInit?.headers ?? {};
+    expect(headers).not.toHaveProperty("Authorization");
+    expect(headers).not.toHaveProperty("authorization");
+  });
+});
