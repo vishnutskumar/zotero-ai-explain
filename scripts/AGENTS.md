@@ -12,9 +12,15 @@ others are invoked by the plugin at runtime via the bundled subprocess controlle
 
 ```text
 scripts/
-  package-xpi.mjs                 # Stage addon/ + bundled llm-proxy/ → zotero-ai-explain.xpi
+  package-xpi.mjs                 # Stage addon/ + bundled llm-proxy/ → zotero-ai-explain.xpi.
+                                  # Local build (no tag arg, GITHUB_REF_NAME unset): reads manifest version
+                                  # verbatim incl. -dev suffix, cross-checks manifest == package.json.
+                                  # Release-tag path (tag arg or GITHUB_REF_NAME set): routes through
+                                  # validateReleaseVersions for strict clean-semver enforcement.
   list-xpi-contents.mjs           # Diagnostic: dump XPI manifest
-  release-version.mjs             # Version-bump helper used by release tags
+  release-version.mjs             # Strict clean-semver parser used by the release-tag path of
+                                  # package-xpi.mjs; rejects -dev suffixes by design so release
+                                  # artifacts never carry a dev-suffix.
   precommit-checks.mjs, precommit-universal.mjs  # Pre-commit hook implementations
   sync-agents-from-claude.mjs     # Keep AGENTS.md mirrors in sync with CLAUDE.md
   llm-proxy/                      # Bundled Node HTTP service (see below)

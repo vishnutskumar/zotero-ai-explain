@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Zotero AI Explain",
-  "version": "0.3.0",
+  "version": "0.4.0-dev",
   "description": "Selected-text explanations and sidebar follow-up chat for Zotero.",
   "applications": {
     "zotero": {

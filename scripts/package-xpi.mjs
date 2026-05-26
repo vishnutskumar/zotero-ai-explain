@@ -17,7 +17,22 @@ import {
 // be the branch name like "forge/foo" and fail the semver guard.
 const tag = process.argv[2] ?? process.env.GITHUB_REF_NAME ?? "";
 const versions = readProjectVersions();
-const version = validateReleaseVersions(tag, versions);
+// Local-build path: when no tag is provided (dev workflow), accept the
+// manifest version verbatim (incl. `-dev` suffixes). Release-tag path
+// (CI on a `v*.*.*` push) keeps the strict validation that the tag,
+// package.json, and manifest.json all agree.
+let version;
+if (tag === "") {
+  version = versions.manifestVersion;
+  if (versions.packageVersion !== versions.manifestVersion) {
+    throw new Error(
+      `package.json version ${versions.packageVersion} does not match addon/manifest.json version ${versions.manifestVersion}`
+    );
+  }
+  console.log(`package-xpi: local build, version=${version}`);
+} else {
+  version = validateReleaseVersions(tag, versions);
+}
 const distDirectory = "dist";
 const artifactName = `zotero-ai-explain-v${version}.xpi`;
 const artifactPath = join(distDirectory, artifactName);

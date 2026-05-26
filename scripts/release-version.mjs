@@ -2,6 +2,14 @@ import { readFileSync } from "node:fs";
 
 export const releaseDownloadBaseUrl =
   "https://github.com/vishnutskumar/zotero-ai-explain/releases/download";
+// Strict by design: release artifacts must be clean semver. Prerelease
+// suffixes like `-dev` (used on feature branches so Zotero's auto-updater
+// treats the locally-installed XPI as strictly newer than the latest
+// GitHub release) MUST NOT flow through here. The local-build path in
+// `scripts/package-xpi.mjs` reads the manifest version verbatim when no
+// tag is supplied, so dev workflows never touch this regex. Release tags
+// also go through `.github/workflows/release.yml`'s
+// `v[0-9]+.[0-9]+.[0-9]+` filter, which already rejects `-dev`.
 export const semverPattern = /^(?:v)?(?<version>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$/u;
 
 export function parseReleaseVersion(tag) {
