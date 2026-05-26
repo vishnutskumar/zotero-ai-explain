@@ -1246,9 +1246,14 @@ ${para}`;
       let headers;
       switch (request.backend) {
         case "ollama":
-        case "proxy":
+        case "proxy": {
           fetchUrl = `${url}/api/tags`;
+          const proxyAuth = request.getProxyAuthHeader?.(url);
+          if (proxyAuth !== void 0) {
+            headers = proxyAuth;
+          }
           break;
+        }
         case "openai":
           if ((request.apiKey ?? "").length === 0) {
             return { ok: false, message: "API key required to list models." };
@@ -3234,6 +3239,7 @@ ${para}`;
   var bootstrap_exports = {};
   __export(bootstrap_exports, {
     attachAutoReindex: () => attachAutoReindex,
+    buildProxyAuthHeader: () => buildProxyAuthHeader,
     openCitationInReader: () => openCitationInReader,
     shutdown: () => shutdown,
     startup: () => startup
@@ -3948,8 +3954,51 @@ ${para}`;
   // src/platform/e2e-driver.ts
   init_indexing_controller();
 
+  // src/ui/citation-lookup.ts
+  var SINGLE_TOKEN_PATTERN = /^\[([A-Z0-9]{8})(?:#(\d+))?\]$/u;
+  function parseCitationToken(token) {
+    const match = SINGLE_TOKEN_PATTERN.exec(token);
+    if (match === null) {
+      return null;
+    }
+    const itemKey = match[1] ?? "";
+    const rawChunkIndex = match[2];
+    if (rawChunkIndex === void 0) {
+      return { itemKey };
+    }
+    return { itemKey, chunkIndex: Number(rawChunkIndex) };
+  }
+  function resolveCitation(parsed, lookup) {
+    if (parsed.chunkIndex !== void 0) {
+      return lookup.get(`${parsed.itemKey}#${String(parsed.chunkIndex)}`);
+    }
+    for (const entry of lookup.values()) {
+      if (entry.itemKey === parsed.itemKey) {
+        return { itemKey: parsed.itemKey, text: entry.text };
+      }
+    }
+    return void 0;
+  }
+  function buildCitationLookup(chunks) {
+    const lookup = /* @__PURE__ */ new Map();
+    for (const chunk of chunks) {
+      if (typeof chunk.chunkIndex !== "number") {
+        continue;
+      }
+      const key = `${chunk.itemKey}#${String(chunk.chunkIndex)}`;
+      lookup.set(key, {
+        itemKey: chunk.itemKey,
+        text: chunk.text,
+        ...typeof chunk.pageIndex === "number" ? { pageIndex: chunk.pageIndex } : {},
+        ...chunk.attachmentKey !== void 0 ? { attachmentKey: chunk.attachmentKey } : {}
+      });
+    }
+    return lookup;
+  }
+
   // src/ui/markdown.ts
   var ALLOWED_URL_SCHEMES = /* @__PURE__ */ new Set(["http:", "https:", "mailto:"]);
+  var CITATION_PATTERN = /\[([A-Z0-9]{8})(?:#(\d+))?\]/gu;
   function renderMarkdown(target, source) {
     target.replaceChildren();
     const doc = target.ownerDocument;
@@ -4044,21 +4093,21 @@ ${para}`;
     }
     return blocks;
   }
-  function renderBlock(doc, block) {
+  function renderBlock(doc, block, emitText = appendPlainText) {
     switch (block.kind) {
       case "heading": {
         const element = doc.createElement(`h${String(block.level)}`);
-        renderInline(doc, element, block.text);
+        renderInline(doc, element, block.text, emitText);
         return element;
       }
       case "paragraph": {
         const element = doc.createElement("p");
-        renderInline(doc, element, block.text);
+        renderInline(doc, element, block.text, emitText);
         return element;
       }
       case "blockquote": {
         const element = doc.createElement("blockquote");
-        renderInline(doc, element, block.text);
+        renderInline(doc, element, block.text, emitText);
         return element;
       }
       case "code": {
@@ -4075,18 +4124,25 @@ ${para}`;
         const list = doc.createElement(block.ordered ? "ol" : "ul");
         for (const item of block.items) {
           const li = doc.createElement("li");
-          renderInline(doc, li, item);
+          renderInline(doc, li, item, emitText);
           list.append(li);
         }
         return list;
       }
     }
   }
-  function renderInline(doc, target, source) {
+  function renderInline(doc, target, source, emitText = appendPlainText) {
     const tokens = tokeniseInline(source);
     for (const token of tokens) {
+      if (token.kind === "text") {
+        emitText(target, token.text);
+        continue;
+      }
       target.append(renderInlineToken(doc, token));
     }
+  }
+  function appendPlainText(target, text) {
+    target.append(target.ownerDocument.createTextNode(text));
   }
   function renderInlineToken(doc, token) {
     switch (token.kind) {
@@ -4196,6 +4252,56 @@ ${para}`;
       i += 1;
     }
     return -1;
+  }
+  function renderMarkdownWithCitations(target, source, opts) {
+    target.replaceChildren();
+    const doc = target.ownerDocument;
+    const blocks = parseBlocks(source);
+    const lookup = opts?.lookup;
+    const emitText = lookup === void 0 ? appendPlainText : (host, text) => {
+      emitTextWithCitations(host, text, lookup);
+    };
+    for (const block of blocks) {
+      target.append(renderBlock(doc, block, emitText));
+    }
+  }
+  function emitTextWithCitations(host, text, lookup) {
+    const doc = host.ownerDocument;
+    CITATION_PATTERN.lastIndex = 0;
+    let cursor = 0;
+    let match;
+    while ((match = CITATION_PATTERN.exec(text)) !== null) {
+      if (match.index > cursor) {
+        host.append(doc.createTextNode(text.slice(cursor, match.index)));
+      }
+      const parsed = parseCitationToken(match[0]);
+      const entry = parsed !== null ? resolveCitation(parsed, lookup) : void 0;
+      if (entry === void 0 || parsed === null) {
+        host.append(doc.createTextNode(match[0]));
+      } else {
+        host.append(renderCitationAnchor(doc, parsed.itemKey, match[2], entry));
+      }
+      cursor = match.index + match[0].length;
+    }
+    if (cursor < text.length) {
+      host.append(doc.createTextNode(text.slice(cursor)));
+    }
+  }
+  function renderCitationAnchor(doc, itemKey, rawChunkIndex, entry) {
+    const link = doc.createElement("a");
+    link.dataset.itemKey = itemKey;
+    if (rawChunkIndex !== void 0) {
+      link.dataset.chunkIndex = rawChunkIndex;
+    }
+    if (entry.attachmentKey !== void 0) {
+      link.dataset.attachmentKey = entry.attachmentKey;
+    }
+    if (typeof entry.pageIndex === "number") {
+      link.dataset.pageIndex = String(entry.pageIndex);
+    }
+    link.setAttribute("href", "#");
+    link.textContent = `[${itemKey}${rawChunkIndex !== void 0 ? `#${rawChunkIndex}` : ""}]`;
+    return link;
   }
   function safeHref(raw) {
     const trimmed = raw.trim();
@@ -4401,30 +4507,37 @@ ${MARKDOWN_CSS}
     return element;
   }
 
-  // src/ui/citation-lookup.ts
-  function buildCitationLookup(chunks) {
-    const lookup = /* @__PURE__ */ new Map();
-    for (const chunk of chunks) {
-      if (typeof chunk.chunkIndex !== "number") {
-        continue;
-      }
-      const key = `${chunk.itemKey}#${String(chunk.chunkIndex)}`;
-      lookup.set(key, {
-        itemKey: chunk.itemKey,
-        text: chunk.text,
-        ...typeof chunk.pageIndex === "number" ? { pageIndex: chunk.pageIndex } : {},
-        ...chunk.attachmentKey !== void 0 ? { attachmentKey: chunk.attachmentKey } : {}
-      });
-    }
-    return lookup;
-  }
-
   // src/platform/e2e-driver.ts
   init_index_controls_view();
 
+  // src/ui/citation-click.ts
+  function attachCitationClickHandler(root, onCitationClick) {
+    const handler = (event) => {
+      const target = event.target;
+      if (target === null) return;
+      const link = target.closest("a[data-item-key]");
+      if (link === null) return;
+      event.preventDefault();
+      const key = link.dataset.itemKey ?? "";
+      if (key.length === 0) return;
+      const attachmentKey = link.dataset.attachmentKey;
+      const rawPageIndex = link.dataset.pageIndex;
+      const pageIndex = rawPageIndex !== void 0 && /^\d+$/u.test(rawPageIndex) ? Number(rawPageIndex) : void 0;
+      onCitationClick({
+        itemKey: key,
+        ...attachmentKey !== void 0 ? { attachmentKey } : {},
+        ...pageIndex !== void 0 ? { pageIndex } : {}
+      });
+    };
+    root.addEventListener("click", handler);
+    return () => {
+      root.removeEventListener("click", handler);
+    };
+  }
+
   // src/ui/library-chat-view.ts
   init_styles();
-  var CITATION_PATTERN = /\[([A-Z0-9]{8})(?:#(\d+))?\]/gu;
+  var CITATION_PATTERN2 = /\[([A-Z0-9]{8})(?:#(\d+))?\]/gu;
   var MESSAGES_STYLE = "list-style: none; margin: 0; padding: 12px 16px; flex: 1 1 auto; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;";
   function renderLibraryChatView(input) {
     const root = document.createElement("aside");
@@ -4578,10 +4691,10 @@ ${MARKDOWN_CSS}
     return row;
   }
   function appendWithCitations(target, source, lookup) {
-    CITATION_PATTERN.lastIndex = 0;
+    CITATION_PATTERN2.lastIndex = 0;
     let cursor = 0;
     let match;
-    while ((match = CITATION_PATTERN.exec(source)) !== null) {
+    while ((match = CITATION_PATTERN2.exec(source)) !== null) {
       if (match.index > cursor) {
         target.append(document.createTextNode(source.slice(cursor, match.index)));
       }
@@ -4634,25 +4747,7 @@ ${MARKDOWN_CSS}
     const handleReset = () => {
       onReset();
     };
-    const handleClick = (event) => {
-      const target = event.target;
-      if (target === null) return;
-      const link = target.closest("a[data-item-key]");
-      if (link === null) return;
-      event.preventDefault();
-      const key = link.dataset.itemKey ?? "";
-      if (key.length === 0) {
-        return;
-      }
-      const attachmentKey = link.dataset.attachmentKey;
-      const rawPageIndex = link.dataset.pageIndex;
-      const pageIndex = rawPageIndex !== void 0 && /^\d+$/u.test(rawPageIndex) ? Number(rawPageIndex) : void 0;
-      onCitationClick({
-        itemKey: key,
-        ...attachmentKey !== void 0 ? { attachmentKey } : {},
-        ...pageIndex !== void 0 ? { pageIndex } : {}
-      });
-    };
+    const detachCitationClicks = attachCitationClickHandler(view, onCitationClick);
     const handleKeydown = (event) => {
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
         event.preventDefault();
@@ -4661,12 +4756,11 @@ ${MARKDOWN_CSS}
     };
     form?.addEventListener("submit", handleSubmit);
     reset?.addEventListener("click", handleReset);
-    view.addEventListener("click", handleClick);
     textarea?.addEventListener("keydown", handleKeydown);
     return () => {
       form?.removeEventListener("submit", handleSubmit);
       reset?.removeEventListener("click", handleReset);
-      view.removeEventListener("click", handleClick);
+      detachCitationClicks();
       textarea?.removeEventListener("keydown", handleKeydown);
     };
   }
@@ -6228,6 +6322,9 @@ Question: First question about the passage?`
     };
   }
 
+  // scripts/llm-proxy/protocol-constants.mjs
+  var LLM_PROXY_AUTH_TOKEN_ENV = "LLM_PROXY_AUTH_TOKEN";
+
   // src/platform/proxy-lifecycle.ts
   var DEFAULT_GRACE_PERIOD_MS = 3e3;
   var DEFAULT_PROBE_TIMEOUT_MS = 500;
@@ -6573,6 +6670,7 @@ Question: First question about the passage?`
     let port = persistedPort ?? DEFAULT_PROXY_PORT;
     let lastError;
     let diagnostics;
+    let currentAuthToken = null;
     let spawnInFlight = false;
     let generation = 0;
     let lifecycle = buildLifecycle();
@@ -6584,13 +6682,20 @@ Question: First question about the passage?`
     }
     function buildLifecycle() {
       const consentEnv = readConsentEnv();
+      const extraEnvironment = {};
+      if (currentAuthToken !== null) {
+        extraEnvironment[LLM_PROXY_AUTH_TOKEN_ENV] = currentAuthToken;
+      }
+      if (consentEnv !== void 0) {
+        Object.assign(extraEnvironment, consentEnv);
+      }
       const cfg = {
         subprocess: deps.subprocess,
         nodeBinaryPath,
         serverScriptPath,
         port,
         ...deps.fetch !== void 0 ? { fetch: deps.fetch } : {},
-        ...consentEnv !== void 0 ? { extraEnvironment: consentEnv } : {},
+        ...Object.keys(extraEnvironment).length > 0 ? { extraEnvironment } : {},
         debug
       };
       return createProxyLifecycle(cfg);
@@ -6599,6 +6704,7 @@ Question: First question about the passage?`
       debug(`proxy-lifecycle: exit code=${code === null ? "null" : String(code)}`);
       generation += 1;
       diagnostics = void 0;
+      currentAuthToken = null;
       if (info?.unexpected === true) {
         const stderr = info.stderr.trim();
         const tail = stderr.length > 0 ? stderr : void 0;
@@ -6626,6 +6732,10 @@ Question: First question about the passage?`
         ...diagnostics !== void 0 ? { diagnostics } : {}
       };
     }
+    function proxyHeaders() {
+      if (currentAuthToken === null) return void 0;
+      return { Authorization: `Bearer ${currentAuthToken}` };
+    }
     async function fetchDiagnostics(forGeneration) {
       if (deps.diagnosticsFetch === void 0) return;
       const controller = new AbortController();
@@ -6633,9 +6743,13 @@ Question: First question about the passage?`
         controller.abort();
       }, 1500);
       try {
+        const headers = proxyHeaders();
         const response = await deps.diagnosticsFetch(
           `http://127.0.0.1:${String(port)}/api/diagnostics`,
-          { signal: controller.signal }
+          {
+            signal: controller.signal,
+            ...headers !== void 0 ? { headers } : {}
+          }
         );
         if (!response.ok) return;
         const body = await response.json();
@@ -6660,9 +6774,13 @@ Question: First question about the passage?`
           controller.abort();
         }, 1500);
         try {
+          const headers = proxyHeaders();
           const response = await deps.diagnosticsFetch(
             `http://127.0.0.1:${String(port)}/api/diagnostics`,
-            { signal: controller.signal }
+            {
+              signal: controller.signal,
+              ...headers !== void 0 ? { headers } : {}
+            }
           );
           if (response.ok) {
             const body = await response.json();
@@ -6720,6 +6838,12 @@ Question: First question about the passage?`
       diagnostics = void 0;
       generation += 1;
       let myGeneration = generation;
+      if (currentAuthToken === null) {
+        currentAuthToken = crypto.randomUUID();
+        exitUnsub();
+        lifecycle = buildLifecycle();
+        exitUnsub = lifecycle.onExit(handleExit);
+      }
       let result = await lifecycle.start();
       if (!("error" in result) && "external" in result) {
         const tookOver = await tryTakeoverOrphan();
@@ -6734,6 +6858,7 @@ Question: First question about the passage?`
       }
       if ("error" in result) {
         lastError = result.error;
+        currentAuthToken = null;
       } else {
         await fetchDiagnostics(myGeneration);
       }
@@ -6744,6 +6869,7 @@ Question: First question about the passage?`
       generation += 1;
       await lifecycle.stop();
       diagnostics = void 0;
+      currentAuthToken = null;
       deps.onStateChange?.(snapshot());
     }
     function applyValues(values) {
@@ -6829,7 +6955,8 @@ Question: First question about the passage?`
       applyValues,
       redetectNode,
       setAutoStart,
-      shutdown: shutdown2
+      shutdown: shutdown2,
+      getProxyAuthToken: () => currentAuthToken
     };
   }
   function detectNodeBinaryWithStatus(deps) {
@@ -7140,6 +7267,25 @@ Question: First question about the passage?`
   init_index_controls_view();
   init_model_discovery();
   init_settings_view();
+  function createPopupRetrievalChannel() {
+    const subscribers = /* @__PURE__ */ new Set();
+    return {
+      publish(chunks) {
+        for (const handler of subscribers) {
+          try {
+            handler(chunks);
+          } catch {
+          }
+        }
+      },
+      subscribe(handler) {
+        subscribers.add(handler);
+        return () => {
+          subscribers.delete(handler);
+        };
+      }
+    };
+  }
   var LIBRARY_CHAT_TOP_K = 8;
   function blankSelection(question) {
     return {
@@ -7226,7 +7372,7 @@ ${lines.join("\n")}`;
       }
       return conversation.messages.slice(firstAssistantIndex + 1);
     }
-    function renderPopupConversation(updated, refs) {
+    function renderPopupConversation(updated, refs, citationLookup) {
       const firstAssistant = firstAssistantMessage(updated);
       const followTurns = followUpTurns(updated);
       const streaming = updated.status === "streaming";
@@ -7252,10 +7398,17 @@ ${lines.join("\n")}`;
           refs.errorMessageEl.textContent = "";
         }
       }
+      const renderText = (host, text) => {
+        if (citationLookup !== void 0) {
+          renderMarkdownWithCitations(host, text, { lookup: citationLookup });
+        } else {
+          renderMarkdown(host, text);
+        }
+      };
       if (firstAssistant !== void 0 && firstAssistant.content.length > 0) {
-        renderMarkdown(refs.body, firstAssistant.content);
+        renderText(refs.body, firstAssistant.content);
       } else {
-        renderMarkdown(refs.body, "");
+        renderText(refs.body, "");
       }
       const turnsContainer = refs.turnsContainer;
       if (turnsContainer !== null) {
@@ -7272,16 +7425,26 @@ ${lines.join("\n")}`;
           attribution.textContent = `${message.role}: `;
           const turnBody = turnsContainer.ownerDocument.createElement("div");
           turnBody.className = "zotero-ai-explain-popup__turn-body";
-          renderMarkdown(turnBody, message.content);
+          renderText(turnBody, message.content);
           article.append(attribution, turnBody);
           return article;
         });
         turnsContainer.replaceChildren(...fragments);
       }
     }
+    function dispatchPopupCitation(citation) {
+      const zoteroForCitation = deps.zotero;
+      if (zoteroForCitation !== void 0) {
+        openCitationInReader(citation, zoteroForCitation);
+      }
+    }
     function startExplain(rawSelection) {
       const selection = withReaderScope(rawSelection);
       const conversation = deps.store.createFromSelection(selection, deps.profile());
+      const lookupRef = { current: void 0 };
+      const retrievalUnsubscribe = deps.popupRetrievalChannel?.subscribe((chunks) => {
+        lookupRef.current = buildCitationLookup(chunks);
+      });
       const sourceFrame = describeSourceFrame(selection);
       if (sourceFrame !== null) {
         deps.store.appendSystemMessage(conversation.id, sourceFrame);
@@ -7301,14 +7464,29 @@ ${lines.join("\n")}`;
       const turnsContainer = popup.querySelector(".zotero-ai-explain-popup__turns");
       let popupUnmount = null;
       let popupUnsubscribe = null;
+      let detachPopupCitationClicks = null;
       let sidebarUnmount = null;
       let sidebarUnsubscribe = null;
+      let detachSidebarCitationClicks = null;
       let sidebarMessages = null;
+      let teardownRetrieval = () => {
+        retrievalUnsubscribe?.();
+      };
+      const tearDownRetrieval = () => {
+        const fn = teardownRetrieval;
+        teardownRetrieval = null;
+        fn?.();
+      };
       const cleanupExplain = () => {
         popupUnsubscribe?.();
+        detachPopupCitationClicks?.();
+        detachPopupCitationClicks = null;
         popupUnmount?.();
         sidebarUnsubscribe?.();
+        detachSidebarCitationClicks?.();
+        detachSidebarCitationClicks = null;
         sidebarUnmount?.();
+        tearDownRetrieval();
       };
       const dismissPopup = () => {
         popupUnsubscribe?.();
@@ -7339,8 +7517,11 @@ ${lines.join("\n")}`;
           onDismiss: () => {
             sidebarUnsubscribe?.();
             sidebarUnsubscribe = null;
+            detachSidebarCitationClicks?.();
+            detachSidebarCitationClicks = null;
             sidebarUnmount = null;
             sidebarMessages = null;
+            tearDownRetrieval();
           }
         });
         sidebarUnsubscribe = deps.store.subscribe(conversation.id, (updated) => {
@@ -7357,12 +7538,19 @@ ${lines.join("\n")}`;
             attribution.textContent = `${message.role}: `;
             const body2 = list.ownerDocument.createElement("div");
             body2.className = "zotero-ai-explain-sidebar__body";
-            renderMarkdown(body2, message.content);
+            if (lookupRef.current !== void 0) {
+              renderMarkdownWithCitations(body2, message.content, {
+                lookup: lookupRef.current
+              });
+            } else {
+              renderMarkdown(body2, message.content);
+            }
             row.append(attribution, body2);
             return row;
           });
           list.replaceChildren(...rows);
         });
+        detachSidebarCitationClicks = attachCitationClickHandler(view, dispatchPopupCitation);
       };
       const continueButton = popup.querySelector(
         '[data-action="continue-sidebar"]'
@@ -7370,6 +7558,8 @@ ${lines.join("\n")}`;
       continueButton?.addEventListener("click", () => {
         popupUnsubscribe?.();
         popupUnsubscribe = null;
+        detachPopupCitationClicks?.();
+        detachPopupCitationClicks = null;
         popupUnmount?.();
         popupUnmount = null;
         deps.popupController.continueInSidebar(conversation.id);
@@ -7406,25 +7596,33 @@ ${lines.join("\n")}`;
           followForm?.requestSubmit();
         }
       });
+      detachPopupCitationClicks = attachCitationClickHandler(popup, dispatchPopupCitation);
       popupUnmount = deps.ui.mountPopup(popup, {
         anchor: selection.anchor,
         onDismiss: () => {
           popupUnsubscribe?.();
           popupUnsubscribe = null;
           popupUnmount = null;
+          detachPopupCitationClicks?.();
+          detachPopupCitationClicks = null;
+          tearDownRetrieval();
         }
       });
       popupUnsubscribe = deps.store.subscribe(conversation.id, (updated) => {
         if (body === null) {
           return;
         }
-        renderPopupConversation(updated, {
-          body,
-          loading,
-          errorBlock,
-          errorMessageEl,
-          turnsContainer
-        });
+        renderPopupConversation(
+          updated,
+          {
+            body,
+            loading,
+            errorBlock,
+            errorMessageEl,
+            turnsContainer
+          },
+          lookupRef.current
+        );
       });
       cleanup.push(cleanupExplain);
       void dismissPopup;
@@ -7436,6 +7634,10 @@ ${lines.join("\n")}`;
     function startAskQuestion(rawSelection) {
       const selection = withReaderScope(rawSelection);
       const conversation = deps.store.createFromSelection(selection, deps.profile());
+      const lookupRef = { current: void 0 };
+      const retrievalUnsubscribe = deps.popupRetrievalChannel?.subscribe((chunks) => {
+        lookupRef.current = buildCitationLookup(chunks);
+      });
       deps.store.appendSystemMessage(conversation.id, quoteSystemFrame(selection.quote));
       const sourceFrame = describeSourceFrame(selection);
       if (sourceFrame !== null) {
@@ -7457,9 +7659,21 @@ ${lines.join("\n")}`;
       const turnsContainer = popup.querySelector(".zotero-ai-explain-popup__turns");
       let popupUnmount = null;
       let popupUnsubscribe = null;
+      let detachPopupCitationClicks = null;
+      let teardownAskRetrieval = () => {
+        retrievalUnsubscribe?.();
+      };
+      const tearDownAskRetrieval = () => {
+        const fn = teardownAskRetrieval;
+        teardownAskRetrieval = null;
+        fn?.();
+      };
       const cleanupAsk = () => {
         popupUnsubscribe?.();
+        detachPopupCitationClicks?.();
+        detachPopupCitationClicks = null;
         popupUnmount?.();
+        tearDownAskRetrieval();
       };
       let firstTurnSent = false;
       const followForm = popup.querySelector(".zotero-ai-explain-popup__form");
@@ -7493,25 +7707,33 @@ Question: ${raw.trim()}`
           followForm?.requestSubmit();
         }
       });
+      detachPopupCitationClicks = attachCitationClickHandler(popup, dispatchPopupCitation);
       popupUnmount = deps.ui.mountPopup(popup, {
         anchor: selection.anchor,
         onDismiss: () => {
           popupUnsubscribe?.();
           popupUnsubscribe = null;
           popupUnmount = null;
+          detachPopupCitationClicks?.();
+          detachPopupCitationClicks = null;
+          tearDownAskRetrieval();
         }
       });
       popupUnsubscribe = deps.store.subscribe(conversation.id, (updated) => {
         if (body === null) {
           return;
         }
-        renderPopupConversation(updated, {
-          body,
-          loading,
-          errorBlock,
-          errorMessageEl,
-          turnsContainer
-        });
+        renderPopupConversation(
+          updated,
+          {
+            body,
+            loading,
+            errorBlock,
+            errorMessageEl,
+            turnsContainer
+          },
+          lookupRef.current
+        );
       });
       cleanup.push(cleanupAsk);
     }
@@ -7690,8 +7912,9 @@ Question: ${raw.trim()}`
     }
     async function probeOneUrl(fetcher, rawBaseUrl) {
       let url;
+      let trimmedBase;
       try {
-        const trimmedBase = rawBaseUrl.replace(/\/+$/u, "");
+        trimmedBase = rawBaseUrl.replace(/\/+$/u, "");
         url = new URL(`${trimmedBase}/api/tags`);
       } catch {
         return { ok: false, field: "url", message: "Not a valid URL." };
@@ -7701,7 +7924,12 @@ Question: ${raw.trim()}`
         controller.abort();
       }, SETTINGS_VALIDATION_TIMEOUT_MS);
       try {
-        const response = await fetcher(url.toString(), { signal: controller.signal });
+        const proxyAuth = deps.getProxyAuthHeader?.(trimmedBase);
+        const init = {
+          signal: controller.signal,
+          ...proxyAuth !== void 0 ? { headers: proxyAuth } : {}
+        };
+        const response = await fetcher(url.toString(), init);
         if (!response.ok) {
           return {
             ok: false,
@@ -7748,7 +7976,12 @@ Question: ${raw.trim()}`
               backend: ctx.backend,
               url: ctx.url,
               apiKey: ctx.apiKey,
-              fetch: discoveryFetch
+              fetch: discoveryFetch,
+              // Thread the bundled-proxy bearer so listing models
+              // against the proxy doesn't 401. The closure self-
+              // gates on hostname/port; non-proxy URLs get no
+              // Authorization header and behave unchanged.
+              ...deps.getProxyAuthHeader !== void 0 ? { getProxyAuthHeader: deps.getProxyAuthHeader } : {}
             })
           }
         } : {},
@@ -8508,10 +8741,11 @@ Question: ${raw.trim()}`
         const url = baseUrl(request.profile.baseUrl);
         yield { type: "message_start", providerId: id, model: request.profile.model };
         try {
+          const authHeader = deps.getProxyAuthHeader?.(url) ?? {};
           const response = await deps.fetch(`${url}/api/chat`, {
             method: "POST",
             signal,
-            headers: { "content-type": "application/json" },
+            headers: { "content-type": "application/json", ...authHeader },
             body: JSON.stringify({
               model: request.profile.model,
               stream: true,
@@ -8563,10 +8797,11 @@ Question: ${raw.trim()}`
       },
       async embedTexts(request) {
         const url = baseUrl(request.baseUrl);
+        const authHeader = deps.getProxyAuthHeader?.(url) ?? {};
         const response = await deps.fetch(`${url}/api/embed`, {
           method: "POST",
           signal: request.signal,
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", ...authHeader },
           body: JSON.stringify({ model: request.model, input: request.texts })
         });
         if (!response.ok) {
@@ -8640,6 +8875,10 @@ Question: ${raw.trim()}`
       return messages;
     }
     if (retrieved.length === 0) return messages;
+    try {
+      deps.onRetrieved?.(retrieved);
+    } catch {
+    }
     const excerpts = retrieved.map(
       (c) => `[${c.itemKey}] <<<UNTRUSTED EXCERPT START>>>
 ${c.text}
@@ -9072,7 +9311,12 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
     }, timeoutMs);
     let payload;
     try {
-      const response = await input.fetch(url, { signal: controller.signal });
+      const proxyAuth = input.getProxyAuthHeader?.(input.baseUrl);
+      const fetchInit = {
+        signal: controller.signal,
+        ...proxyAuth !== void 0 ? { headers: proxyAuth } : {}
+      };
+      const response = await input.fetch(url, fetchInit);
       if (!response.ok)
         return { state: "ollama-missing", reason: `status ${String(response.status)}` };
       payload = await response.json();
@@ -9480,6 +9724,19 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
   function describeDisclosureFor(readProviderProfile) {
     return () => providerDisclosure(providerProfileToDisclosure(readProviderProfile()));
   }
+  function buildProxyAuthHeader(input) {
+    if (input.token === null) return void 0;
+    let parsed;
+    try {
+      parsed = new URL(input.requestBaseUrl);
+    } catch {
+      return void 0;
+    }
+    const hostMatches = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
+    if (!hostMatches) return void 0;
+    if (parsed.port !== String(input.proxyPort)) return void 0;
+    return { Authorization: `Bearer ${input.token}` };
+  }
   function maybeDumpTokens(zotero) {
     let enabled = false;
     try {
@@ -9668,7 +9925,7 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
     return { dir: "." };
   }
   async function maybeRunOnboarding(deps) {
-    const { zotero, runtime: runtime2, settings, boundFetch, prefs, prefsWriter } = deps;
+    const { zotero, runtime: runtime2, settings, boundFetch, prefs, prefsWriter, getProxyAuthHeader } = deps;
     if (readOnboardingShown(prefs)) {
       return;
     }
@@ -9682,7 +9939,8 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
         baseUrl: settings.baseUrl,
         chatModel: settings.chatModel,
         embeddingModel: settings.embeddingModel,
-        fetch: boundFetch
+        fetch: boundFetch,
+        ...getProxyAuthHeader !== void 0 ? { getProxyAuthHeader } : {}
       });
     } catch (err) {
       zotero.debug(
@@ -9761,7 +10019,8 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
               baseUrl: settings.baseUrl,
               chatModel: settings.chatModel,
               embeddingModel: settings.embeddingModel,
-              fetch: boundFetch
+              fetch: boundFetch,
+              ...getProxyAuthHeader !== void 0 ? { getProxyAuthHeader } : {}
             });
           } catch (err) {
             return {
@@ -9951,7 +10210,19 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
       );
     }
     const boundFetch = typeof fetchFn === "function" ? fetchFn.bind(globalThis) : globalThis.fetch;
-    const ollamaProvider = createOllamaProvider({ fetch: boundFetch });
+    const getProxyAuthHeader = (requestBaseUrl) => {
+      const wired = proxyWired;
+      if (wired === null) return void 0;
+      return buildProxyAuthHeader({
+        requestBaseUrl,
+        token: wired.getProxyAuthToken(),
+        proxyPort: wired.snapshot().port
+      });
+    };
+    const ollamaProvider = createOllamaProvider({
+      fetch: boundFetch,
+      getProxyAuthHeader
+    });
     const registry = createProviderRegistry([ollamaProvider]);
     const fetchForAdapters = boundFetch;
     const provider = buildChatProvider({
@@ -9992,6 +10263,7 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
     });
     void indexingController.hydrate();
     const ui = createZoteroUiAdapter({ Zotero: context.Zotero, pluginId: context.pluginId });
+    const popupRetrievalChannel = createPopupRetrievalChannel();
     const ragProvider = createRagAugmentedProvider({
       inner: provider,
       embeddingProvider,
@@ -9999,6 +10271,9 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
       embedSettings: { baseUrl: settings.embedBaseUrl, model: settings.embeddingModel },
       debug: (msg) => {
         context.Zotero.debug(`Zotero AI Explain: ${msg}`);
+      },
+      onRetrieved: (chunks) => {
+        popupRetrievalChannel.publish(chunks);
       }
     });
     const popupController = createPopupController({ store, provider: ragProvider });
@@ -10104,7 +10379,15 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
       prefsWriter: asStringPrefWriter(zotero.Prefs),
       libraryChat: libraryChatDeps,
       zotero: context.Zotero,
+      popupRetrievalChannel,
       providerProfile,
+      // Thread the proxy bearer closure into the runtime so the Save-
+      // button URL probe AND the live model-discovery dropdown attach
+      // `Authorization: Bearer <token>` when targeting the bundled
+      // proxy. Without this, the settings dialog 401s the user out of
+      // the Codex / Claude Proxy presets at validate-and-save time and
+      // at "list models" refresh time.
+      getProxyAuthHeader,
       onProviderProfileChange: (next) => {
         context.Zotero.debug(
           `Zotero AI Explain provider profile saved: chat=${next.chatProvider} embed=${next.embedProvider}. New providers take effect after a Zotero restart.`
@@ -10157,7 +10440,8 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
       settings,
       boundFetch,
       prefs: asStringPrefReader(zotero.Prefs),
-      prefsWriter: asStringPrefWriter(zotero.Prefs)
+      prefsWriter: asStringPrefWriter(zotero.Prefs),
+      getProxyAuthHeader
     });
     void runE2eDriver({
       zotero,

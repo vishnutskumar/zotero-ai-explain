@@ -338,6 +338,17 @@ export function createZoteroRuntime(deps: {
    * render as literal `[ABCD1234]` text without anchors).
    */
   readonly popupRetrievalChannel?: PopupRetrievalChannel;
+  /**
+   * Optional accessor for the bundled-proxy bearer header. When the
+   * URL the runtime is about to hit targets the local LLM proxy, the
+   * closure returns an `Authorization: Bearer <token>` header; for
+   * every other URL it returns undefined. Two runtime call sites must
+   * apply it or the proxy returns 401:
+   *   - `probeOneUrl` (Save-button URL validation via `/api/tags`).
+   *   - `discoverModels` (live model dropdown in the settings dialog).
+   * Omitted in tests / hosts that don't wire the proxy lifecycle.
+   */
+  readonly getProxyAuthHeader?: (baseUrl: string) => Record<string, string> | undefined;
 }): ZoteroRuntime {
   const cleanup: Unsubscribe[] = [];
   // Mutable cache so the next "open settings" click reflects the values
@@ -1216,6 +1227,7 @@ export function createZoteroRuntime(deps: {
     | { ok: false; field: "url" | "transport"; message: string }
   > {
     let url: URL;
+    let trimmedBase: string;
     try {
       // Preserve the path prefix of rawBaseUrl (e.g., `/codex` for the proxy
       // route) by appending `/api/tags` instead of using it as an absolute
@@ -1224,7 +1236,7 @@ export function createZoteroRuntime(deps: {
       // returns the wrong model list (the Ollama passthrough), letting
       // invalid combinations like URL=/codex + model=gemma slip past
       // validation.
-      const trimmedBase = rawBaseUrl.replace(/\/+$/u, "");
+      trimmedBase = rawBaseUrl.replace(/\/+$/u, "");
       url = new URL(`${trimmedBase}/api/tags`);
     } catch {
       return { ok: false, field: "url", message: "Not a valid URL." };
@@ -1234,7 +1246,17 @@ export function createZoteroRuntime(deps: {
       controller.abort();
     }, SETTINGS_VALIDATION_TIMEOUT_MS);
     try {
-      const response = await fetcher(url.toString(), { signal: controller.signal });
+      // Apply the bundled-proxy bearer when the URL targets the local
+      // proxy. The closure self-gates on hostname/port; for a real-
+      // Ollama-daemon URL it returns undefined and no Authorization is
+      // sent. Without this, clicking Save with a Codex/Claude Proxy URL
+      // surfaced "Server responded 401 for /api/tags".
+      const proxyAuth = deps.getProxyAuthHeader?.(trimmedBase);
+      const init: { signal: AbortSignal; headers?: Record<string, string> } = {
+        signal: controller.signal,
+        ...(proxyAuth !== undefined ? { headers: proxyAuth } : {})
+      };
+      const response = await fetcher(url.toString(), init);
       if (!response.ok) {
         return {
           ok: false,
@@ -1301,7 +1323,14 @@ export function createZoteroRuntime(deps: {
                   backend: ctx.backend,
                   url: ctx.url,
                   apiKey: ctx.apiKey,
-                  fetch: discoveryFetch
+                  fetch: discoveryFetch,
+                  // Thread the bundled-proxy bearer so listing models
+                  // against the proxy doesn't 401. The closure self-
+                  // gates on hostname/port; non-proxy URLs get no
+                  // Authorization header and behave unchanged.
+                  ...(deps.getProxyAuthHeader !== undefined
+                    ? { getProxyAuthHeader: deps.getProxyAuthHeader }
+                    : {})
                 })
             }
           }

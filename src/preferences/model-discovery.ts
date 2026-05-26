@@ -45,6 +45,15 @@ export type DiscoveryRequest = {
   readonly fetch: DiscoveryFetch;
   /** Override the per-probe timeout. Tests pass 0 for synchronous. */
   readonly timeoutMs?: number;
+  /**
+   * Optional accessor for the bundled-proxy bearer header. When the URL
+   * targets the local LLM proxy the closure returns an Authorization
+   * header; for every other URL (real Ollama daemon, direct OpenAI/
+   * Anthropic/Gemini) it returns undefined and the probe sends no bearer.
+   * Without this, listing models against the proxy returns 401 because
+   * the proxy enforces bearer auth on every route (`/api/tags` included).
+   */
+  readonly getProxyAuthHeader?: (baseUrl: string) => Record<string, string> | undefined;
 };
 
 export type DiscoveryResult =
@@ -128,9 +137,21 @@ export async function discoverModels(request: DiscoveryRequest): Promise<Discove
     let headers: Record<string, string> | undefined;
     switch (request.backend) {
       case "ollama":
-      case "proxy":
+      case "proxy": {
         fetchUrl = `${url}/api/tags`;
+        // Apply the bundled-proxy bearer when the URL targets the
+        // local proxy. The closure self-gates on hostname/port, so a
+        // real-Ollama-daemon URL (e.g. `http://localhost:11434`) gets
+        // undefined and no Authorization is sent — the daemon would
+        // otherwise reject an unexpected header on its open endpoint.
+        // We pass `url` (the trimmed base) so the closure sees the
+        // form it was wired for in the chat-adapter path.
+        const proxyAuth = request.getProxyAuthHeader?.(url);
+        if (proxyAuth !== undefined) {
+          headers = proxyAuth;
+        }
         break;
+      }
       case "openai":
         if ((request.apiKey ?? "").length === 0) {
           return { ok: false, message: "API key required to list models." };

@@ -356,6 +356,42 @@ function describeDisclosureFor(readProviderProfile: () => ProviderProfileSetting
   return () => providerDisclosure(providerProfileToDisclosure(readProviderProfile()));
 }
 
+/**
+ * Decide whether a request to `requestBaseUrl` is going to the bundled
+ * local LLM proxy and, if so, mint the `Authorization: Bearer <token>`
+ * header the proxy expects. Exported so the wiring rule is testable in
+ * isolation — the bootstrap closure that lives inside `startup()` is a
+ * one-line forward to this helper.
+ *
+ * The match policy mirrors the proxy server's allowed-hosts Set: hostname
+ * must be either `127.0.0.1` OR `localhost`, and the port must equal the
+ * proxy's currently-configured port. URL parse failures degrade to
+ * "no header" so the adapter falls back to the unauthenticated path
+ * (which is what real-Ollama-daemon callers rely on).
+ *
+ * The previous implementation matched a literal `http://127.0.0.1:<port>`
+ * prefix via `startsWith`, which silently dropped the header for the
+ * `localhost` form the proxy presets write. That caused the user-visible
+ * "missing bearer" 401 on the Codex/Claude Proxy presets.
+ */
+export function buildProxyAuthHeader(input: {
+  readonly requestBaseUrl: string;
+  readonly token: string | null;
+  readonly proxyPort: number;
+}): Record<string, string> | undefined {
+  if (input.token === null) return undefined;
+  let parsed: URL;
+  try {
+    parsed = new URL(input.requestBaseUrl);
+  } catch {
+    return undefined;
+  }
+  const hostMatches = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
+  if (!hostMatches) return undefined;
+  if (parsed.port !== String(input.proxyPort)) return undefined;
+  return { Authorization: `Bearer ${input.token}` };
+}
+
 function maybeDumpTokens(zotero: ZoteroWithPrefs): void {
   let enabled = false;
   try {
@@ -630,8 +666,18 @@ async function maybeRunOnboarding(deps: {
   readonly boundFetch: typeof fetch | undefined;
   readonly prefs: StringPrefReader;
   readonly prefsWriter: StringPrefWriter;
+  /**
+   * Optional bundled-proxy bearer accessor. A user who picked a Codex/
+   * Claude Proxy preset has `settings.baseUrl` pointing at
+   * `http://localhost:11400/codex` (applyPreset writes baseUrl ===
+   * chatBaseUrl), and the proxy enforces bearer auth on `/api/tags`.
+   * Without this the first-run probe always reported `ollama-missing`
+   * for proxy users. Closure self-gates on hostname/port; non-proxy
+   * URLs get no header.
+   */
+  readonly getProxyAuthHeader?: (baseUrl: string) => Record<string, string> | undefined;
 }): Promise<void> {
-  const { zotero, runtime, settings, boundFetch, prefs, prefsWriter } = deps;
+  const { zotero, runtime, settings, boundFetch, prefs, prefsWriter, getProxyAuthHeader } = deps;
   if (readOnboardingShown(prefs)) {
     return;
   }
@@ -645,7 +691,8 @@ async function maybeRunOnboarding(deps: {
       baseUrl: settings.baseUrl,
       chatModel: settings.chatModel,
       embeddingModel: settings.embeddingModel,
-      fetch: boundFetch
+      fetch: boundFetch,
+      ...(getProxyAuthHeader !== undefined ? { getProxyAuthHeader } : {})
     });
   } catch (err) {
     zotero.debug(
@@ -748,7 +795,8 @@ async function maybeRunOnboarding(deps: {
             baseUrl: settings.baseUrl,
             chatModel: settings.chatModel,
             embeddingModel: settings.embeddingModel,
-            fetch: boundFetch
+            fetch: boundFetch,
+            ...(getProxyAuthHeader !== undefined ? { getProxyAuthHeader } : {})
           });
         } catch (err) {
           return {
@@ -1101,16 +1149,15 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
   const getProxyAuthHeader = (requestBaseUrl: string): Record<string, string> | undefined => {
     const wired = proxyWired;
     if (wired === null) return undefined;
-    const token = wired.getProxyAuthToken();
-    if (token === null) return undefined;
-    // Match against the proxy's currently-configured port. The
-    // settings dialog can rebind the port at runtime via
-    // applyValues(), and `snapshot().port` is the single source of
-    // truth that follows those edits.
-    const proxyPort = wired.snapshot().port;
-    const proxyPrefix = `http://127.0.0.1:${String(proxyPort)}`;
-    if (!requestBaseUrl.startsWith(proxyPrefix)) return undefined;
-    return { Authorization: `Bearer ${token}` };
+    // The proxy's port is read from snapshot() on every call so a mid-
+    // session settings-dialog edit (applyValues → restart on a new
+    // port) is reflected immediately. The token accessor is similarly
+    // lazy because the token rotates on every spawn.
+    return buildProxyAuthHeader({
+      requestBaseUrl,
+      token: wired.getProxyAuthToken(),
+      proxyPort: wired.snapshot().port
+    });
   };
   const ollamaProvider = createOllamaProvider({
     fetch: boundFetch,
@@ -1332,6 +1379,13 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
     zotero: context.Zotero,
     popupRetrievalChannel,
     providerProfile,
+    // Thread the proxy bearer closure into the runtime so the Save-
+    // button URL probe AND the live model-discovery dropdown attach
+    // `Authorization: Bearer <token>` when targeting the bundled
+    // proxy. Without this, the settings dialog 401s the user out of
+    // the Codex / Claude Proxy presets at validate-and-save time and
+    // at "list models" refresh time.
+    getProxyAuthHeader,
     onProviderProfileChange: (next) => {
       context.Zotero.debug(
         `Zotero AI Explain provider profile saved: chat=${next.chatProvider} embed=${next.embedProvider}. New providers take effect after a Zotero restart.`
@@ -1405,7 +1459,8 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
     settings,
     boundFetch,
     prefs: asStringPrefReader(zotero.Prefs),
-    prefsWriter: asStringPrefWriter(zotero.Prefs)
+    prefsWriter: asStringPrefWriter(zotero.Prefs),
+    getProxyAuthHeader
   });
 
   // Optional diagnostic-driven user journey. Gated on the

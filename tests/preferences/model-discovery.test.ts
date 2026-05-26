@@ -82,6 +82,61 @@ describe("discoverModels — proxy", () => {
     expect(result.models).toEqual(["gpt-5-codex"]);
     expect(fetcher.mock.calls[0]?.[0]).toBe("http://localhost:11400/codex/api/tags");
   });
+
+  // Regression: the proxy enforces bearer auth on `/api/tags`. Without
+  // the closure, the settings-dialog "list models" dropdown 401s every
+  // user on the Codex/Claude Proxy presets. The dep is optional so
+  // legacy callers that don't wire the proxy lifecycle still work.
+  it("threads the Authorization header from getProxyAuthHeader into the fetch init", async () => {
+    const fetcher = vi.fn<DiscoveryFetch>(() =>
+      jsonResponse({ models: [{ name: "gpt-5-codex" }] })
+    );
+    const result = await discoverModels({
+      backend: "proxy",
+      url: "http://localhost:11400/codex",
+      fetch: fetcher,
+      timeoutMs: 0,
+      getProxyAuthHeader: (baseUrl) => {
+        // The trimmed URL flows through; assert here so we catch
+        // accidental trailing-slash drift in either direction.
+        expect(baseUrl).toBe("http://localhost:11400/codex");
+        return { Authorization: "Bearer proxy-token-xyz" };
+      }
+    });
+    if (!result.ok) throw new Error(`expected ok, got ${result.message}`);
+    const [, init] = fetcher.mock.calls[0] ?? [];
+    expect(init?.headers?.Authorization).toBe("Bearer proxy-token-xyz");
+  });
+
+  it("sends no Authorization header when getProxyAuthHeader returns undefined", async () => {
+    // The closure self-gates on hostname/port. A user with the Local
+    // Ollama preset (backend === ollama, but URL matches a real daemon)
+    // must NOT receive the proxy bearer because the closure returns
+    // undefined for any non-proxy host/port.
+    const fetcher = vi.fn<DiscoveryFetch>(() => jsonResponse({ models: [{ name: "gemma4:e4b" }] }));
+    const result = await discoverModels({
+      backend: "ollama",
+      url: "http://localhost:11434",
+      fetch: fetcher,
+      timeoutMs: 0,
+      getProxyAuthHeader: () => undefined
+    });
+    if (!result.ok) throw new Error("expected ok");
+    const [, init] = fetcher.mock.calls[0] ?? [];
+    expect(init?.headers).toBeUndefined();
+  });
+
+  it("omits Authorization when getProxyAuthHeader dep is not provided (backward compat)", async () => {
+    const fetcher = vi.fn<DiscoveryFetch>(() => jsonResponse({ models: [] }));
+    await discoverModels({
+      backend: "proxy",
+      url: "http://localhost:11400/codex",
+      fetch: fetcher,
+      timeoutMs: 0
+    });
+    const [, init] = fetcher.mock.calls[0] ?? [];
+    expect(init?.headers).toBeUndefined();
+  });
 });
 
 describe("discoverModels — OpenAI", () => {

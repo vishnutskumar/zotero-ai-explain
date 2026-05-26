@@ -125,9 +125,13 @@ in the Zotero error console.
 
 When the plugin auto-spawns the proxy via `src/platform/wire-proxy-lifecycle.ts`, a fresh
 `crypto.randomUUID()` token is minted per spawn and threaded into the child's environment under
-`LLM_PROXY_AUTH_TOKEN`; the chrome-side ollama adapter conditionally adds the
-`Authorization: Bearer <token>` header when its base URL matches the proxy's
-`http://127.0.0.1:<port>` prefix, and the lifecycle's diagnostics fetch threads the bearer too.
+`LLM_PROXY_AUTH_TOKEN`; the chrome-side callers (ollama chat/embed adapter, settings model-list
+discovery, Save-button validation probe, and first-run onboarding probe) all consult a shared
+`buildProxyAuthHeader(...)` helper that URL-parses the request base URL and adds the
+`Authorization: Bearer <token>` header when the hostname is either `127.0.0.1` or `localhost` at the
+proxy's configured port (so Codex/Claude Proxy presets, which use `localhost` URLs by default, match
+just as cleanly as a hand-edited `127.0.0.1` URL). The lifecycle's diagnostics fetch threads the
+bearer too.
 
 ## Wire contract
 

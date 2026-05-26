@@ -146,8 +146,13 @@ contract between the plugin and the proxy is:
   - `GET /` (route catalogue) — kept unauthenticated so a developer poking at the proxy with `curl`
     can discover the surface, and so trivial liveness probes do not need to know the token.
 
-The plugin-side wiring updates the ollama adapter to accept an optional
-`getProxyAuthHeader(baseUrl)` dep that adds `Authorization: Bearer <token>` only when the request
-URL matches the running proxy's `http://127.0.0.1:<port>` prefix (legacy callers, real-Ollama-daemon
-paths, and tests that omit the dep remain backward-compatible — no Authorization header is sent).
-The lifecycle's `diagnosticsFetch` threads the same bearer into the `/api/diagnostics` probe.
+The plugin-side wiring exposes a shared `buildProxyAuthHeader(baseUrl)` helper (exported from
+`src/bootstrap.ts`) that URL-parses the request URL and returns the `Authorization: Bearer <token>`
+header only when the hostname is either `127.0.0.1` or `localhost` at the running proxy's configured
+port. All four chrome-side callers consult it — the ollama chat/embed adapter, the settings-dialog
+model-list `discoverModels`, the Save-button `probeOneUrl` validation, and the first-run
+`probeOllamaForOnboarding` probe — so a user who picked the Codex/Claude Proxy preset (which seeds
+the base URL as `http://localhost:11400/codex` or `…/claude`) authenticates cleanly without the
+plugin requiring the URL be hand-edited to `127.0.0.1`. Legacy callers, real-Ollama-daemon paths,
+and tests that omit the dep remain backward-compatible — no Authorization header is sent. The
+lifecycle's `diagnosticsFetch` threads the same bearer into the `/api/diagnostics` probe.
