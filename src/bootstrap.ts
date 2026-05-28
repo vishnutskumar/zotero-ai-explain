@@ -833,6 +833,7 @@ function createSubprocessAdapter(zotero: ZoteroGlobal): SubprocessLike | null {
         readonly environment?: Readonly<Record<string, string>>;
         readonly environmentAppend?: boolean;
         readonly stderr?: "pipe" | "ignore" | "stdout";
+        readonly stdin?: "pipe" | "ignore" | "stdout";
       }): Promise<{
         readonly pid: number;
         wait(): Promise<{ readonly exitCode: number | null }>;
@@ -872,6 +873,13 @@ function createSubprocessAdapter(zotero: ZoteroGlobal): SubprocessLike | null {
         ...(args.environmentAppend !== undefined
           ? { environmentAppend: args.environmentAppend }
           : {}),
+        // Default to "pipe" on both stdin and stderr to match the
+        // proxy-lifecycle contract: stdin must be a real pipe so the
+        // server's parent-death detector reacts to parent close (not to
+        // a /dev/null EOF on Linux GUI launchers), and stderr is piped
+        // so the lifecycle's rolling-buffer drainer can surface crash
+        // diagnostics into the settings UI.
+        stdin: args.stdin ?? "pipe",
         stderr: args.stderr ?? "pipe"
       });
       return {
@@ -992,6 +1000,146 @@ function makeChromePathExists(zotero: ZoteroGlobal): (path: string) => boolean {
         `Zotero AI Explain: pathExists(${path}) failed ${err instanceof Error ? err.message : String(err)}`
       );
       return false;
+    }
+  };
+}
+
+/**
+ * Build a sync `listDirectory` adapter on top of chrome's nsIFile
+ * directoryEntries enumerator. Used by the nvm scan in
+ * wire-proxy-lifecycle to enumerate `~/.nvm/versions/node` (POSIX) or
+ * `~/AppData/Roaming/nvm` (NVM-Windows). Returns `[]` on missing /
+ * unreadable directories or stripped (test) chrome hosts.
+ */
+function makeChromeListDirectory(zotero: ZoteroGlobal): (path: string) => readonly string[] {
+  type NsFile = {
+    initWithPath(p: string): void;
+    exists(): boolean;
+    isDirectory(): boolean;
+    readonly directoryEntries: {
+      hasMoreElements(): boolean;
+      getNext(): unknown;
+    };
+    readonly leafName?: string;
+  };
+  type FileFactory = {
+    createInstance(iface: unknown): NsFile;
+  };
+  type ComponentsLike = {
+    readonly classes: Record<string, FileFactory>;
+    readonly interfaces: Record<string, unknown>;
+  };
+  const components = (globalThis as unknown as { readonly Components?: ComponentsLike }).Components;
+  if (components === undefined) {
+    return () => [];
+  }
+  return (path: string): readonly string[] => {
+    try {
+      const factory = components.classes["@mozilla.org/file/local;1"];
+      if (factory === undefined) return [];
+      const nsIFile = components.interfaces.nsIFile;
+      const dir = factory.createInstance(nsIFile);
+      dir.initWithPath(path);
+      if (!dir.exists() || !dir.isDirectory()) return [];
+      const entries: string[] = [];
+      const iter = dir.directoryEntries;
+      while (iter.hasMoreElements()) {
+        const next = iter.getNext() as { readonly leafName?: string } | null;
+        const leaf = next?.leafName;
+        if (typeof leaf === "string" && leaf.length > 0) entries.push(leaf);
+      }
+      return entries;
+    } catch (err) {
+      zotero.debug(
+        `Zotero AI Explain: listDirectory(${path}) failed ${err instanceof Error ? err.message : String(err)}`
+      );
+      return [];
+    }
+  };
+}
+
+/**
+ * Sync `readTextFile` adapter for tiny one-line files (specifically
+ * `~/.nvm/alias/default`). Backed by chrome's
+ * `IOUtils.readUTF8` would be async-only; we use the synchronous
+ * `nsIFileInputStream` + `nsIScriptableInputStream` chain instead so
+ * detection stays synchronous during the settings-dialog render.
+ * Returns `null` on missing / unreadable files / stripped chrome hosts.
+ */
+function makeChromeReadTextFile(zotero: ZoteroGlobal): (path: string) => string | null {
+  type NsFile = {
+    initWithPath(p: string): void;
+    exists(): boolean;
+  };
+  type FileFactory = { createInstance(iface: unknown): NsFile };
+  type StreamFactory = {
+    createInstance(iface: unknown): {
+      init(file: NsFile, ioFlags: number, perm: number, behaviorFlags: number): void;
+      close(): void;
+      readonly available?: () => number;
+    };
+  };
+  type ScriptableStreamFactory = {
+    createInstance(iface: unknown): {
+      init(stream: unknown): void;
+      read(count: number): string;
+      close(): void;
+    };
+  };
+  type ComponentsLike = {
+    readonly classes: Record<string, FileFactory | StreamFactory | ScriptableStreamFactory>;
+    readonly interfaces: Record<string, unknown>;
+  };
+  const components = (globalThis as unknown as { readonly Components?: ComponentsLike }).Components;
+  if (components === undefined) {
+    return () => null;
+  }
+  return (path: string): string | null => {
+    try {
+      const fileFactory = components.classes["@mozilla.org/file/local;1"] as
+        | FileFactory
+        | undefined;
+      const streamFactory = components.classes["@mozilla.org/network/file-input-stream;1"] as
+        | StreamFactory
+        | undefined;
+      const scriptableFactory = components.classes["@mozilla.org/scriptableinputstream;1"] as
+        | ScriptableStreamFactory
+        | undefined;
+      if (
+        fileFactory === undefined ||
+        streamFactory === undefined ||
+        scriptableFactory === undefined
+      ) {
+        return null;
+      }
+      const file = fileFactory.createInstance(components.interfaces.nsIFile);
+      file.initWithPath(path);
+      if (!file.exists()) return null;
+      const stream = streamFactory.createInstance(components.interfaces.nsIFileInputStream);
+      stream.init(file, 0x01, 0o444, 0);
+      try {
+        const scriptable = scriptableFactory.createInstance(
+          components.interfaces.nsIScriptableInputStream
+        );
+        scriptable.init(stream);
+        try {
+          // Alias files are a single short line; cap the read at 4 KiB
+          // so a stray large file never blocks startup.
+          const available = stream.available?.() ?? 4096;
+          const cap = Math.min(Math.max(available, 0), 4096);
+          if (cap === 0) return "";
+          return scriptable.read(cap);
+        } finally {
+          scriptable.close();
+        }
+      } finally {
+        stream.close();
+      }
+    } catch (err) {
+      zotero.debug(
+        `Zotero AI Explain: readTextFile(${path}) failed ${err instanceof Error ? err.message : String(err)}`
+      );
+      return null;
     }
   };
 }
@@ -1276,6 +1424,8 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
         }
       },
       pathExists: makeChromePathExists(context.Zotero),
+      listDirectory: makeChromeListDirectory(context.Zotero),
+      readTextFile: makeChromeReadTextFile(context.Zotero),
       ...(detectedHomeDir !== undefined ? { homeDir: detectedHomeDir } : {}),
       // Developer-friendly default: the user's checkout. End users can
       // override via the settings dialog; the XPI does not ship the

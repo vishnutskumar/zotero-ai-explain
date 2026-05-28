@@ -88,6 +88,8 @@ function makeFakeSubprocess(): {
     command: string;
     args: readonly string[];
     env: Readonly<Record<string, string>> | undefined;
+    stdin: string | undefined;
+    stderr: string | undefined;
   }[];
   queue: (factory: () => FakeChild | Error) => void;
   /** Queue a spawn that the test resolves manually via the returned deferred. */
@@ -98,6 +100,8 @@ function makeFakeSubprocess(): {
     command: string;
     args: readonly string[];
     env: Readonly<Record<string, string>> | undefined;
+    stdin: string | undefined;
+    stderr: string | undefined;
   }[] = [];
   const pendingChildren: FakeChild[] = [];
   const factories: (() => FakeChild | Error | Promise<FakeChild>)[] = [];
@@ -105,7 +109,9 @@ function makeFakeSubprocess(): {
     calls.push({
       command: spec.command,
       args: spec.arguments,
-      env: spec.environment
+      env: spec.environment,
+      stdin: spec.stdin,
+      stderr: spec.stderr
     });
     const factory = factories.shift();
     if (factory === undefined) {
@@ -193,6 +199,22 @@ describe("createProxyLifecycle.start", () => {
       args: ["/fake/server.mjs"]
     });
     expect(sub.calls[0]?.env).toMatchObject({ LLM_PROXY_PORT: "11400" });
+  });
+
+  it("UL-1: spawn opts explicitly include stdin: 'pipe' (Linux Subprocess auto-pipe unverified)", async () => {
+    // Mozilla's Subprocess.sys.mjs auto-pipes stdin on macOS but Linux
+    // behavior is not verified — a GUI launcher (.desktop, snap) may
+    // inherit /dev/null, which EOFs immediately and trips the proxy's
+    // stdin-EOF parent-death detector at startup. We pass `stdin: "pipe"`
+    // explicitly so the EOF only fires when the parent actually closes.
+    const sub = makeFakeSubprocess();
+    sub.queue(() => makeFakeChild(4243));
+    const lifecycle = createProxyLifecycle(baseDeps({ subprocess: sub.subprocess }));
+    await lifecycle.start();
+    expect(sub.calls).toHaveLength(1);
+    expect(sub.calls[0]?.stdin).toBe("pipe");
+    // stderr stays piped — regression guard for Bug C's rolling buffer.
+    expect(sub.calls[0]?.stderr).toBe("pipe");
   });
 
   it("returns the existing pid when already running and does not double-spawn", async () => {

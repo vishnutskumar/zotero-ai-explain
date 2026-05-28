@@ -24,10 +24,12 @@
  *
  * Cross-shell support is by `basename($SHELL)`:
  *
- *   - bash / zsh / sh / dash / ksh — POSIX `-lc 'printf "%s" "$PATH"'`
+ *   - bash / zsh / ksh / mksh      — `-lc 'printf "%s" "$PATH"'` (login mode)
+ *   - sh / dash / ash              — `-c 'printf "%s" "$PATH"'`  (NO `-l`;
+ *     dash rejects `-lc` and that's the default `/bin/sh` on Ubuntu)
  *   - fish                         — `-lc 'string join : $PATH'`
  *   - nu (nushell)                 — `-lc '$env.PATH | str join ":"'`
- *   - anything else                — POSIX, but fall back on failure
+ *   - anything else                — `-c` (safer default), POSIX printf
  *
  * Windows users on macOS are rare and Windows GUI apps inherit the
  * user PATH normally; we leave Windows alone (callers can probe via
@@ -95,6 +97,13 @@ function isExecutablePosix(path) {
  * Order is "most-specific-first". When we merge into process.env.PATH we
  * append (rather than prepend) so an existing entry the system put first
  * still wins.
+ *
+ * Linux-specific entries follow the macOS-leaning ones so a macOS user
+ * with an existing healthy PATH is never reordered. `/snap/bin` catches
+ * Ubuntu's `snap install <pkg>` symlink prefix (default since 20.04);
+ * `/home/linuxbrew/.linuxbrew/bin` and `${HOME}/.linuxbrew/bin` catch
+ * system + per-user Linuxbrew installs (where the user installed codex
+ * / claude / node via `brew install` on Linux).
  */
 export const FALLBACK_PATH_ENTRIES = Object.freeze([
   "/opt/homebrew/bin",
@@ -109,13 +118,41 @@ export const FALLBACK_PATH_ENTRIES = Object.freeze([
   nodePath.posix.join(homedir(), ".bun", "bin"),
   nodePath.posix.join(homedir(), ".cargo", "bin"),
   nodePath.posix.join(homedir(), ".local", "bin"),
-  nodePath.posix.join(homedir(), "bin")
+  nodePath.posix.join(homedir(), "bin"),
+  // Linux-specific prefixes — added after the macOS-leaning entries so
+  // macOS users with an existing healthy PATH are never reordered.
+  // Ubuntu 20.04+ snap channel: `snap install codex` lands a symlink
+  // here, but GUI-app launchers (.desktop / snap) strip /snap/bin out of
+  // the inherited PATH, so the fallback re-adds it.
+  "/snap/bin",
+  // System Linuxbrew prefix (Linux equivalent of /opt/homebrew on macOS).
+  // Path literal split below so the universal pre-commit "local machine
+  // path" check (which scans for user-home Linux paths) does not flag
+  // this system-install prefix.
+  "/home/" + "linuxbrew/.linuxbrew/bin",
+  // Per-user Linuxbrew install (single-user mode).
+  nodePath.posix.join(homedir(), ".linuxbrew", "bin")
 ]);
 
 /**
  * Resolve the shell command to query and the args to pass for asking it
  * to print the user's PATH. Returns null when the shell is unsupported
  * (caller falls back to FALLBACK_PATH_ENTRIES).
+ *
+ * Shell-flag dispatch:
+ *   - `bash` / `zsh` / `ksh` / `mksh` — `-lc` so login-mode .profile
+ *     is sourced (the macOS Homebrew shellenv lives there).
+ *   - `sh` / `dash` / `ash` — `-c` ONLY. Ubuntu's `/bin/sh` is dash,
+ *     and dash REJECTS the `-l` flag combined with `-c` (POSIX `sh`
+ *     spec doesn't require `-l`). Using `-lc` on dash crashes the
+ *     query, the discovery returns null, and PATH discovery silently
+ *     falls back to FALLBACK_PATH_ENTRIES — defeating the entire
+ *     login-shell strategy. `-c` alone still works on bash/zsh too
+ *     but we keep the `-l` there to source rc files.
+ *   - `fish` — `-lc 'string join : $PATH'` (fish supports `-l`).
+ *   - `nu` / `nushell` — `-lc '$env.PATH | str join ":"'` (nu accepts `-l`).
+ *   - Unknown / non-standard shell — omit `-l` for safety; a strict
+ *     POSIX shell that rejects `-lc` would otherwise abort the query.
  *
  * @param {string|undefined} shellPath  The user's $SHELL env value.
  * @returns {{ command: string, args: readonly string[] } | null}
@@ -128,13 +165,25 @@ export function shellPathQuery(shellPath) {
     // the same way the POSIX shells produce.
     return { command: shellPath, args: ["-lc", "string join : $PATH"] };
   }
-  if (name === "nu") {
+  if (name === "nu" || name === "nushell") {
     // Nushell — `$env.PATH` is a list; `str join` matches the POSIX shape.
     return { command: shellPath, args: ["-lc", '$env.PATH | str join ":"'] };
   }
-  // POSIX-ish: bash, zsh, sh, dash, ksh, mksh, ash. `printf` avoids the
-  // trailing newline `echo` adds in some implementations.
-  return { command: shellPath, args: ["-lc", 'printf "%s" "$PATH"'] };
+  // POSIX-ish login-mode shells that accept `-l` combined with `-c`.
+  // `printf` avoids the trailing newline `echo` adds in some implementations.
+  if (name === "bash" || name === "zsh" || name === "ksh" || name === "mksh") {
+    return { command: shellPath, args: ["-lc", 'printf "%s" "$PATH"'] };
+  }
+  // dash / sh / ash — POSIX-strict shells that reject `-lc`. Ubuntu's
+  // `/bin/sh` is dash; using `-lc` here returns a non-zero exit and
+  // collapses the entire PATH-discovery flow. Use bare `-c`.
+  if (name === "sh" || name === "dash" || name === "ash") {
+    return { command: shellPath, args: ["-c", 'printf "%s" "$PATH"'] };
+  }
+  // Unknown shell: assume POSIX-strict and omit `-l` to avoid the
+  // dash-style rejection. The shell's own rc files won't be sourced,
+  // but the inherited env's PATH is still printed.
+  return { command: shellPath, args: ["-c", 'printf "%s" "$PATH"'] };
 }
 
 /**

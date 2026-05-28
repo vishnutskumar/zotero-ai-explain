@@ -191,9 +191,11 @@ resolves the key at request time.
 For the **Codex via Proxy**, **Claude via Proxy**, and **Anthropic Direct** presets, the bundled LLM
 proxy must be running. Click **Start** in the settings dialog's _Local LLM Proxy_ section and the
 plugin spawns it for you via Mozilla's `Subprocess.sys.mjs`. It auto-detects a Node binary
-(`/opt/homebrew/bin/node` first to match Apple Silicon, then `which node`, then a fallback list); if
-auto-detection fails the dialog reveals a **Node binary path** field. The child is sent SIGTERM
-(with a 3 s grace before SIGKILL) on plugin shutdown.
+(`/opt/homebrew/bin/node` first to match Apple Silicon, then `which node`, then a fallback list that
+covers Linux apt/snap/linuxbrew, the Windows Program Files MSI, and common version managers — volta,
+asdf, fnm, n, mise, nodenv, and a directory scan of `~/.nvm/versions/node` for POSIX nvm plus
+`%APPDATA%\nvm` for NVM-Windows); if auto-detection fails the dialog reveals a **Node binary path**
+field. The child is sent SIGTERM (with a 3 s grace before SIGKILL) on plugin shutdown.
 
 For the **Local Ollama** preset you instead need `ollama serve` running on `http://localhost:11434`.
 

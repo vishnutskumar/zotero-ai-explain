@@ -98,6 +98,19 @@ export type SubprocessLike = {
     readonly environment?: Readonly<Record<string, string>>;
     readonly environmentAppend?: boolean;
     readonly stderr?: "pipe" | "ignore" | "stdout";
+    /**
+     * Stdin disposition for the spawned child. The default behavior of
+     * Mozilla's `Subprocess.sys.mjs` is platform-dependent — verified on
+     * macOS that stdin is auto-piped (callers can drive `proc.stdin`),
+     * but Linux behavior is NOT verified. On Linux GUI launchers (Zotero
+     * via .desktop file, snap, etc.) the parent has no controlling TTY
+     * and the inherited stdin may be `/dev/null`, which EOFs immediately
+     * and trips the proxy's stdin-EOF parent-death detector before the
+     * server has bound its port. Passing `"pipe"` explicitly forces a
+     * piped stdin on every platform so the EOF detector only fires when
+     * the parent actually closes the pipe.
+     */
+    readonly stdin?: "pipe" | "ignore" | "stdout";
   }): Promise<SubprocessHandle>;
 };
 
@@ -445,14 +458,19 @@ export function createProxyLifecycle(deps: ProxyLifecycleDeps): ProxyLifecycle {
       // external-management flag from a prior probe-skip.
       externallyManaged = false;
       // Mozilla's `Subprocess.sys.mjs` (the production spawn adapter)
-      // unconditionally pipes the child's stdin so callers can drive it
-      // via `proc.stdin.write()` / `.close()`. We rely on that here:
-      // the server's `installParentDeathDetector` listens for stdin EOF
-      // and self-terminates on parent death — without a piped stdin
-      // there's nothing for the kernel to close when Zotero crashes /
-      // is force-quit, and the proxy would survive as an orphan
-      // reparented to launchd/init. See
-      // `scripts/llm-proxy/server.mjs` for the EOF-handler rationale.
+      // pipes the child's stdin on macOS so callers can drive it via
+      // `proc.stdin.write()` / `.close()` — verified locally. **Linux
+      // behavior is NOT verified**: a GUI launcher (Zotero invoked from
+      // a .desktop file, snap, etc.) has no controlling TTY, and the
+      // inherited stdin may be `/dev/null` which EOFs immediately. The
+      // server's `installParentDeathDetector` listens for stdin EOF and
+      // self-terminates on parent death — if the kernel hands the child
+      // a pre-EOF'd stdin, the proxy would self-shutdown before binding
+      // its port and the user would see a confusing "exit 0, no output"
+      // failure. Passing `stdin: "pipe"` explicitly forces a piped stdin
+      // on every platform so the EOF detector only fires when Zotero
+      // actually closes the pipe (e.g. crash / force-quit). The fix is
+      // safe on macOS where stdin was already piped by default.
       const handle = await deps.subprocess.call({
         command: deps.nodeBinaryPath,
         arguments: [deps.serverScriptPath],
@@ -461,6 +479,7 @@ export function createProxyLifecycle(deps: ProxyLifecycleDeps): ProxyLifecycle {
           ...(deps.extraEnvironment ?? {})
         },
         environmentAppend: true,
+        stdin: "pipe",
         stderr: "pipe"
       });
       child = handle;

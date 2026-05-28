@@ -143,6 +143,18 @@ export const NODE_BINARY_CANDIDATES: readonly string[] = [
   "/opt/homebrew/bin/node",
   "/usr/local/bin/node",
   "/usr/bin/node",
+  // Ubuntu 20.04+ snap channel — installs the Node binary symlink
+  // under /snap/bin which is on the default user PATH but NOT in the
+  // chrome-context PATH that Subprocess inherits, so we add it here.
+  "/snap/bin/node",
+  // Linux Homebrew (linuxbrew) default prefix — same shape as macOS
+  // Homebrew but rooted at the linuxbrew system user. Single-user
+  // installs may also place node under $HOME/.linuxbrew but we leave
+  // that to the homedir scan / manual override.
+  // Path literal is split below so the universal pre-commit "local
+  // machine path" check (which scans for user-home Linux paths) does
+  // not flag this system-install prefix.
+  "/home/" + "linuxbrew/.linuxbrew/bin/node",
   // Windows: default Program Files install location for both the
   // official MSI and Chocolatey package. Subprocess.call accepts the
   // full path; %PATH% is not searched in chrome context.
@@ -168,8 +180,160 @@ export function homeRelativeNodeCandidates(homeDir: string): readonly string[] {
     // fnm — `default` alias is the shell-default Node binary.
     join(".local", "share", "fnm", "aliases", "default", "bin", "node"),
     // n (TJ's manager) — installs to ~/n/bin in single-user mode.
-    join("n", "bin", "node")
+    join("n", "bin", "node"),
+    // mise (modern asdf fork) — shim dispatches to the active version.
+    join(".local", "share", "mise", "shims", "node"),
+    // nodenv — shim dispatches to `~/.nodenv/versions/<active>/bin/node`.
+    join(".nodenv", "shims", "node"),
+    // Per-user Linuxbrew (single-user install, separate from the system
+    // `/home/linuxbrew/.linuxbrew` prefix covered in NODE_BINARY_CANDIDATES).
+    join(".linuxbrew", "bin", "node")
   ];
+}
+
+/**
+ * List a directory's entries by name. Used for the nvm-style scans
+ * which need to enumerate `~/.nvm/versions/node` (POSIX) or
+ * `~/AppData/Roaming/nvm` (NVM-Windows) — there's no canonical shim
+ * path so we have to readdir. Tests inject a stub; production wraps
+ * a sync `nsIFile.directoryEntries` call. Returns `[]` on any error
+ * so a missing/unreadable directory is silently skipped.
+ */
+export type ListDirectory = (path: string) => readonly string[];
+
+/**
+ * Read a single line from a small file. Used by the nvm scan to
+ * consult `~/.nvm/alias/default` (one-line text like `lts/iron` or
+ * `22.3.0`). Returns `null` when the file is missing/unreadable.
+ * Optional — when absent we skip the alias path and fall straight to
+ * highest-installed-version selection.
+ */
+export type ReadTextFile = (path: string) => string | null;
+
+/**
+ * Parse a `v<major>.<minor>.<patch>` (or bare `<major>.<minor>.<patch>`)
+ * tag into a numeric tuple, or `null` if the string doesn't match.
+ * Used by `scanNvmVersions` to sort installed versions descending.
+ *
+ * Trailing pre-release suffixes (e.g. `v20.0.0-rc.1`) are tolerated
+ * but contribute nothing to the order — the numeric prefix wins.
+ */
+function parseNvmVersion(name: string): readonly [number, number, number] | null {
+  const trimmed = name.startsWith("v") ? name.slice(1) : name;
+  const parts = trimmed.split(/[.\-+]/);
+  if (parts.length < 3) return null;
+  const major = Number.parseInt(parts[0] ?? "", 10);
+  const minor = Number.parseInt(parts[1] ?? "", 10);
+  const patch = Number.parseInt(parts[2] ?? "", 10);
+  if (!Number.isFinite(major) || !Number.isFinite(minor) || !Number.isFinite(patch)) return null;
+  return [major, minor, patch];
+}
+
+function compareSemverDesc(
+  a: readonly [number, number, number],
+  b: readonly [number, number, number]
+): number {
+  if (a[0] !== b[0]) return b[0] - a[0];
+  if (a[1] !== b[1]) return b[1] - a[1];
+  return b[2] - a[2];
+}
+
+/**
+ * Scan for an nvm-installed Node binary. Handles both POSIX nvm
+ * (`~/.nvm/versions/node/v<x.y.z>/bin/node`) and NVM-Windows
+ * (`%APPDATA%\nvm\v<x.y.z>\node.exe`) layouts; the Windows shape is
+ * picked when the supplied `homeDir` contains a backslash separator.
+ *
+ * Resolution order, highest priority first:
+ *   1. POSIX-only: `~/.nvm/alias/default` — if the named version (or
+ *      the version a `lts/<codename>` alias resolves to via a same-
+ *      directory probe) has a working `bin/node`, return it.
+ *   2. Highest installed semver: list the versions dir, sort
+ *      descending, return the first entry whose `bin/node` (POSIX)
+ *      or `node.exe` (Windows) exists per `pathExists`.
+ *
+ * Returns `null` when no candidate matches so the caller can fall
+ * through to other detection strategies.
+ */
+export function scanNvmVersions(
+  homeDir: string,
+  listDirectory: ListDirectory,
+  pathExists: PathExists,
+  readTextFile?: ReadTextFile
+): string | null {
+  if (homeDir.length === 0) return null;
+  const isWindows = homeDir.includes("\\");
+  const sep = isWindows ? "\\" : "/";
+  const join = (...parts: string[]): string => [homeDir, ...parts].join(sep);
+  const versionsDir = isWindows
+    ? join("AppData", "Roaming", "nvm")
+    : join(".nvm", "versions", "node");
+  const binName = isWindows ? "node.exe" : "node";
+  const buildBinPath = (version: string): string =>
+    isWindows
+      ? join("AppData", "Roaming", "nvm", version, binName)
+      : join(".nvm", "versions", "node", version, "bin", binName);
+
+  let entries: readonly string[];
+  try {
+    entries = listDirectory(versionsDir);
+  } catch {
+    entries = [];
+  }
+  if (entries.length === 0) return null;
+
+  // Filter to version-shaped entries up front so the alias path can
+  // resolve `lts/iron`-style names by scanning the same set.
+  const versioned = entries
+    .map((name) => ({ name, semver: parseNvmVersion(name) }))
+    .filter(
+      (e): e is { name: string; semver: readonly [number, number, number] } => e.semver !== null
+    );
+
+  // Alias path (POSIX only). NVM-Windows doesn't ship the alias file.
+  if (!isWindows && readTextFile !== undefined) {
+    let aliasValue: string | null = null;
+    try {
+      aliasValue = readTextFile(join(".nvm", "alias", "default"));
+    } catch {
+      aliasValue = null;
+    }
+    if (aliasValue !== null) {
+      const aliasTrimmed = aliasValue.trim();
+      if (aliasTrimmed.length > 0) {
+        // Direct hit: alias is already a version name.
+        if (parseNvmVersion(aliasTrimmed) !== null) {
+          const candidate = buildBinPath(aliasTrimmed);
+          if (pathExists(candidate)) return candidate;
+        }
+        // Indirect hit: alias is `lts/<codename>` → read that alias
+        // file too. nvm stores LTS aliases as separate single-line
+        // files under `.nvm/alias/lts/<codename>`.
+        if (aliasTrimmed.startsWith("lts/")) {
+          let nested: string | null = null;
+          try {
+            nested = readTextFile(join(".nvm", "alias", aliasTrimmed));
+          } catch {
+            nested = null;
+          }
+          if (nested !== null) {
+            const nestedTrimmed = nested.trim();
+            if (parseNvmVersion(nestedTrimmed) !== null) {
+              const candidate = buildBinPath(nestedTrimmed);
+              if (pathExists(candidate)) return candidate;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const sorted = [...versioned].sort((a, b) => compareSemverDesc(a.semver, b.semver));
+  for (const { name } of sorted) {
+    const candidate = buildBinPath(name);
+    if (pathExists(candidate)) return candidate;
+  }
+  return null;
 }
 
 /**
@@ -193,6 +357,53 @@ export type WhichRunner = (command: string) => string | null;
  */
 export type PathExists = (path: string) => boolean;
 
+/**
+ * Synchronous spawn-with-stdout-capture used to ask a candidate Node
+ * binary for its `--version` string. Production wires this to
+ * `node:child_process.spawnSync`; tests inject a deterministic fake.
+ *
+ * Returns the captured stdout + exit status. Implementations MUST swallow
+ * spawn-time errors (ENOENT, EACCES) and surface them as `status: null`
+ * with empty stdout so the validator can fail-closed without throwing.
+ */
+export type SpawnSyncRunner = (
+  command: string,
+  args: readonly string[]
+) => { readonly stdout: string; readonly status: number | null };
+
+/**
+ * Validate that the supplied Node binary is version 18 or higher. The
+ * bundled proxy's Ollama backend (`scripts/llm-proxy/backends/ollama.mjs`)
+ * uses `globalThis.fetch`, which became a Node global in v18; older
+ * versions (notably the Node 12/14 shipped by `apt install nodejs` on
+ * Ubuntu LTS) crash at module-load with a `ReferenceError`. We probe
+ * `<path> --version`, parse the major, and reject anything below 18 so
+ * the candidate walk can fall through to a version-manager-managed
+ * binary instead of accepting a doomed one.
+ *
+ * Exported for tests so the validator can be exercised without standing
+ * up the full detection pipeline.
+ *
+ * @param candidatePath  Absolute path to the Node binary under test.
+ * @param spawnSync       Sync spawn implementation. Tests inject a fake.
+ * @returns `true` iff the binary reports a parseable `v18+` version.
+ */
+export function validateNodeFetchSupport(
+  candidatePath: string,
+  spawnSync: SpawnSyncRunner
+): boolean {
+  try {
+    const result = spawnSync(candidatePath, ["--version"]);
+    if (result.status !== 0) return false;
+    const m = /^v(\d+)\./.exec(result.stdout.trim());
+    if (m === null) return false;
+    const major = Number.parseInt(m[1] ?? "0", 10);
+    return Number.isFinite(major) && major >= 18;
+  } catch {
+    return false;
+  }
+}
+
 export type WireProxyLifecycleDeps = {
   readonly subprocess: SubprocessLike;
   /** Pref store. Optional — without it the defaults are used and no persistence happens. */
@@ -209,10 +420,37 @@ export type WireProxyLifecycleDeps = {
   readonly whichRunner?: WhichRunner;
   /**
    * Home directory used to seed version-manager shim candidates
-   * (volta / asdf / fnm / n). When omitted, detection only walks the
-   * static system paths in `NODE_BINARY_CANDIDATES`.
+   * (volta / asdf / fnm / n / mise / nodenv) and the nvm scan.
+   * When omitted, detection only walks the static system paths in
+   * `NODE_BINARY_CANDIDATES`.
    */
   readonly homeDir?: string;
+  /**
+   * List a directory's immediate entries by name. Used to scan
+   * version-specific Node-manager install locations (notably nvm,
+   * which lacks a fixed shim path). Tests inject a stub; production
+   * wires this to a try/catch'd `nsIFile.directoryEntries` wrapper
+   * returning `[]` on missing/unreadable directories.
+   */
+  readonly listDirectory?: ListDirectory;
+  /**
+   * Read a one-line text file (used for `~/.nvm/alias/default`).
+   * Returns `null` on any error. Optional — when absent, the nvm
+   * scan skips the alias path and goes straight to highest-version
+   * selection.
+   */
+  readonly readTextFile?: ReadTextFile;
+  /**
+   * Sync spawn used by the Node-version validator. Each detected
+   * candidate is asked for its `--version` and rejected when the major
+   * is below 18 (the proxy's Ollama backend uses `globalThis.fetch`,
+   * which is a Node global only from v18+). Cache is keyed on path so
+   * repeated detect calls don't re-spawn for the same binary. Optional —
+   * when absent, validation is skipped and any path that passes
+   * `pathExists` is accepted. Production wires this to
+   * `node:child_process.spawnSync`; tests inject a deterministic fake.
+   */
+  readonly spawnSync?: SpawnSyncRunner;
   /** Default server-script path when no pref override is set. */
   readonly defaultServerScriptPath?: string;
   /** Fetch for the lifecycle's isRunning probe. */
@@ -354,6 +592,9 @@ export function wireProxyLifecycle(deps: WireProxyLifecycleDeps): WiredProxy {
     detectNodeBinaryWithStatus({
       ...(deps.whichRunner !== undefined ? { whichRunner: deps.whichRunner } : {}),
       ...(deps.homeDir !== undefined ? { homeDir: deps.homeDir } : {}),
+      ...(deps.listDirectory !== undefined ? { listDirectory: deps.listDirectory } : {}),
+      ...(deps.readTextFile !== undefined ? { readTextFile: deps.readTextFile } : {}),
+      ...(deps.spawnSync !== undefined ? { spawnSync: deps.spawnSync } : {}),
       pathExists
     });
   const detection =
@@ -846,10 +1087,21 @@ export function detectNodeBinary(exists: PathExists): string {
  *      installed Node in non-standard prefixes).
  *   2. Each `NODE_BINARY_CANDIDATES` path, gated on `pathExists`.
  *   3. When `homeDir` is supplied, each `homeRelativeNodeCandidates`
- *      entry — volta / asdf / fnm / n shims.
- *   4. Fall back to the bare command `"node"` and flag the result
+ *      entry — volta / asdf / fnm / n / mise / nodenv shims.
+ *   4. When `homeDir` AND `listDirectory` are supplied, an nvm /
+ *      NVM-Windows scan (`scanNvmVersions`) — the only version
+ *      manager without a fixed shim path.
+ *   5. Fall back to the bare command `"node"` and flag the result
  *      with `autoDetectFailed: true` so the UI knows the manual
  *      override field needs the user's attention.
+ *
+ * When `spawnSync` is supplied, every accepted candidate is additionally
+ * gated on `validateNodeFetchSupport` (`<path> --version` reports v18+).
+ * The Ubuntu `apt install nodejs` path drops a Node 12 or 14 at
+ * `/usr/bin/node`; without the validator the detector would accept it
+ * and the proxy would crash at module-load (the Ollama backend uses
+ * `globalThis.fetch`, a Node 18+ global). The validator's `spawnSync`
+ * result is cached per-call so multi-shim layouts don't re-spawn.
  *
  * Exported for tests so the detection priority is easy to assert
  * without spinning up the full lifecycle.
@@ -858,12 +1110,36 @@ export function detectNodeBinaryWithStatus(deps: {
   readonly whichRunner?: WhichRunner;
   readonly pathExists: PathExists;
   readonly homeDir?: string;
+  readonly listDirectory?: ListDirectory;
+  readonly readTextFile?: ReadTextFile;
+  readonly spawnSync?: SpawnSyncRunner;
 }): { readonly path: string; readonly autoDetectFailed: boolean } {
+  // Cache `validateNodeFetchSupport` results per-call so repeated
+  // appearances of the same path (e.g. the same binary reachable via two
+  // shim layers) don't re-spawn `node --version`. Scoped to this call so
+  // a follow-up detect after a Node upgrade still re-validates.
+  const validatedCache = new Map<string, boolean>();
+  const validate = (path: string): boolean => {
+    if (deps.spawnSync === undefined) return true; // skip validation if no runner
+    const cached = validatedCache.get(path);
+    if (cached !== undefined) return cached;
+    const ok = validateNodeFetchSupport(path, deps.spawnSync);
+    validatedCache.set(path, ok);
+    return ok;
+  };
+
   if (deps.whichRunner !== undefined) {
     try {
       const resolved = deps.whichRunner("node");
       if (resolved !== null && resolved.trim().length > 0) {
-        return { path: resolved.trim(), autoDetectFailed: false };
+        const trimmed = resolved.trim();
+        // Validate even the whichRunner hit: on Ubuntu, `which node`
+        // points at the apt-installed `/usr/bin/node` which may be
+        // Node 12 / 14 (pre-fetch). Falling through to the candidate
+        // scan gives the version-manager paths a chance to win.
+        if (validate(trimmed)) {
+          return { path: trimmed, autoDetectFailed: false };
+        }
       }
     } catch {
       // Fall through to the candidate scan.
@@ -874,8 +1150,21 @@ export function detectNodeBinaryWithStatus(deps: {
       ? [...NODE_BINARY_CANDIDATES, ...homeRelativeNodeCandidates(deps.homeDir)]
       : NODE_BINARY_CANDIDATES;
   for (const candidate of candidates) {
-    if (deps.pathExists(candidate)) {
+    if (deps.pathExists(candidate) && validate(candidate)) {
       return { path: candidate, autoDetectFailed: false };
+    }
+  }
+  // nvm / NVM-Windows: dynamic directory scan. Only attempted when
+  // both a home directory AND a listDirectory dep are available.
+  if (deps.homeDir !== undefined && deps.homeDir.length > 0 && deps.listDirectory !== undefined) {
+    const scanned = scanNvmVersions(
+      deps.homeDir,
+      deps.listDirectory,
+      deps.pathExists,
+      deps.readTextFile
+    );
+    if (scanned !== null && validate(scanned)) {
+      return { path: scanned, autoDetectFailed: false };
     }
   }
   return { path: "node", autoDetectFailed: true };

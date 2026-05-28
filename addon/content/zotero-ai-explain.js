@@ -6460,6 +6460,7 @@ Question: First question about the passage?`
             ...deps.extraEnvironment ?? {}
           },
           environmentAppend: true,
+          stdin: "pipe",
           stderr: "pipe"
         });
         child = handle;
@@ -6646,6 +6647,18 @@ Question: First question about the passage?`
     "/opt/homebrew/bin/node",
     "/usr/local/bin/node",
     "/usr/bin/node",
+    // Ubuntu 20.04+ snap channel — installs the Node binary symlink
+    // under /snap/bin which is on the default user PATH but NOT in the
+    // chrome-context PATH that Subprocess inherits, so we add it here.
+    "/snap/bin/node",
+    // Linux Homebrew (linuxbrew) default prefix — same shape as macOS
+    // Homebrew but rooted at the linuxbrew system user. Single-user
+    // installs may also place node under $HOME/.linuxbrew but we leave
+    // that to the homedir scan / manual override.
+    // Path literal is split below so the universal pre-commit "local
+    // machine path" check (which scans for user-home Linux paths) does
+    // not flag this system-install prefix.
+    "/home/linuxbrew/.linuxbrew/bin/node",
     // Windows: default Program Files install location for both the
     // official MSI and Chocolatey package. Subprocess.call accepts the
     // full path; %PATH% is not searched in chrome context.
@@ -6664,8 +6677,99 @@ Question: First question about the passage?`
       // fnm — `default` alias is the shell-default Node binary.
       join(".local", "share", "fnm", "aliases", "default", "bin", "node"),
       // n (TJ's manager) — installs to ~/n/bin in single-user mode.
-      join("n", "bin", "node")
+      join("n", "bin", "node"),
+      // mise (modern asdf fork) — shim dispatches to the active version.
+      join(".local", "share", "mise", "shims", "node"),
+      // nodenv — shim dispatches to `~/.nodenv/versions/<active>/bin/node`.
+      join(".nodenv", "shims", "node"),
+      // Per-user Linuxbrew (single-user install, separate from the system
+      // `/home/linuxbrew/.linuxbrew` prefix covered in NODE_BINARY_CANDIDATES).
+      join(".linuxbrew", "bin", "node")
     ];
+  }
+  function parseNvmVersion(name) {
+    const trimmed = name.startsWith("v") ? name.slice(1) : name;
+    const parts = trimmed.split(/[.\-+]/);
+    if (parts.length < 3) return null;
+    const major = Number.parseInt(parts[0] ?? "", 10);
+    const minor = Number.parseInt(parts[1] ?? "", 10);
+    const patch = Number.parseInt(parts[2] ?? "", 10);
+    if (!Number.isFinite(major) || !Number.isFinite(minor) || !Number.isFinite(patch)) return null;
+    return [major, minor, patch];
+  }
+  function compareSemverDesc(a, b) {
+    if (a[0] !== b[0]) return b[0] - a[0];
+    if (a[1] !== b[1]) return b[1] - a[1];
+    return b[2] - a[2];
+  }
+  function scanNvmVersions(homeDir, listDirectory, pathExists, readTextFile) {
+    if (homeDir.length === 0) return null;
+    const isWindows = homeDir.includes("\\");
+    const sep = isWindows ? "\\" : "/";
+    const join = (...parts) => [homeDir, ...parts].join(sep);
+    const versionsDir = isWindows ? join("AppData", "Roaming", "nvm") : join(".nvm", "versions", "node");
+    const binName = isWindows ? "node.exe" : "node";
+    const buildBinPath = (version) => isWindows ? join("AppData", "Roaming", "nvm", version, binName) : join(".nvm", "versions", "node", version, "bin", binName);
+    let entries;
+    try {
+      entries = listDirectory(versionsDir);
+    } catch {
+      entries = [];
+    }
+    if (entries.length === 0) return null;
+    const versioned = entries.map((name) => ({ name, semver: parseNvmVersion(name) })).filter(
+      (e) => e.semver !== null
+    );
+    if (!isWindows && readTextFile !== void 0) {
+      let aliasValue = null;
+      try {
+        aliasValue = readTextFile(join(".nvm", "alias", "default"));
+      } catch {
+        aliasValue = null;
+      }
+      if (aliasValue !== null) {
+        const aliasTrimmed = aliasValue.trim();
+        if (aliasTrimmed.length > 0) {
+          if (parseNvmVersion(aliasTrimmed) !== null) {
+            const candidate = buildBinPath(aliasTrimmed);
+            if (pathExists(candidate)) return candidate;
+          }
+          if (aliasTrimmed.startsWith("lts/")) {
+            let nested = null;
+            try {
+              nested = readTextFile(join(".nvm", "alias", aliasTrimmed));
+            } catch {
+              nested = null;
+            }
+            if (nested !== null) {
+              const nestedTrimmed = nested.trim();
+              if (parseNvmVersion(nestedTrimmed) !== null) {
+                const candidate = buildBinPath(nestedTrimmed);
+                if (pathExists(candidate)) return candidate;
+              }
+            }
+          }
+        }
+      }
+    }
+    const sorted = [...versioned].sort((a, b) => compareSemverDesc(a.semver, b.semver));
+    for (const { name } of sorted) {
+      const candidate = buildBinPath(name);
+      if (pathExists(candidate)) return candidate;
+    }
+    return null;
+  }
+  function validateNodeFetchSupport(candidatePath, spawnSync) {
+    try {
+      const result = spawnSync(candidatePath, ["--version"]);
+      if (result.status !== 0) return false;
+      const m = /^v(\d+)\./.exec(result.stdout.trim());
+      if (m === null) return false;
+      const major = Number.parseInt(m[1] ?? "0", 10);
+      return Number.isFinite(major) && major >= 18;
+    } catch {
+      return false;
+    }
   }
   function wireProxyLifecycle(deps) {
     const debug = deps.debug ?? (() => void 0);
@@ -6678,6 +6782,9 @@ Question: First question about the passage?`
     const runDetection = () => detectNodeBinaryWithStatus({
       ...deps.whichRunner !== void 0 ? { whichRunner: deps.whichRunner } : {},
       ...deps.homeDir !== void 0 ? { homeDir: deps.homeDir } : {},
+      ...deps.listDirectory !== void 0 ? { listDirectory: deps.listDirectory } : {},
+      ...deps.readTextFile !== void 0 ? { readTextFile: deps.readTextFile } : {},
+      ...deps.spawnSync !== void 0 ? { spawnSync: deps.spawnSync } : {},
       pathExists
     });
     const detection = persistedNode !== void 0 ? { path: persistedNode, autoDetectFailed: false } : runDetection();
@@ -6972,19 +7079,42 @@ Question: First question about the passage?`
     };
   }
   function detectNodeBinaryWithStatus(deps) {
+    const validatedCache = /* @__PURE__ */ new Map();
+    const validate = (path) => {
+      if (deps.spawnSync === void 0) return true;
+      const cached = validatedCache.get(path);
+      if (cached !== void 0) return cached;
+      const ok = validateNodeFetchSupport(path, deps.spawnSync);
+      validatedCache.set(path, ok);
+      return ok;
+    };
     if (deps.whichRunner !== void 0) {
       try {
         const resolved = deps.whichRunner("node");
         if (resolved !== null && resolved.trim().length > 0) {
-          return { path: resolved.trim(), autoDetectFailed: false };
+          const trimmed = resolved.trim();
+          if (validate(trimmed)) {
+            return { path: trimmed, autoDetectFailed: false };
+          }
         }
       } catch {
       }
     }
     const candidates = deps.homeDir !== void 0 && deps.homeDir.length > 0 ? [...NODE_BINARY_CANDIDATES, ...homeRelativeNodeCandidates(deps.homeDir)] : NODE_BINARY_CANDIDATES;
     for (const candidate of candidates) {
-      if (deps.pathExists(candidate)) {
+      if (deps.pathExists(candidate) && validate(candidate)) {
         return { path: candidate, autoDetectFailed: false };
+      }
+    }
+    if (deps.homeDir !== void 0 && deps.homeDir.length > 0 && deps.listDirectory !== void 0) {
+      const scanned = scanNvmVersions(
+        deps.homeDir,
+        deps.listDirectory,
+        deps.pathExists,
+        deps.readTextFile
+      );
+      if (scanned !== null && validate(scanned)) {
+        return { path: scanned, autoDetectFailed: false };
       }
     }
     return { path: "node", autoDetectFailed: true };
@@ -10072,6 +10202,13 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
           arguments: args.arguments,
           ...args.environment !== void 0 ? { environment: args.environment } : {},
           ...args.environmentAppend !== void 0 ? { environmentAppend: args.environmentAppend } : {},
+          // Default to "pipe" on both stdin and stderr to match the
+          // proxy-lifecycle contract: stdin must be a real pipe so the
+          // server's parent-death detector reacts to parent close (not to
+          // a /dev/null EOF on Linux GUI launchers), and stderr is piped
+          // so the lifecycle's rolling-buffer drainer can surface crash
+          // diagnostics into the settings UI.
+          stdin: args.stdin ?? "pipe",
           stderr: args.stderr ?? "pipe"
         });
         return {
@@ -10138,6 +10275,77 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
           `Zotero AI Explain: pathExists(${path}) failed ${err instanceof Error ? err.message : String(err)}`
         );
         return false;
+      }
+    };
+  }
+  function makeChromeListDirectory(zotero) {
+    const components = globalThis.Components;
+    if (components === void 0) {
+      return () => [];
+    }
+    return (path) => {
+      try {
+        const factory = components.classes["@mozilla.org/file/local;1"];
+        if (factory === void 0) return [];
+        const nsIFile = components.interfaces.nsIFile;
+        const dir = factory.createInstance(nsIFile);
+        dir.initWithPath(path);
+        if (!dir.exists() || !dir.isDirectory()) return [];
+        const entries = [];
+        const iter = dir.directoryEntries;
+        while (iter.hasMoreElements()) {
+          const next = iter.getNext();
+          const leaf = next?.leafName;
+          if (typeof leaf === "string" && leaf.length > 0) entries.push(leaf);
+        }
+        return entries;
+      } catch (err) {
+        zotero.debug(
+          `Zotero AI Explain: listDirectory(${path}) failed ${err instanceof Error ? err.message : String(err)}`
+        );
+        return [];
+      }
+    };
+  }
+  function makeChromeReadTextFile(zotero) {
+    const components = globalThis.Components;
+    if (components === void 0) {
+      return () => null;
+    }
+    return (path) => {
+      try {
+        const fileFactory = components.classes["@mozilla.org/file/local;1"];
+        const streamFactory = components.classes["@mozilla.org/network/file-input-stream;1"];
+        const scriptableFactory = components.classes["@mozilla.org/scriptableinputstream;1"];
+        if (fileFactory === void 0 || streamFactory === void 0 || scriptableFactory === void 0) {
+          return null;
+        }
+        const file = fileFactory.createInstance(components.interfaces.nsIFile);
+        file.initWithPath(path);
+        if (!file.exists()) return null;
+        const stream = streamFactory.createInstance(components.interfaces.nsIFileInputStream);
+        stream.init(file, 1, 292, 0);
+        try {
+          const scriptable = scriptableFactory.createInstance(
+            components.interfaces.nsIScriptableInputStream
+          );
+          scriptable.init(stream);
+          try {
+            const available = stream.available?.() ?? 4096;
+            const cap = Math.min(Math.max(available, 0), 4096);
+            if (cap === 0) return "";
+            return scriptable.read(cap);
+          } finally {
+            scriptable.close();
+          }
+        } finally {
+          stream.close();
+        }
+      } catch (err) {
+        zotero.debug(
+          `Zotero AI Explain: readTextFile(${path}) failed ${err instanceof Error ? err.message : String(err)}`
+        );
+        return null;
       }
     };
   }
@@ -10305,6 +10513,8 @@ When you rely on an excerpt, cite its item key in square brackets, e.g. "X is tr
           }
         },
         pathExists: makeChromePathExists(context.Zotero),
+        listDirectory: makeChromeListDirectory(context.Zotero),
+        readTextFile: makeChromeReadTextFile(context.Zotero),
         ...detectedHomeDir !== void 0 ? { homeDir: detectedHomeDir } : {},
         // Developer-friendly default: the user's checkout. End users can
         // override via the settings dialog; the XPI does not ship the
