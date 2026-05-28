@@ -129,7 +129,7 @@ install the ones that match the preset you intend to use.
 | **Claude Code CLI** | Latest stable      | When using the **Claude Code Proxy** preset (drives your Claude subscription through the bundled proxy).                                                                                      | `npm install -g @anthropic-ai/claude-code` (or per the Claude Code README); run `claude` once to authenticate.                                           |
 | **API key**         | Provider-issued    | When using **OpenAI**, **Anthropic**, or **Gemini** presets directly (no local proxy). The plugin stores secret-references, never plaintext.                                                  | Get a key from your provider's console and paste it into the settings dialog.                                                                            |
 
-CI pins **Node 22.22.3** and **Ollama 0.24.0** as the validated combination. The plugin's runtime
+CI pins **Node 22.22.3** and **Ollama 0.23.4** as the validated combination. The plugin's runtime
 floor is **Node 22.x LTS** (matches the bundle target) and **Ollama 0.10.0** (matches the
 `MIN_OLLAMA_VERSION` constant in `src/preferences/ollama-version.ts`); the settings dialog surfaces
 a warning when your Ollama daemon reports a version below the floor.
