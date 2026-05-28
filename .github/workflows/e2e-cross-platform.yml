@@ -221,11 +221,14 @@ jobs:
         run: |
           set -euxo pipefail
           # Pin via direct binary download — `install.sh` floats @latest.
-          BIN_URL="https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-amd64.tgz"
-          TGZ="$RUNNER_TEMP/ollama.tgz"
-          curl -fsSL "$BIN_URL" -o "$TGZ"
+          # Ollama 0.7+ ships Linux as zstd-compressed tar (.tar.zst), not
+          # gzip-compressed (.tgz). Ubuntu's tar supports --zstd natively
+          # (zstd binary is preinstalled on actions/runner ubuntu-latest).
+          BIN_URL="https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-amd64.tar.zst"
+          TARBALL="$RUNNER_TEMP/ollama.tar.zst"
+          curl -fsSL "$BIN_URL" -o "$TARBALL"
           sudo mkdir -p /usr/local/ollama
-          sudo tar -xzf "$TGZ" -C /usr/local/ollama
+          sudo tar --zstd -xf "$TARBALL" -C /usr/local/ollama
           sudo ln -sf /usr/local/ollama/bin/ollama /usr/local/bin/ollama
           ollama --version
 
