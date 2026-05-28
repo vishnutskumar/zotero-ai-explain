@@ -238,7 +238,13 @@ async function startProxy(text: string): Promise<Spawned> {
       // Ignored if not honored; falls back to the default banner.
       LLM_PROXY_QUIET: "1"
     },
-    stdio: ["ignore", "pipe", "pipe"]
+    // stdin MUST be a pipe (not "ignore") so the proxy's
+    // `installParentDeathDetector` sees an open stdin at startup.
+    // `"ignore"` connects stdin to /dev/null, which triggers immediate
+    // EOF and self-shutdown — see `scripts/llm-proxy/server.mjs`.
+    // The test never writes to stdin; the pipe stays open until we kill
+    // the child in `stopProxy()`.
+    stdio: ["pipe", "pipe", "pipe"]
   });
   // `stdio: pipe` makes these streams non-null in the inferred type.
   const { stdout, stderr } = child;

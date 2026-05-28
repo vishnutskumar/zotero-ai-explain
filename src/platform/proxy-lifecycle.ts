@@ -444,6 +444,15 @@ export function createProxyLifecycle(deps: ProxyLifecycleDeps): ProxyLifecycle {
       // We're claiming ownership with a fresh spawn — drop any stale
       // external-management flag from a prior probe-skip.
       externallyManaged = false;
+      // Mozilla's `Subprocess.sys.mjs` (the production spawn adapter)
+      // unconditionally pipes the child's stdin so callers can drive it
+      // via `proc.stdin.write()` / `.close()`. We rely on that here:
+      // the server's `installParentDeathDetector` listens for stdin EOF
+      // and self-terminates on parent death — without a piped stdin
+      // there's nothing for the kernel to close when Zotero crashes /
+      // is force-quit, and the proxy would survive as an orphan
+      // reparented to launchd/init. See
+      // `scripts/llm-proxy/server.mjs` for the EOF-handler rationale.
       const handle = await deps.subprocess.call({
         command: deps.nodeBinaryPath,
         arguments: [deps.serverScriptPath],

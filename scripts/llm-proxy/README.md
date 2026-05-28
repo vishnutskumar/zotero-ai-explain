@@ -103,10 +103,13 @@ The proxy enforces three defense layers on the sensitive routes (`/codex|claude|
 
 Two routes are **exempt from bearer auth** (still Host/Origin gated):
 
-- `POST /api/shutdown` — preserves the orphan-takeover path. When the plugin starts after a Zotero
-  crash leaves an old proxy listening on the configured port, it cannot know the orphan's token; the
-  Host/Origin gates still prevent network attackers, and DoS via shutdown is acceptable on a
-  single-user desktop.
+- `POST /api/shutdown` — preserves the orphan-takeover path. Under normal operation the proxy
+  self-terminates on stdin EOF when Zotero exits or is killed (see
+  [Parent-death detection](#parent-death-detection) below), but on Windows the named-pipe semantics
+  differ and stdin-EOF detection is not guaranteed; if an orphan proxy is ever left listening on the
+  configured port, the new plugin instance cannot know the orphan's token, so this route must remain
+  bearer-exempt. Host/Origin gates still prevent network attackers, and DoS via shutdown is
+  acceptable on a single-user desktop.
 - `GET /` — the route catalogue is intentionally unauthenticated so a developer poking at the proxy
   with `curl` can discover the surface.
 
@@ -414,6 +417,26 @@ curl http://127.0.0.1:11400/api/tags
   [Authentication](#authentication) for the orphan-takeover rationale. They remain Host/Origin
   gated.
 - Forwards request bodies verbatim. Do not place the proxy behind a public reverse proxy.
+
+## Parent-death detection
+
+The proxy self-terminates when its parent process (Zotero) exits, crashes, or is OS-killed. macOS
+does not expose Linux's `PR_SET_PDEATHSIG`, so the cross-platform parent-death signal the proxy
+relies on is **stdin EOF**: when the parent closes its end of the proxy's stdin pipe (or the kernel
+closes it on parent death), Node emits `'end'` on `process.stdin`, and the proxy runs the shared
+idempotent `shutdown("stdin-eof")` — closing the HTTP server and exiting `0`. A single-shot guard
+makes the shutdown safe under concurrent EOF + SIGTERM.
+
+Implications for callers:
+
+- Mozilla's `Subprocess.sys.mjs` (the plugin's spawn path) unconditionally pipes stdin, so the
+  detector works under normal operation.
+- Manual smoke runs (`npm run proxy:llm`) keep their terminal stdin open and behave unchanged. Tests
+  or scripts that spawn the server with `stdio: ["ignore", ...]` will trigger immediate
+  self-shutdown at startup (stdin is routed to `/dev/null`, which the proxy reads as EOF); use
+  `"pipe"` and keep the parent-side handle open instead.
+- Windows named-pipe semantics differ from POSIX. The new tests skip on Windows; the
+  `POST /api/shutdown` orphan-takeover path covers that platform.
 
 ## Implementation notes
 

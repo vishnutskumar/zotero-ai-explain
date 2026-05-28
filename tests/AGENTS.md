@@ -56,7 +56,11 @@ tests/
   `tests/providers/adapters/ollama.test.ts` (B1/B2: `getProxyAuthHeader` dep is honoured and
   omitted-dep stays backward-compatible) and `tests/platform/wire-proxy-lifecycle.test.ts` (C1–C6:
   per-spawn UUID rotation, parent/child env round-trip through the shared `LLM_PROXY_AUTH_TOKEN_ENV`
-  constant, and `diagnosticsFetch` bearer).
+  constant, and `diagnosticsFetch` bearer). Parent-death self-shutdown is covered by
+  `tests/scripts/llm-proxy-stdin-shutdown.test.ts` (SE-1/SE-2/SE-3: real-subprocess spawns that
+  close stdin and assert the child exits 0, logs the `stdin-eof` signal name, and survives a
+  concurrent SIGTERM via the single-shot guard; POSIX-only — Windows is covered by the
+  `POST /api/shutdown` orphan-takeover path).
 
 ## Extending
 

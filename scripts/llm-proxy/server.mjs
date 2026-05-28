@@ -749,6 +749,46 @@ export function createProxyServer(deps = {}) {
   };
 }
 
+/**
+ * Cross-platform "parent-died" detector.
+ *
+ * macOS has no `prctl(PR_SET_PDEATHSIG)` and POSIX has no automatic
+ * child-cleanup on parent death; when Zotero is force-quit / crashes
+ * / OS-killed, the proxy is reparented to launchd (PID 1) and survives
+ * as an orphan holding the configured port. The plugin's clean-exit JS
+ * callback only fires on a graceful Zotero shutdown, so orphans
+ * accumulate across crashes.
+ *
+ * The reliable cross-platform trick: when the parent process dies, the
+ * OS closes the writable end of any pipe the parent had to the child's
+ * stdin. The child then sees stdin emit `'end'` (clean EOF) or
+ * `'error'` (rare; e.g. EBADF). Mozilla's `Subprocess.sys.mjs` always
+ * spawns children with stdin as a pipe (it's a writable stream on
+ * `proc.stdin`), so the EOF arrives reliably under chrome.
+ *
+ * Edge cases:
+ *   - `node server.mjs < /dev/null`: stdin EOFs immediately at startup.
+ *     This is intended — no parent is writing, so there's nothing to
+ *     wait on. The dev workflow (`npm run proxy:llm` from a terminal)
+ *     keeps a TTY attached, so EOF only arrives on Ctrl-D.
+ *   - Concurrent SIGTERM + EOF: the caller's `shutdownFn` MUST be
+ *     idempotent (single-shot). See the `shuttingDown` guard below.
+ *
+ * Without `process.stdin.resume()` Node's default-paused stdin never
+ * emits `'end'` — the kernel-level EOF is buffered but the JS event
+ * loop never observes it. `.resume()` opts in to the byte stream.
+ *
+ * @param {(signal: string) => void} shutdownFn
+ */
+function installParentDeathDetector(shutdownFn) {
+  process.stdin.on("end", () => shutdownFn("stdin-eof"));
+  process.stdin.on("error", (err) => {
+    console.error(`zotero-ai-llm-proxy: stdin error: ${err?.message ?? String(err)}`);
+    shutdownFn("stdin-error");
+  });
+  process.stdin.resume();
+}
+
 // Entrypoint: only run when invoked directly (node scripts/llm-proxy/server.mjs).
 // `file://${process.argv[1]}` would naively concatenate a Windows-style
 // `D:\a\...` path into a URL, producing unescaped backslashes that don't
@@ -788,12 +828,20 @@ if (isDirect) {
         }
       );
 
+      // Single-shot guard: EOF on stdin may arrive concurrently with a
+      // SIGTERM the lifecycle controller is sending. Both code paths call
+      // `shutdown`, so without a guard we'd hit `process.exit(0)` twice
+      // (the second after `proxy.close()` resolves on a torn-down server).
+      let shuttingDown = false;
       const shutdown = (signal) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
         console.log(`zotero-ai-llm-proxy: received ${signal}, shutting down`);
         proxy.close().then(() => process.exit(0));
       };
       process.on("SIGINT", () => shutdown("SIGINT"));
       process.on("SIGTERM", () => shutdown("SIGTERM"));
+      installParentDeathDetector(shutdown);
     },
     (err) => {
       // enrichEnvironmentPath promises to never reject, but defend in

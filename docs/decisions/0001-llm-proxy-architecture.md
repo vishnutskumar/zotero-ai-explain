@@ -156,3 +156,14 @@ the base URL as `http://localhost:11400/codex` or `…/claude`) authenticates cl
 plugin requiring the URL be hand-edited to `127.0.0.1`. Legacy callers, real-Ollama-daemon paths,
 and tests that omit the dep remain backward-compatible — no Authorization header is sent. The
 lifecycle's `diagnosticsFetch` threads the same bearer into the `/api/diagnostics` probe.
+
+## Addendum — 2026-05-26: Parent-death self-shutdown
+
+The proxy now self-terminates when its parent (Zotero) exits, crashes, or is OS-killed by listening
+for stdin EOF — the cross-platform parent-death signal that works where macOS lacks Linux's
+`PR_SET_PDEATHSIG`. Mozilla's `Subprocess.sys.mjs` always pipes stdin, so the kernel closes the
+proxy's stdin pipe on parent death; Node emits `'end'` on `process.stdin` and the proxy runs the
+shared idempotent `shutdown("stdin-eof")`. A single-shot guard makes the shutdown safe under
+concurrent EOF + SIGTERM. Windows named-pipe semantics differ from POSIX and stdin-EOF detection is
+not validated there; the bearer-exempt `POST /api/shutdown` orphan-takeover path remains the
+fallback for that platform and for any other case where the proxy outlives its parent.
