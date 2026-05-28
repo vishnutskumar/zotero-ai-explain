@@ -145,13 +145,13 @@ npm run package    # zip addon/ + bundled llm-proxy/ → zotero-ai-explain.xpi
 Then install the freshly built `zotero-ai-explain.xpi` via the same **Tools → Plugins → gear menu →
 Install Plugin From File…** flow.
 
-Local builds carry a `-dev` suffix on the manifest version (e.g. `0.4.0-dev`). `npm run package`
-runs without arguments and reads that version verbatim, producing
-`dist/zotero-ai-explain-v0.4.0-dev.xpi` plus the `zotero-ai-explain.xpi` latest-alias. Zotero's
-auto-updater silently replaces locally-installed XPIs with the GitHub release version when both
-share the same version number — the `-dev` suffix makes Zotero treat the local install as strictly
-newer than the latest release, so it is left alone across restarts. Strip the suffix only when
-prepping a release tag (see [Releasing](#releasing)).
+Dev branches advance the manifest version to the next clean semver ahead of the latest GitHub
+release (e.g. `0.4.0` while the latest release is `v0.3.0`). `npm run package` runs without
+arguments and reads that version verbatim, producing `dist/zotero-ai-explain-v0.4.0.xpi` plus the
+`zotero-ai-explain.xpi` latest-alias. Because the dev manifest is strictly newer than the latest
+release, Zotero's auto-updater leaves locally-installed dev XPIs alone across restarts. Bumping the
+manifest happens in a stand-alone "version bump" commit that lands on the feature branch (see
+[Releasing](#releasing)).
 
 ## Configuration
 
@@ -314,24 +314,27 @@ acceptance pass after building and packaging the `addon/` directory.
 
 ## Releasing
 
-The feature branch's manifest version carries a `-dev` suffix (e.g. `0.4.0-dev`) so Zotero's
-auto-updater treats locally-installed XPIs as strictly newer than the latest GitHub release. To cut
-a release:
+Feature branches carry a manifest version that is one clean semver ahead of the latest GitHub
+release (e.g. `0.4.0` while the latest tagged release is `v0.3.0`), so Zotero's auto-updater treats
+locally-installed XPIs as strictly newer than the latest release and leaves them alone. To cut a
+release:
 
-1. Edit `addon/manifest.json` and `package.json` — strip the `-dev` suffix from both versions in the
-   same commit (the `version-guards` test enforces that the pair moves together).
-2. Commit with a release-prep message and open a pull request against `main`.
+1. Confirm `addon/manifest.json` and `package.json` already declare the intended release version
+   (they should — the version bump landed in a stand-alone commit on the feature branch). The
+   `version-guards` test enforces that the pair stays in sync.
+2. Open the release-prep pull request against `main` (or reuse the merged feature branch's landing
+   commit if the version is already on `main`).
 3. Merge the release-prep PR to `main`, then wait for all required checks (`CI`, `Zotero E2E`,
    `E2E Cross-Platform`) to report green on the merge commit. The release workflow itself re-gates
    on these three checks against the tagged SHA and aborts after 60 minutes if any is missing or
    red, so tagging before `main` is green wastes a release-workflow run.
 4. Tag the green `main` commit and push: `git tag v<MAJOR>.<MINOR>.<PATCH> && git push --tags`.
-5. The release workflow's `v[0-9]+.[0-9]+.[0-9]+` tag filter accepts only clean semver — `-dev` tags
-   never trigger a release. `validateReleaseVersions` then asserts that the tag, `package.json`, and
-   `addon/manifest.json` all agree.
-6. After the release, open a follow-up PR that bumps both files to `v<MAJOR>.<MINOR+1>.0-dev` (or
-   `<MAJOR>.<MINOR>.<PATCH+1>-dev` for a patch line) so the next feature branch advances past the
-   release again.
+5. The release workflow's `v[0-9]+.[0-9]+.[0-9]+` tag filter accepts only clean semver.
+   `validateReleaseVersions` then asserts that the tag, `package.json`, and `addon/manifest.json`
+   all agree.
+6. After the release, open a follow-up PR that bumps both files to the next clean semver one minor
+   (or patch) ahead of the just-tagged release, so the next feature branch's dev manifest stays
+   strictly newer than the new latest release.
 
 ## Project layout
 

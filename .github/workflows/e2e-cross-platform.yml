@@ -393,7 +393,9 @@ jobs:
           set -euxo pipefail
           # package-xpi.mjs requires a semver tag in $GITHUB_REF_NAME OR as
           # argv[2]. On push to main `$GITHUB_REF_NAME=main` fails the
-          # semver guard; cross-validate against the manifest version.
+          # strict semver guard; the manifest carries clean semver one
+          # minor ahead of the latest release, so passing it as argv[2]
+          # routes through the release-tag validation path.
           MANIFEST_VERSION="$(node -p "require('./addon/manifest.json').version")"
           node scripts/package-xpi.mjs "v${MANIFEST_VERSION}"
           ls -la dist/
