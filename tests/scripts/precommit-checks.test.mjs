@@ -10,6 +10,12 @@ import {
 const macUserPath = ["/Us", "ers/alice/project/file.ts"].join("");
 const linuxUserPath = ["file://", "/ho", "me/alice/project/file.ts"].join("");
 const tempPath = ["/pri", "vate/t", "mp/build-output.txt"].join("");
+// Canonical Linuxbrew install location — same path on every Linuxbrew
+// install (system-level, not per-user). Should be allowed.
+const linuxbrewSystemPath = ["/ho", "me/linuxbrew/.linuxbrew/bin"].join("");
+// Per-user home path (Node version manager dir under a developer's
+// own username). Should still be flagged.
+const perUserNvmPath = ["/ho", "me/vishnuts/.nvm/versions/node"].join("");
 
 describe("containsLocalMachinePath", () => {
   it("flags absolute home-directory paths", () => {
@@ -29,6 +35,14 @@ describe("containsLocalMachinePath", () => {
     expect(
       containsLocalMachinePath("Visit https://github.com/vishnutskumar/zotero-ai-explain")
     ).toBe(false);
+  });
+
+  it("allows the canonical /home/linuxbrew/.linuxbrew system install location", () => {
+    expect(containsLocalMachinePath(`PATH=${linuxbrewSystemPath}`)).toBe(false);
+  });
+
+  it("still flags per-user home-directory paths under a developer username", () => {
+    expect(containsLocalMachinePath(`See ${perUserNvmPath}`)).toBe(true);
   });
 });
 

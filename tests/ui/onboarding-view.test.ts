@@ -364,6 +364,70 @@ describe("probeOllamaForOnboarding", () => {
     });
     expect(result.state).toBe("ready");
   });
+
+  // Regression: a user who first-runs the plugin after selecting a
+  // Codex/Claude Proxy preset has `baseUrl` pointing at the proxy. The
+  // proxy enforces bearer auth on `/api/tags`. Without the closure the
+  // probe always reported `ollama-missing` for proxy users, popping the
+  // onboarding dialog on every launch.
+  it("threads getProxyAuthHeader into the fetch init when the dep is provided", async () => {
+    const fakeFetch = vi.fn<
+      (
+        url: string,
+        init?: { readonly signal?: AbortSignal; readonly headers?: Record<string, string> }
+      ) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>
+    >(async () => {
+      await Promise.resolve();
+      return {
+        ok: true,
+        status: 200,
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async json() {
+          return { models: [{ name: "gpt-5-codex" }] };
+        }
+      };
+    });
+    const result = await probeOllamaForOnboarding({
+      baseUrl: "http://localhost:11400/codex",
+      chatModel: "gpt-5-codex",
+      embeddingModel: "gpt-5-codex",
+      fetch: fakeFetch,
+      getProxyAuthHeader: (baseUrl) => {
+        expect(baseUrl).toBe("http://localhost:11400/codex");
+        return { Authorization: "Bearer onboarding-token" };
+      }
+    });
+    expect(result.state).toBe("ready");
+    const headers = fakeFetch.mock.calls[0]?.[1]?.headers;
+    expect(headers?.Authorization).toBe("Bearer onboarding-token");
+  });
+
+  it("sends no Authorization header when getProxyAuthHeader is omitted (legacy)", async () => {
+    const fakeFetch = vi.fn<
+      (
+        url: string,
+        init?: { readonly signal?: AbortSignal; readonly headers?: Record<string, string> }
+      ) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>
+    >(async () => {
+      await Promise.resolve();
+      return {
+        ok: true,
+        status: 200,
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async json() {
+          return { models: [{ name: "gemma4:e2b" }, { name: "embeddinggemma" }] };
+        }
+      };
+    });
+    await probeOllamaForOnboarding({
+      baseUrl: "http://localhost:11434",
+      chatModel: "gemma4:e2b",
+      embeddingModel: "embeddinggemma",
+      fetch: fakeFetch
+    });
+    const headers = fakeFetch.mock.calls[0]?.[1]?.headers;
+    expect(headers).toBeUndefined();
+  });
 });
 
 describe("detectPlatform", () => {

@@ -57,11 +57,12 @@ jobs:
         run: |
           set -euxo pipefail
           npm run build
-          # package-xpi.mjs prefers $GITHUB_REF_NAME for the version tag.
-          # On push (not on a tag) that's "main", which fails the semver
-          # check. Override with the manifest version for this build only;
-          # the script then cross-validates the tag against package.json
-          # and manifest.json (must all match).
+          # On push (not a release tag) $GITHUB_REF_NAME is the branch
+          # name (e.g. "main"), which fails release-version.mjs's strict
+          # semver guard. The manifest carries clean semver one minor
+          # ahead of the latest release, so synthesising the tag from the
+          # manifest version lets the release-tag validation path run on
+          # PR / push-to-main builds too.
           MANIFEST_VERSION="$(node -p "require('./addon/manifest.json').version")"
           GITHUB_REF_NAME="v${MANIFEST_VERSION}" node scripts/package-xpi.mjs
           ls -la dist/

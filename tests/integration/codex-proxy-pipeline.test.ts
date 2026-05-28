@@ -1,9 +1,9 @@
 /**
  * Full-subprocess integration for the codex CLI proxy path: spawns the
  * real `scripts/llm-proxy/server.mjs` with `PROXY_CODEX_BIN` pointed at
- * a fake codex that replays the live `codex exec --json` event stream,
- * then drives it through the real ollama provider adapter (the same
- * adapter the popup uses).
+ * a fake `codex mcp-server` that speaks the MCP JSON-RPC wire shape the
+ * real backend now drives, then drives it through the real ollama
+ * provider adapter (the same adapter the popup uses).
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -52,34 +52,147 @@ async function pickFreePort(): Promise<number> {
 }
 
 /**
- * Write a fake `codex` executable that replays the live event stream we
- * captured from `codex exec --json --model gpt-5.5 -`. The script is
- * POSIX-portable (`/bin/bash` shebang + heredoc) so it runs on every
- * supported platform without depending on user-installed CLIs.
+ * Write a fake `codex mcp-server` executable that speaks the same MCP
+ * JSON-RPC wire shape the real backend now drives. The fake is a
+ * self-contained Node ESM script — the shebang resolves to the current
+ * Node binary via `process.execPath` so we do NOT depend on `node`
+ * being on the (deliberately restricted) test PATH.
+ *
+ * Behaviour:
+ *   1. Read JSON-RPC frames from stdin line-by-line. The proxy backend
+ *      sends three frames per turn: `initialize` (id 0),
+ *      `notifications/initialized` (no id), and `tools/call` (id 1).
+ *      Frames before the `tools/call` are simply discarded.
+ *   2. On the `tools/call` request, the fake emits (each as one
+ *      `\n`-terminated JSON object):
+ *        a) A `session_configured` framing notification whose nested
+ *           `text` field embeds `<<<must-not-leak>>>` — verifies the
+ *           denylist suppression end-to-end.
+ *        b) Two `agent_message_content_delta` notifications carrying
+ *           "hello " and "world" respectively, with a short delay
+ *           between writes so the deltas arrive as distinct chunks
+ *           in the consuming side (proves streaming, not just content).
+ *        c) The denylisted `item_completed AgentMessage` terminal
+ *           envelope carrying the FULL assembled text — verifies that
+ *           the extractor's terminal-envelope denylist prevents the
+ *           response from replaying after the deltas.
+ *        d) The `id:1` tools/call response with
+ *           `structuredContent.threadId` — receiving this is what
+ *           causes the proxy backend to close stdin so the fake exits.
+ *   3. Exit 0 when stdin closes.
+ *
+ * The script is POSIX-only because the existing `describeOnPosix`
+ * skip (file:~190) already excludes Windows. A future cross-platform
+ * port can change the shebang resolution; out of scope here.
  */
 function writeFakeCodex(dir: string, text: string): string {
   const path = join(dir, "fake-codex");
-  // The script ignores --json / --skip-git-repo-check / --model X / `-`
-  // and the prompt on stdin. It emits the real codex CLI event ordering
-  // observed live: thread.started, turn.started, an `item.completed`
-  // command_execution (which must NOT leak into the popup), then the
-  // assistant message wrapped in `item.completed` / `agent_message`,
-  // then turn.completed. The agent text is interpolated from `text` so
-  // the test can assert against a specific known-string.
-  const script = [
-    `#!/bin/bash`,
-    // Consume stdin so the producing side doesn't error on EPIPE.
-    `cat > /dev/null`,
-    `cat <<'JSON'`,
-    `{"type":"thread.started","thread_id":"thread-fixture-1"}`,
-    `{"type":"turn.started"}`,
-    `{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"true","aggregated_output":"<<<must-not-leak>>>","exit_code":0,"status":"completed"}}`,
-    `{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"__AGENT_TEXT__"}}`,
-    `{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`,
-    `JSON`,
-    ``
-  ].join("\n");
-  writeFileSync(path, script.replace("__AGENT_TEXT__", text), "utf8");
+  // Split the agent text into at least two chunks so the consuming
+  // side observes streaming (≥2 distinct `done:false` deltas).
+  const split = Math.max(1, Math.floor(text.length / 2));
+  const piece1 = text.slice(0, split);
+  const piece2 = text.slice(split);
+  // The fake script. Templated values are JSON-stringified into the
+  // body so embedded quotes / backslashes are safe.
+  const script = `#!${process.execPath}
+import { createInterface } from "node:readline";
+const TEXT = ${JSON.stringify(text)};
+const PIECE_1 = ${JSON.stringify(piece1)};
+const PIECE_2 = ${JSON.stringify(piece2)};
+const THREAD_ID = "thread-fixture-1";
+function emit(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\\n");
+}
+async function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+async function respond() {
+  // (a) Denylisted framing envelope carrying a must-not-leak string —
+  // proves the extractor's framing denylist works end-to-end.
+  emit({
+    jsonrpc: "2.0",
+    method: "codex/event",
+    params: {
+      _meta: { threadId: THREAD_ID },
+      msg: {
+        type: "session_configured",
+        session_id: THREAD_ID,
+        text: "<<<must-not-leak>>>"
+      }
+    }
+  });
+  // (b) Two streamed deltas.
+  emit({
+    jsonrpc: "2.0",
+    method: "codex/event",
+    params: {
+      _meta: { threadId: THREAD_ID },
+      msg: { type: "agent_message_content_delta", item_id: "msg_0", delta: PIECE_1 }
+    }
+  });
+  await sleep(10);
+  emit({
+    jsonrpc: "2.0",
+    method: "codex/event",
+    params: {
+      _meta: { threadId: THREAD_ID },
+      msg: { type: "agent_message_content_delta", item_id: "msg_0", delta: PIECE_2 }
+    }
+  });
+  // (c) Denylisted terminal envelope carrying the FULL text — proves
+  // the terminal-envelope denylist prevents double emission.
+  emit({
+    jsonrpc: "2.0",
+    method: "codex/event",
+    params: {
+      _meta: { threadId: THREAD_ID },
+      msg: {
+        type: "item_completed",
+        item: {
+          type: "AgentMessage",
+          content: [{ type: "Text", text: TEXT }],
+          phase: "final_answer"
+        }
+      }
+    }
+  });
+  // (d) tools/call response — receiving this is what causes the
+  // backend to close stdin so this process exits.
+  emit({
+    jsonrpc: "2.0",
+    id: 1,
+    result: {
+      content: [{ type: "text", text: TEXT }],
+      structuredContent: { threadId: THREAD_ID, content: TEXT }
+    }
+  });
+}
+const rl = createInterface({ input: process.stdin });
+let responded = false;
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) return;
+  let frame;
+  try {
+    frame = JSON.parse(trimmed);
+  } catch {
+    return;
+  }
+  // The backend's third frame is tools/call with id:1. Earlier frames
+  // (initialize id:0, notifications/initialized) are discarded.
+  if (!responded && frame && frame.id === 1 && frame.method === "tools/call") {
+    responded = true;
+    respond().catch((err) => {
+      process.stderr.write("fake-codex respond error: " + String(err) + "\\n");
+      process.exit(1);
+    });
+  }
+});
+rl.on("close", () => {
+  process.exit(0);
+});
+`;
+  writeFileSync(path, script, "utf8");
   chmodSync(path, 0o755);
   return path;
 }
@@ -125,7 +238,13 @@ async function startProxy(text: string): Promise<Spawned> {
       // Ignored if not honored; falls back to the default banner.
       LLM_PROXY_QUIET: "1"
     },
-    stdio: ["ignore", "pipe", "pipe"]
+    // stdin MUST be a pipe (not "ignore") so the proxy's
+    // `installParentDeathDetector` sees an open stdin at startup.
+    // `"ignore"` connects stdin to /dev/null, which triggers immediate
+    // EOF and self-shutdown — see `scripts/llm-proxy/server.mjs`.
+    // The test never writes to stdin; the pipe stays open until we kill
+    // the child in `stopProxy()`.
+    stdio: ["pipe", "pipe", "pipe"]
   });
   // `stdio: pipe` makes these streams non-null in the inferred type.
   const { stdout, stderr } = child;
@@ -183,12 +302,12 @@ afterAll(async () => {
   }
 });
 
-// `writeFakeCodex` emits a `#!/bin/bash` script (cat + heredoc). The
-// shebang + bash chain works on POSIX but Windows lacks `/bin/bash`
-// and ignores shebangs at OS level — the spawn silently returns no
-// stdout. The pipeline coverage is POSIX-only; Linux + macOS CI
-// already exercise it. A future port to a Node-script fake would
-// unlock cross-platform coverage.
+// `writeFakeCodex` emits a Node ESM script with a shebang that points
+// at `process.execPath`. POSIX kernels honour the shebang and invoke
+// Node directly; Windows ignores shebangs at the OS level so the spawn
+// silently returns no stdout there. The pipeline coverage stays
+// POSIX-only (Linux + macOS CI both exercise it); a future
+// cross-platform port can swap to a `.cmd` wrapper on Windows.
 const describeOnPosix = process.platform === "win32" ? describe.skip : describe;
 
 describeOnPosix("codex CLI proxy pipeline (real subprocess + real HTTP)", () => {
@@ -217,15 +336,23 @@ describeOnPosix("codex CLI proxy pipeline (real subprocess + real HTTP)", () => 
     // assistant text. Pre-fix this assertion failed because the proxy
     // emitted zero `message.content` deltas — the regression that
     // surfaced as "popup stuck loading".
-    const deltaText = events
-      .filter((e): e is Extract<ChatEvent, { type: "delta" }> => e.type === "delta")
-      .map((d) => d.text)
-      .join("");
+    const deltas = events.filter(
+      (e): e is Extract<ChatEvent, { type: "delta" }> => e.type === "delta"
+    );
+    const deltaText = deltas.map((d) => d.text).join("");
     expect(deltaText).toBe("hello world");
-    // The tool-call envelope (command_execution `aggregated_output`)
-    // must not leak — verifies the suppression branch in
-    // extractDeltaText for non-agent_message item types.
+    // The denylisted framing envelope (`session_configured` with a
+    // nested `text` field) and the terminal `item_completed
+    // AgentMessage` envelope both carry strings that must NOT reach the
+    // popup. `must-not-leak` proves the framing denylist; the assembled
+    // "hello world" appearing EXACTLY once (above) proves the terminal
+    // denylist (would otherwise be "hello worldhello world").
     expect(deltaText).not.toContain("must-not-leak");
+    // Streaming proof: the fake emits two distinct
+    // `agent_message_content_delta` frames ("hello " + "world") with a
+    // short delay between them, so the consuming side must observe at
+    // least two delta events (not one assembled blob).
+    expect(deltas.length).toBeGreaterThanOrEqual(2);
     // No in-band error event — the stream completed cleanly.
     expect(events.find((e) => e.type === "error")).toBeUndefined();
     // The terminal event from the ollama adapter is `message_end` once

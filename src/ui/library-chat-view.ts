@@ -15,7 +15,8 @@
 
 import type { ChatMessage } from "../providers/provider-types.js";
 import type { RetrievedChunk } from "../indexing/index-search.js";
-import type { CitationLookup, CitationLookupEntry } from "./citation-lookup.js";
+import { attachCitationClickHandler } from "./citation-click.js";
+import { emitTextWithCitations, type CitationLookup } from "./citation-lookup.js";
 import {
   ACCENT,
   BORDER_HAIRLINE,
@@ -42,16 +43,6 @@ export type LibraryChatViewInput = {
    */
   readonly citationLookups?: ReadonlyMap<number, CitationLookup>;
 };
-
-/**
- * Regex that matches a chunk-scoped citation token: `[ABCD1234]` (legacy,
- * no chunk index) or `[ABCD1234#3]` (chunk-scoped). The item key is
- * exactly 8 uppercase-alphanumeric chars — the shape Zotero assigns. The
- * optional `#<digits>` half carries the chunk index. Anything else (e.g.
- * `[<img>]`, a lowercase key, a 5-char key) does NOT match, so injection
- * payloads and stray brackets fall through to literal text.
- */
-const CITATION_PATTERN = /\[([A-Z0-9]{8})(?:#(\d+))?\]/gu;
 
 const MESSAGES_STYLE =
   "list-style: none; margin: 0; padding: 12px 16px; flex: 1 1 auto; " +
@@ -104,6 +95,19 @@ export function renderLibraryChatView(input: LibraryChatViewInput): HTMLElement 
     .zotero-ai-library-chat__role {
       /* Role is communicated by side + colour; the text label is redundant. */
       display: none;
+    }
+    /*
+     * HIGH-3 follow-up: citation anchors inside the assistant body get an
+     * explicit accent + underline affordance so they look clickable. The
+     * popup/sidebar surfaces get this via MARKDOWN_CSS in styles.ts;
+     * library-chat has no MARKDOWN_CSS owner so we re-state the rule
+     * locally, scoped to the assistant body so user-typed text-bearing
+     * anchors are unaffected.
+     */
+    .zotero-ai-library-chat__body a {
+      color: ${ACCENT};
+      text-decoration: underline;
+      cursor: pointer;
     }
   `;
   root.append(styleTag);
@@ -258,15 +262,13 @@ function renderMessage(message: ChatMessage, lookup?: CitationLookup): HTMLLIEle
  * literal `<script>` or `<img>` markup lands as text — not interpreted
  * HTML.
  *
- * When `lookup` is supplied (AC-6) the renderer composes the full key
- * `${itemKey}#${chunkIndex}` and resolves it against that per-turn table.
- * On a HIT the link carries `data-chunk-index`, `data-attachment-key`,
- * and `data-page-index` from the matched entry so the click handler can
- * jump straight to the source page. On a MISS — a legacy token with no
- * chunk index, a hallucinated itemKey, a chunk-index out of range, or no
- * table at all — the link falls back to legacy `[itemKey]` rendering
- * (the `data-item-key`-only shape), which downstream opens the
- * attachment at page 0.
+ * Delegates to the shared `emitTextWithCitations` in `citation-lookup.ts`
+ * so the library-chat surface and the popup/sidebar surface tokenize
+ * citations identically: chunk-scoped hits stamp `data-chunk-index`,
+ * `data-attachment-key`, `data-page-index`; bare-key tokens resolve via
+ * `resolveCitation`'s legacy fallback when ANY chunk in the lookup shares
+ * the itemKey; hallucinated keys and out-of-range chunk-indices render as
+ * INERT TEXT (no anchor), matching the README contract.
  *
  * Exported separately from `renderMessage` to keep the helper unit-
  * testable without a full view render.
@@ -276,59 +278,7 @@ export function appendWithCitations(
   source: string,
   lookup?: CitationLookup
 ): void {
-  CITATION_PATTERN.lastIndex = 0;
-  let cursor = 0;
-  let match: RegExpExecArray | null;
-  while ((match = CITATION_PATTERN.exec(source)) !== null) {
-    if (match.index > cursor) {
-      target.append(document.createTextNode(source.slice(cursor, match.index)));
-    }
-    const itemKey = match[1] ?? "";
-    const rawChunkIndex = match[2];
-    // A hit requires BOTH a chunk-index half AND a lookup entry under the
-    // composed full key. A legacy `[itemKey]` token (no `#`) never hits;
-    // a hallucinated itemKey or out-of-range chunk-index composes a key
-    // that is absent from the table.
-    const entry =
-      rawChunkIndex !== undefined && lookup !== undefined
-        ? lookup.get(`${itemKey}#${rawChunkIndex}`)
-        : undefined;
-    target.append(renderCitationLink(itemKey, entry, rawChunkIndex));
-    cursor = match.index + match[0].length;
-  }
-  if (cursor < source.length) {
-    target.append(document.createTextNode(source.slice(cursor)));
-  }
-}
-
-function renderCitationLink(
-  itemKey: string,
-  entry: CitationLookupEntry | undefined,
-  rawChunkIndex: string | undefined
-): HTMLAnchorElement {
-  const link = document.createElement("a");
-  link.dataset.itemKey = itemKey;
-  if (entry !== undefined) {
-    // Hit: stamp the chunk-scoped data attributes so the click handler
-    // can route the jump-to-page. `chunkIndex` rides verbatim from the
-    // token; `pageIndex: 0` is preserved — `typeof === "number"` keeps a
-    // real page 0 from being dropped by a truthy guard.
-    if (rawChunkIndex !== undefined) {
-      link.dataset.chunkIndex = rawChunkIndex;
-    }
-    if (entry.attachmentKey !== undefined) {
-      link.dataset.attachmentKey = entry.attachmentKey;
-    }
-    if (typeof entry.pageIndex === "number") {
-      link.dataset.pageIndex = String(entry.pageIndex);
-    }
-  }
-  // Use `#` rather than a real URL so click handlers can preventDefault
-  // without navigating; the wire layer dispatches to `onCitationClick`.
-  link.setAttribute("href", "#");
-  link.setAttribute("style", `color: ${ACCENT}; text-decoration: underline; cursor: pointer;`);
-  link.textContent = itemKey;
-  return link;
+  emitTextWithCitations(target, source, lookup ?? new Map());
 }
 
 export type LibraryChatDetach = () => void;
@@ -374,33 +324,12 @@ export function wireLibraryChatView(input: WireLibraryChatInput): LibraryChatDet
     onReset();
   };
 
-  // Delegate citation clicks at the view root so re-renders (which
-  // replace `.zotero-ai-library-chat__messages` children) keep working
-  // without re-binding.
-  const handleClick = (event: MouseEvent): void => {
-    const target = event.target as HTMLElement | null;
-    if (target === null) return;
-    const link = target.closest<HTMLAnchorElement>("a[data-item-key]");
-    if (link === null) return;
-    event.preventDefault();
-    const key = link.dataset.itemKey ?? "";
-    if (key.length === 0) {
-      return;
-    }
-    // Read the chunk-scoped data attributes the renderer stamped on a
-    // hit. A legacy / fallback link carries only `data-item-key`, so
-    // `attachmentKey`/`pageIndex` drop off the emitted citation. The
-    // page-index parse guards against a non-numeric attribute value.
-    const attachmentKey = link.dataset.attachmentKey;
-    const rawPageIndex = link.dataset.pageIndex;
-    const pageIndex =
-      rawPageIndex !== undefined && /^\d+$/u.test(rawPageIndex) ? Number(rawPageIndex) : undefined;
-    onCitationClick({
-      itemKey: key,
-      ...(attachmentKey !== undefined ? { attachmentKey } : {}),
-      ...(pageIndex !== undefined ? { pageIndex } : {})
-    });
-  };
+  // Delegate citation clicks at the view root via the shared
+  // `attachCitationClickHandler` helper so re-renders (which replace
+  // `.zotero-ai-library-chat__messages` children) keep working without
+  // re-binding, and the click semantics stay byte-identical to the
+  // popup/sidebar delegations in `zotero-runtime.ts`.
+  const detachCitationClicks = attachCitationClickHandler(view, onCitationClick);
 
   // Enter submits; Shift+Enter inserts a newline. Same convention as
   // the popup so users don't have to mouse to "Ask" for every question.
@@ -413,13 +342,12 @@ export function wireLibraryChatView(input: WireLibraryChatInput): LibraryChatDet
 
   form?.addEventListener("submit", handleSubmit);
   reset?.addEventListener("click", handleReset);
-  view.addEventListener("click", handleClick);
   textarea?.addEventListener("keydown", handleKeydown);
 
   return () => {
     form?.removeEventListener("submit", handleSubmit);
     reset?.removeEventListener("click", handleReset);
-    view.removeEventListener("click", handleClick);
+    detachCitationClicks();
     textarea?.removeEventListener("keydown", handleKeydown);
   };
 }

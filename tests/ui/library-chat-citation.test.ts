@@ -5,6 +5,15 @@
  * guard (`appendWithCitations`, `renderLibraryChatView`, `wireLibraryChatView`,
  * `buildLibraryPrompt` from `src/ui/library-chat-view.ts`).
  *
+ * REV (HIGH-3): `appendWithCitations` now delegates to the shared
+ * `emitTextWithCitations` in `citation-lookup.ts`, the same tokenizer the
+ * popup/sidebar markdown renderer uses. The library-chat surface and the
+ * popup/sidebar surface therefore tokenize citations IDENTICALLY — a
+ * hallucinated chunk-scoped token renders as inert text on every surface,
+ * a bare-key token routes through `resolveCitation`'s legacy fallback on
+ * every surface, and the anchor's visible text is the bracketed token on
+ * every surface (e.g. `[ABCD1234#3]`, not bare `ABCD1234`).
+ *
  * ### PHASE 1 — SPEC SEMANTICS
  * - PREMISE S1: `appendWithCitations(target, source, lookup?)` parses both halves
  *   of a citation via `/\[([A-Z0-9]{8})(?:#(\d+))?\]/g`. The renderer composes
@@ -12,15 +21,23 @@
  *   per-turn `lookup` table.
  * - PREMISE S2: ON A HIT the `<a>` element carries `data-item-key`,
  *   `data-chunk-index`, `data-attachment-key`, `data-page-index` populated from
- *   the matched `CitationLookupEntry`.
- * - PREMISE S3: ON A MISS — a legacy `[ITEMKEY]` token (no chunk-index), a
- *   hallucinated itemKey, OR a hallucinated in-range-looking chunk-index such as
- *   `[ABCD1234#99]` when only chunks 0-7 are in the table — the renderer falls
- *   back to legacy `[itemKey]` behavior: a link carrying `data-item-key` only
- *   (no `data-page-index`), which downstream opens the attachment at page 0.
- * - PREMISE S4: `[WRONGKEY#0]` where WRONGKEY ≠ chunk-0's true itemKey ⇒ the
- *   composed key `WRONGKEY#0` is absent from the table ⇒ miss ⇒ fallback to
- *   legacy `[WRONGKEY]`. It must NOT silently route to chunk-0's true source.
+ *   the matched `CitationLookupEntry`. The anchor's `textContent` is the
+ *   bracketed token (e.g. `[ABCD1234#3]`), matching the popup/sidebar.
+ * - PREMISE S3 (HIGH-3): ON A CHUNK-SCOPED MISS — a hallucinated itemKey,
+ *   an out-of-range chunk-index such as `[ABCD1234#99]` when only chunks 0-7
+ *   are in the table, or `[WRONGKEY#0]` where WRONGKEY shares no chunk in the
+ *   table — the renderer emits INERT TEXT (no anchor). This matches the README
+ *   "inert text on hallucination" contract that the popup/sidebar already
+ *   enforced; the library-chat surface used to emit a fallback `<a>` instead.
+ * - PREMISE S4 (HIGH-3): a BARE-KEY `[ITEMKEY]` token (no `#`) routes through
+ *   `resolveCitation`'s legacy fallback: if ANY chunk in the lookup shares
+ *   this itemKey, the helper synthesises a fallback entry `{ itemKey, text }`
+ *   (no `pageIndex` / `attachmentKey`) and the renderer emits a clickable
+ *   anchor carrying `data-item-key` only. When the lookup has no chunk for
+ *   this itemKey (or no lookup at all — the legacy 2-arg caller passes an
+ *   empty `Map`), `resolveCitation` returns `undefined` and the token renders
+ *   as INERT TEXT. The anchor's `textContent` on the bare-key hit is the
+ *   bracketed `[ITEMKEY]`, NOT bare `ITEMKEY`.
  * - PREMISE S5: the lookup table is PER-TURN, pinned to the assistant message
  *   index in the store (`citationLookups: ReadonlyMap<number, CitationLookup>`).
  *   Re-rendering an OLDER assistant turn must use THAT turn's table.
@@ -31,39 +48,20 @@
  * - PREMISE S8: rendering stays XSS-safe — no `innerHTML`; markup payloads land
  *   as literal text.
  *
- * ### PHASE 2 — CODE PATH TRACE (current code)
- * - METHOD: `CITATION_PATTERN` | LOCATION: src/ui/library-chat-view.ts:46 |
- *   BEHAVIOR (current): `/\[([A-Za-z0-9_]{3,32})\]/gu`, NO chunk-index half.
- *   RELEVANCE: must widen to capture `#(\d+)`.
- * - METHOD: `appendWithCitations(target, source)` | LOCATION: lines 252-267 |
- *   BEHAVIOR (current): 2-arg, every match becomes a link with `data-item-key`
- *   only. RELEVANCE: must accept the `lookup?` 3rd arg and stamp the page/
- *   attachment data attributes on hits.
- * - METHOD: `wireLibraryChatView` click delegate | LOCATION: lines 315-325 |
- *   BEHAVIOR (current): emits a bare string `itemKey`. RELEVANCE: must emit the
- *   citation object.
- * - METHOD: `buildLibraryPrompt` | LOCATION: lines 355-370 | BEHAVIOR (current):
- *   excerpt prefix `[${c.itemKey}]`. RELEVANCE: must become `[${itemKey}#${chunkIndex}]`.
- *
  * ### PHASE 3 — DIVERGENCE ANALYSIS
  * - CLAIM D1: a hit may stamp only `data-item-key` and forget the new
  *   `data-chunk-index/-attachment-key/-page-index` attributes.
- * - CLAIM D2: a hallucinated `[ABCD1234#99]` may still resolve if the renderer
- *   keys the table by bare itemKey, or if it falls back to chunk 0 of that item.
- * - CLAIM D3: a `[WRONGKEY#0]` token may route to chunk 0's true source if the
- *   renderer ignores the itemKey half of the composed key.
+ * - CLAIM D2 (HIGH-3 flipped): a hallucinated `[ABCD1234#99]` may still render
+ *   a clickable fallback anchor (the legacy library-chat behavior). After
+ *   unification the token must render as INERT TEXT.
+ * - CLAIM D3 (HIGH-3 flipped): `[WRONGKEY#0]` may emit a fallback `<a>` even
+ *   when no chunk in the table shares WRONGKEY. After unification the token
+ *   must render as INERT TEXT.
  * - CLAIM D4: a re-render may use the CURRENT lookup table (singleton) rather
  *   than the table pinned to the message's index — wrong page on stale turns.
  * - CLAIM D5: `pageIndex: 0` may be dropped on the data attribute by a truthy
  *   guard, producing a missing `data-page-index` on a real page-0 citation.
  * - CLAIM D6: `onCitationClick` may still emit a bare string after the widen.
- *
- * ### PHASE 4 — TEST TARGETS
- * 1. D2/D3 — hallucination guard: out-of-range and wrong-key tokens fall back.
- * 2. D1/D5 — hit stamps all four data attributes incl. page 0.
- * 3. D4 — per-turn table pinning across an older-turn re-render.
- * 4. D6 — onCitationClick emits the resolved citation object.
- * 5. legacy `[ITEMKEY]` (no chunk-index) fallback; buildLibraryPrompt shape.
  *
  * Black-box: imports only public exports of `library-chat-view.ts` +
  * `citation-lookup.ts` + the `RetrievedChunk` type.
@@ -133,47 +131,69 @@ describe("appendWithCitations — hit path stamps chunk-scoped data attributes",
 });
 
 describe("appendWithCitations — miss path falls back to legacy [itemKey] behavior", () => {
-  it("treats a legacy [ITEMKEY] token (no chunk-index) as a fallback link", () => {
-    // PREMISE S3: no chunk-index half -> legacy behavior, no data-page-index.
+  it("treats a legacy [ITEMKEY] token (no chunk-index) as a fallback link with bracketed text", () => {
+    // PREMISE S4 (HIGH-3): a bare-key token still resolves via
+    // `resolveCitation`'s legacy fallback when ANY chunk in the lookup
+    // shares this itemKey. The fallback entry has no pageIndex /
+    // attachmentKey, so the anchor carries data-item-key ONLY. The
+    // anchor's textContent is the BRACKETED token (`[ABCD1234]`), not
+    // bare `ABCD1234` — matches the popup/sidebar markdown renderer.
     const target = document.createElement("div");
     appendWithCitations(target, "Legacy cite [ABCD1234].", eightChunkLookup());
     const link = target.querySelector<HTMLAnchorElement>("a[data-item-key]");
     expect(link).not.toBeNull();
     expect(link?.dataset.itemKey).toBe("ABCD1234");
     expect(link?.dataset.pageIndex).toBeUndefined();
+    expect(link?.dataset.attachmentKey).toBeUndefined();
+    expect(link?.dataset.chunkIndex).toBeUndefined();
+    // HIGH-3 visible-text shape: bracketed, not bare.
+    expect(link?.textContent).toBe("[ABCD1234]");
   });
 
-  it("falls back when the chunk-index is out of range ([ABCD1234#99], table holds 0-7)", () => {
-    // Adversarial D2.
+  it("renders out-of-range [ABCD1234#99] as INERT TEXT (no anchor)", () => {
+    // Adversarial D2 (HIGH-3 flipped). The table holds chunks 0-7; chunk
+    // 99 is a hallucination. Library-chat used to emit a fallback `<a>`;
+    // after unification with the popup/sidebar renderer the token now
+    // renders as inert text — matches the README contract.
     const target = document.createElement("div");
     appendWithCitations(target, "Hallucinated [ABCD1234#99].", eightChunkLookup());
-    const link = target.querySelector<HTMLAnchorElement>("a[data-item-key]");
-    expect(link).not.toBeNull();
-    expect(link?.dataset.itemKey).toBe("ABCD1234");
-    // Miss -> legacy fallback: no resolved page/attachment.
-    expect(link?.dataset.pageIndex).toBeUndefined();
+    expect(target.querySelector("a")).toBeNull();
+    // The original token survives verbatim in the rendered text.
+    expect(target.textContent).toContain("[ABCD1234#99]");
   });
 
-  it("falls back for [WRONGKEY#0] and does NOT route to chunk-0's true source", () => {
-    // Adversarial D3 / PREMISE S4. The table's chunk 0 is itemKey ABCD1234 on
-    // page 0. A wrong itemKey with chunkIndex 0 must NOT inherit that page.
+  it("renders [WRONGKEY#0] as INERT TEXT — never routes to chunk-0's true source", () => {
+    // Adversarial D3 (HIGH-3 flipped). The table's chunk 0 is itemKey
+    // ABCD1234 on page 0. A wrong itemKey with chunkIndex 0 composes
+    // `WRONGKEY#0`, absent from the lookup -> miss -> INERT TEXT. No
+    // chunk in the table shares WRONGKEY either, so the bare-key
+    // fallback also misses. The token must NOT inherit chunk-0's page.
     const target = document.createElement("div");
     appendWithCitations(target, "Wrong key [WRONGKEY#0].", eightChunkLookup());
-    const link = target.querySelector<HTMLAnchorElement>("a[data-item-key]");
-    expect(link).not.toBeNull();
-    expect(link?.dataset.itemKey).toBe("WRONGKEY");
-    // Must NOT have silently adopted chunk-0's pageIndex 0 / attachment.
-    expect(link?.dataset.pageIndex).toBeUndefined();
-    expect(link?.dataset.attachmentKey).toBeUndefined();
+    expect(target.querySelector("a")).toBeNull();
+    expect(target.textContent).toContain("[WRONGKEY#0]");
   });
 
-  it("falls back when no lookup table is supplied at all (legacy 2-arg caller)", () => {
+  it("renders chunk-scoped [ABCD1234#3] as INERT TEXT when no lookup is supplied (legacy 2-arg caller)", () => {
+    // PREMISE S4 (HIGH-3): the legacy 2-arg call passes an empty lookup.
+    // A chunk-scoped token has nothing to resolve against -> inert text.
+    // (A bare-key token would still also be inert because no chunk
+    // shares its itemKey — covered in the next test.)
     const target = document.createElement("div");
     appendWithCitations(target, "Cite [ABCD1234#3].");
-    const link = target.querySelector<HTMLAnchorElement>("a[data-item-key]");
-    expect(link).not.toBeNull();
-    expect(link?.dataset.itemKey).toBe("ABCD1234");
-    expect(link?.dataset.pageIndex).toBeUndefined();
+    expect(target.querySelector("a")).toBeNull();
+    expect(target.textContent).toContain("[ABCD1234#3]");
+  });
+
+  it("renders bare-key [ABCD1234] as INERT TEXT when no lookup is supplied (legacy 2-arg caller)", () => {
+    // HIGH-3 visible-text contract: with no lookup, `resolveCitation`'s
+    // legacy fallback returns undefined for a bare-key token (no chunk
+    // shares this itemKey because there are no chunks), so the token
+    // renders as inert text — matching the popup/sidebar.
+    const target = document.createElement("div");
+    appendWithCitations(target, "Cite [ABCD1234].");
+    expect(target.querySelector("a")).toBeNull();
+    expect(target.textContent).toContain("[ABCD1234]");
   });
 
   it("inserts non-citation text as literal text nodes and never as markup (XSS-safe)", () => {
@@ -228,8 +248,12 @@ describe("renderLibraryChatView — per-turn lookup table pinning", () => {
     expect(links[1]?.dataset.pageIndex).toBe("40");
   });
 
-  it("renders a citation as a legacy fallback when its turn has no lookup entry", () => {
-    // An assistant turn with no entry in citationLookups -> miss -> fallback.
+  it("renders a chunk-scoped citation as INERT TEXT when its turn has no lookup entry", () => {
+    // HIGH-3 flipped: an assistant turn with no entry in citationLookups
+    // exposes a chunk-scoped token to an empty lookup -> miss -> inert
+    // text. Library-chat used to emit a fallback `<a>`; after unification
+    // with the popup/sidebar renderer the contract is "inert text on
+    // hallucination" everywhere.
     const view = renderLibraryChatView({
       messages: [{ role: "assistant", content: "Orphan [ABCD1234#0]." }],
       status: "completed",
@@ -237,9 +261,8 @@ describe("renderLibraryChatView — per-turn lookup table pinning", () => {
       hasIndex: true,
       citationLookups: new Map<number, CitationLookup>()
     });
-    const link = view.querySelector<HTMLAnchorElement>("a[data-item-key]");
-    expect(link).not.toBeNull();
-    expect(link?.dataset.pageIndex).toBeUndefined();
+    expect(view.querySelector("a")).toBeNull();
+    expect(view.textContent).toContain("[ABCD1234#0]");
   });
 });
 

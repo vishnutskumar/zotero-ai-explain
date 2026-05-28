@@ -131,6 +131,20 @@ async function readErrorMessage(response: Response): Promise<string> {
 
 export function createOllamaProvider(deps: {
   readonly fetch: FetchLike;
+  /**
+   * Optional accessor that, given the resolved request URL, returns
+   * the headers to add for proxy authentication (e.g.
+   * `{ Authorization: "Bearer <uuid>" }`). When omitted, undefined, or
+   * the accessor returns undefined, NO Authorization header is sent —
+   * which is the right answer for real Ollama daemons that don't
+   * speak our auth scheme and for legacy callers / tests that haven't
+   * threaded the proxy lifecycle yet.
+   *
+   * Wiring: `src/bootstrap.ts` builds a closure that returns the
+   * bearer header iff the URL matches the spawned proxy's prefix and
+   * the proxy is currently running.
+   */
+  readonly getProxyAuthHeader?: (baseUrl: string) => Record<string, string> | undefined;
 }): ModelProvider & EmbeddingProvider {
   const id = "ollama";
 
@@ -142,10 +156,11 @@ export function createOllamaProvider(deps: {
       yield { type: "message_start", providerId: id, model: request.profile.model };
 
       try {
+        const authHeader = deps.getProxyAuthHeader?.(url) ?? {};
         const response = await deps.fetch(`${url}/api/chat`, {
           method: "POST",
           signal,
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", ...authHeader },
           body: JSON.stringify({
             model: request.profile.model,
             stream: true,
@@ -216,10 +231,11 @@ export function createOllamaProvider(deps: {
     },
     async embedTexts(request) {
       const url = baseUrl(request.baseUrl);
+      const authHeader = deps.getProxyAuthHeader?.(url) ?? {};
       const response = await deps.fetch(`${url}/api/embed`, {
         method: "POST",
         signal: request.signal,
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...authHeader },
         body: JSON.stringify({ model: request.model, input: request.texts })
       });
       if (!response.ok) {

@@ -88,6 +88,8 @@ function makeFakeSubprocess(): {
     command: string;
     args: readonly string[];
     env: Readonly<Record<string, string>> | undefined;
+    stdin: string | undefined;
+    stderr: string | undefined;
   }[];
   queue: (factory: () => FakeChild | Error) => void;
   /** Queue a spawn that the test resolves manually via the returned deferred. */
@@ -98,6 +100,8 @@ function makeFakeSubprocess(): {
     command: string;
     args: readonly string[];
     env: Readonly<Record<string, string>> | undefined;
+    stdin: string | undefined;
+    stderr: string | undefined;
   }[] = [];
   const pendingChildren: FakeChild[] = [];
   const factories: (() => FakeChild | Error | Promise<FakeChild>)[] = [];
@@ -105,7 +109,9 @@ function makeFakeSubprocess(): {
     calls.push({
       command: spec.command,
       args: spec.arguments,
-      env: spec.environment
+      env: spec.environment,
+      stdin: spec.stdin,
+      stderr: spec.stderr
     });
     const factory = factories.shift();
     if (factory === undefined) {
@@ -166,6 +172,19 @@ function baseDeps(
   };
 }
 
+/**
+ * Yield enough microtask + macrotask turns for the exit-handler chain
+ * to settle: `wait().then(async ...)` → `await awaitDrainerOrGrace()`
+ * (which schedules a Promise.race against a setTimeout) → snapshot +
+ * emit. The `setTimeout(_, 0)` flush is what drains any pending macro-
+ * tasks the race may have queued; the trailing microtasks settle the
+ * async handler's resumption hops.
+ */
+async function settleExit(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+}
+
 describe("createProxyLifecycle.start", () => {
   it("spawns the child once and returns its pid", async () => {
     const sub = makeFakeSubprocess();
@@ -180,6 +199,22 @@ describe("createProxyLifecycle.start", () => {
       args: ["/fake/server.mjs"]
     });
     expect(sub.calls[0]?.env).toMatchObject({ LLM_PROXY_PORT: "11400" });
+  });
+
+  it("UL-1: spawn opts explicitly include stdin: 'pipe' (Linux Subprocess auto-pipe unverified)", async () => {
+    // Mozilla's Subprocess.sys.mjs auto-pipes stdin on macOS but Linux
+    // behavior is not verified — a GUI launcher (.desktop, snap) may
+    // inherit /dev/null, which EOFs immediately and trips the proxy's
+    // stdin-EOF parent-death detector at startup. We pass `stdin: "pipe"`
+    // explicitly so the EOF only fires when the parent actually closes.
+    const sub = makeFakeSubprocess();
+    sub.queue(() => makeFakeChild(4243));
+    const lifecycle = createProxyLifecycle(baseDeps({ subprocess: sub.subprocess }));
+    await lifecycle.start();
+    expect(sub.calls).toHaveLength(1);
+    expect(sub.calls[0]?.stdin).toBe("pipe");
+    // stderr stays piped — regression guard for Bug C's rolling buffer.
+    expect(sub.calls[0]?.stderr).toBe("pipe");
   });
 
   it("returns the existing pid when already running and does not double-spawn", async () => {
@@ -217,9 +252,8 @@ describe("createProxyLifecycle.start", () => {
     expect(a).toEqual({ pid: 1 });
     // Simulate crash.
     first.release(137);
-    // Let the exit handler run.
-    await Promise.resolve();
-    await Promise.resolve();
+    // Let the exit handler run (await drainer race + snapshot + emit).
+    await settleExit();
     expect(lifecycle.trackedPid()).toBeNull();
     const b = await lifecycle.start();
     expect(b).toEqual({ pid: 2 });
@@ -446,8 +480,7 @@ describe("createProxyLifecycle.onExit", () => {
     const unsubscribe = lifecycle.onExit(listener);
     await lifecycle.start();
     fake.release(42);
-    await Promise.resolve();
-    await Promise.resolve();
+    await settleExit();
     // Bug-C: the listener now receives `(exitCode, info)`. The diagnostic
     // info bag carries the rolling stderr buffer + an "unexpected" flag
     // so the UI can decide whether to surface an error message. Backwards-
@@ -699,9 +732,7 @@ describe("createProxyLifecycle exit diagnostics (Bug C)", () => {
     await Promise.resolve();
     await Promise.resolve();
     fake.release(1);
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    await settleExit();
     expect(listener).toHaveBeenCalledTimes(1);
     const args = listener.mock.calls[0] as [number | null, { stderr: string; unexpected: boolean }];
     expect(args[0]).toBe(1);
@@ -730,9 +761,7 @@ describe("createProxyLifecycle exit diagnostics (Bug C)", () => {
     // Advance time by 100ms — well inside the early-exit window.
     nowVal += 100;
     fake.release(0);
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    await settleExit();
     expect(listener).toHaveBeenCalledTimes(1);
     const info = listener.mock.calls[0]?.[1] as { unexpected: boolean; stderr: string };
     expect(info.unexpected).toBe(true);
@@ -787,8 +816,7 @@ describe("createProxyLifecycle exit diagnostics (Bug C)", () => {
     // normal lifecycle shutdown (e.g., a graceful node process.exit()).
     nowVal += 60_000;
     fake.release(0);
-    await Promise.resolve();
-    await Promise.resolve();
+    await settleExit();
     const info = listener.mock.calls[0]?.[1] as { unexpected: boolean };
     expect(info.unexpected).toBe(false);
   });
@@ -812,9 +840,7 @@ describe("createProxyLifecycle exit diagnostics (Bug C)", () => {
     await Promise.resolve();
     await Promise.resolve();
     fake.release(2);
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    await settleExit();
     const info = listener.mock.calls[0]?.[1] as { stderr: string };
     expect(info.stderr.length).toBeLessThanOrEqual(500);
     expect(info.stderr).toContain(tail);
@@ -836,5 +862,235 @@ describe("createProxyLifecycle exit diagnostics (Bug C)", () => {
       LLM_PROXY_CONFIG_READ: "allow",
       FOO: "bar"
     });
+  });
+});
+
+/**
+ * Stderr-exit race regression — pattern `stderr-exit-race-loses-error-message`.
+ *
+ * Premises:
+ *   P1. drainStderr runs as an async task that consumes the child's
+ *       stderr stream into a rolling buffer.
+ *   P2. wait() may resolve BEFORE the drainer has consumed all chunks
+ *       (fast-crashing children: module-load errors, EADDRINUSE, syntax
+ *       errors all emit stderr then exit in the same OS scheduling tick).
+ *   P3. The exit handler MUST grant the drainer a short grace window
+ *       (STDERR_GRACE_MS = 500ms) so the snapshot includes the stderr
+ *       chunks that arrived just before exit. Pre-fix the handler
+ *       snapshotted synchronously and lost the message.
+ *   P4. A hung drainer (stream that never closes) MUST NOT block the
+ *       exit listener forever — the grace race caps the wait at 500ms
+ *       and falls through with whatever stderr accumulated by then.
+ */
+describe("createProxyLifecycle stderr drain race", () => {
+  /**
+   * Build a SubprocessHandle whose stderr is an async-iterable. The
+   * iterable's `next()` blocks on a manual gate so the test drives the
+   * exact interleaving of (a) wait() resolving and (b) the drainer
+   * consuming chunks.
+   *
+   * `flush(chunks, { close })` releases the queued chunks to the next
+   * `next()` call; passing `close: true` then closes the iterable
+   * (drainer reaches EOF). Without `close: true`, the iterable stays
+   * open — simulating a hung stderr stream.
+   */
+  function makeRaceChild(pid: number): {
+    readonly handle: SubprocessHandle;
+    release: (exitCode: number | null) => void;
+    flush: (chunks: readonly string[], options?: { close?: boolean }) => void;
+  } {
+    let resolveWait: ((value: { readonly exitCode: number | null }) => void) | null = null;
+    const waitPromise = new Promise<{ readonly exitCode: number | null }>((resolve) => {
+      resolveWait = resolve;
+    });
+    let pendingChunks: string[] = [];
+    let pendingResolve: ((value: IteratorResult<string>) => void) | null = null;
+    let closed = false;
+    const tryDeliver = (): void => {
+      if (pendingResolve === null) return;
+      const chunk = pendingChunks.shift();
+      if (chunk !== undefined) {
+        const r = pendingResolve;
+        pendingResolve = null;
+        r({ value: chunk, done: false });
+        return;
+      }
+      if (closed) {
+        const r = pendingResolve;
+        pendingResolve = null;
+        r({ value: undefined, done: true });
+      }
+    };
+    const stderr: AsyncIterable<string> = {
+      [Symbol.asyncIterator](): AsyncIterator<string> {
+        return {
+          next(): Promise<IteratorResult<string>> {
+            return new Promise<IteratorResult<string>>((resolve) => {
+              pendingResolve = resolve;
+              tryDeliver();
+            });
+          }
+        };
+      }
+    };
+    const handle: SubprocessHandle = {
+      pid,
+      wait(): Promise<{ readonly exitCode: number | null }> {
+        return waitPromise;
+      },
+      kill(): void {
+        // unused in these tests
+      },
+      stderr
+    };
+    return {
+      handle,
+      release(exitCode) {
+        resolveWait?.({ exitCode });
+      },
+      flush(chunks, options) {
+        pendingChunks = [...pendingChunks, ...chunks];
+        if (options?.close === true) closed = true;
+        tryDeliver();
+      }
+    };
+  }
+
+  it("SR-1 (regression): captures stderr chunk emitted before wait() resolves but drained after", async () => {
+    // Pre-fix repro: the child wrote one stderr chunk THEN crashed.
+    // The drainer is fire-and-forget; wait() resolves immediately. The
+    // exit handler used to snapshot `stderrBuffer` synchronously, missing
+    // the chunk that the drainer hadn't consumed yet. With the fix, the
+    // exit handler awaits Promise.race([drainerDone, STDERR_GRACE_MS])
+    // so the drainer gets a chance to flush before the snapshot.
+    const sub = makeFakeSubprocess();
+    const race = makeRaceChild(20000);
+    sub.queue(() => ({
+      handle: race.handle,
+      kills: [],
+      release: race.release,
+      fail: () => undefined
+    }));
+    const lifecycle = createProxyLifecycle(baseDeps({ subprocess: sub.subprocess }));
+    const listener = vi.fn();
+    lifecycle.onExit(listener);
+
+    await lifecycle.start();
+
+    // Resolve wait() FIRST — before the drainer has consumed anything.
+    // Then queue the stderr chunk + EOF. The race grace must give the
+    // drainer a chance to consume both before the snapshot.
+    race.release(1);
+    race.flush(["ERR_MODULE_NOT_FOUND: cannot find module 'protocol-constants.mjs'\n"], {
+      close: true
+    });
+
+    // The drainer is now able to consume both. We don't know how many
+    // microtask ticks the awaitDrainerOrGrace + drainer iteration takes,
+    // so simply await the controller's exit handler by yielding enough
+    // event-loop turns for the EOF microtask chain to settle.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    const info = listener.mock.calls[0]?.[1] as { stderr: string; unexpected: boolean };
+    expect(info.stderr).toContain("ERR_MODULE_NOT_FOUND");
+    expect(info.unexpected).toBe(true);
+  });
+
+  it("SR-2 (grace window): exit fires within ~600ms even when stderr stream never closes", async () => {
+    // A hung drainer (stream never reaches EOF) must not block the exit
+    // listener forever. The grace race caps the wait at STDERR_GRACE_MS
+    // (500ms) and the snapshot uses whatever stderr accumulated up to
+    // that point.
+    const sub = makeFakeSubprocess();
+    const race = makeRaceChild(20001);
+    sub.queue(() => ({
+      handle: race.handle,
+      kills: [],
+      release: race.release,
+      fail: () => undefined
+    }));
+    const lifecycle = createProxyLifecycle(baseDeps({ subprocess: sub.subprocess }));
+    const listener = vi.fn();
+    lifecycle.onExit(listener);
+
+    await lifecycle.start();
+
+    // Drainer consumes one chunk then hangs (stream never closes —
+    // simulates a misbehaving stream where the child crashed but the
+    // pipe remained open from the parent's perspective).
+    race.flush(["Partial stderr before hang\n"]); // no close
+    // Give the drainer a microtask to consume the chunk into the buffer.
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+
+    const startedAt = Date.now();
+    race.release(1);
+
+    // Wait for the exit listener to fire. The grace is 500ms; allow a
+    // bit of slack for timer scheduling.
+    while (listener.mock.calls.length === 0 && Date.now() - startedAt < 1500) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const elapsed = Date.now() - startedAt;
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(elapsed).toBeLessThan(1000); // grace ~500ms + slack, well under 1s
+    const info = listener.mock.calls[0]?.[1] as { stderr: string; unexpected: boolean };
+    // Whatever stderr accumulated before the grace expired should be in
+    // the snapshot — the partial chunk we flushed before the hang.
+    expect(info.stderr).toContain("Partial stderr before hang");
+    expect(info.unexpected).toBe(true);
+  });
+
+  it("SR-3 (no race): clean SIGTERM exit captures full stderr without unnecessary delay", async () => {
+    // Sanity check that the fix doesn't regress the healthy stop()
+    // path. The child writes some stderr during its lifetime, the user
+    // initiates Stop (SIGTERM), the child closes its stderr stream then
+    // exits 0. The exit handler should:
+    //   (a) capture the full stderr (because the drainer already saw EOF
+    //       before the grace timer was needed), and
+    //   (b) classify the exit as expected (stop() was called).
+    const sub = makeFakeSubprocess();
+    const race = makeRaceChild(20002);
+    // Wire SIGTERM → release(0) so stop() drives the child to exit.
+    const handleWithKill: SubprocessHandle = {
+      ...race.handle,
+      kill(signal): void {
+        if (signal === "SIGTERM" || signal === undefined) {
+          // Close the stderr stream first so the drainer reaches EOF,
+          // then resolve wait(). This is the realistic ordering: a
+          // well-behaved child closes its fds before exiting.
+          race.flush([], { close: true });
+          race.release(0);
+        }
+      }
+    };
+    sub.queue(() => ({
+      handle: handleWithKill,
+      kills: [],
+      release: race.release,
+      fail: () => undefined
+    }));
+    const lifecycle = createProxyLifecycle(baseDeps({ subprocess: sub.subprocess }));
+    const listener = vi.fn();
+    lifecycle.onExit(listener);
+
+    await lifecycle.start();
+    // Emit some runtime-stderr the drainer can pick up before stop().
+    race.flush(["[proxy] booting on 127.0.0.1:11400\n"]);
+    // Let the drainer consume that chunk into the buffer.
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+
+    const startedAt = Date.now();
+    await lifecycle.stop();
+    const elapsed = Date.now() - startedAt;
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    // Clean exit should NOT wait the full grace window — the drainer
+    // hit EOF synchronously with the kill, so the race short-circuits.
+    expect(elapsed).toBeLessThan(400);
+    const info = listener.mock.calls[0]?.[1] as { stderr: string; unexpected: boolean };
+    expect(info.stderr).toContain("booting on 127.0.0.1:11400");
+    expect(info.unexpected).toBe(false);
   });
 });

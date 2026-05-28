@@ -295,6 +295,91 @@ describe("settings save flow (integration)", () => {
     await runtime.shutdown();
   });
 
+  it("threads getProxyAuthHeader into the Save-button URL probe (proxy preset)", async () => {
+    // Regression: clicking Save with a Codex/Claude Proxy URL surfaced
+    // "Server responded 401 for /api/tags" because the runtime's
+    // `probeOneUrl` never attached the proxy bearer. With the closure
+    // threaded through, the GET reaches `/api/tags` with the bearer
+    // and validation passes.
+    const prefs = makePrefStore({
+      [CHAT_BASE_URL_PREF]: "http://localhost:11400/codex",
+      [EMBED_BASE_URL_PREF]: "http://localhost:11400/codex",
+      [CHAT_MODEL_PREF]: "gpt-5-codex",
+      [EMBEDDING_MODEL_PREF]: "gpt-5-codex"
+    });
+    const fakeFetch = makeFakeFetch(["gpt-5-codex"]);
+    const { popupController, sidebarController } = makeStubControllers();
+
+    const menuCallbacks: { label: string; action: () => void }[] = [];
+    const realUi = createZoteroUiAdapter({
+      Zotero: { debug: vi.fn(), getMainWindow: () => window },
+      pluginId: "test"
+    });
+    const ui: typeof realUi = {
+      ...realUi,
+      addMenuItem(label, action) {
+        menuCallbacks.push({ label, action });
+        return realUi.addMenuItem(label, action);
+      }
+    };
+
+    // The closure returns the bearer regardless of input here so the
+    // assertion below can pin it; in production it self-gates on
+    // hostname/port (the buildProxyAuthHeader unit tests pin that).
+    const fakeBearer = "Bearer proxy-token-zzz";
+    const getProxyAuthHeader = vi.fn((): Record<string, string> => ({ Authorization: fakeBearer }));
+
+    const initial = {
+      ...createDefaultOllamaSettings(),
+      baseUrl: "http://localhost:11400/codex",
+      chatBaseUrl: "http://localhost:11400/codex",
+      embedBaseUrl: "http://localhost:11400/codex",
+      chatModel: "gpt-5-codex",
+      embeddingModel: "gpt-5-codex"
+    };
+    const runtime = createZoteroRuntime({
+      settings: initial,
+      indexingController: createIndexingController({
+        logger: { debug: () => undefined },
+        ...controllerStubDeps()
+      }),
+      ui,
+      store: createConversationStore(),
+      profile: () => ollamaSettingsToProfile(initial),
+      popupController,
+      sidebarController,
+      disclosure: () => "disclosure",
+      prefsWriter: prefs.writer,
+      fetch: fakeFetch,
+      getProxyAuthHeader
+    });
+    await runtime.startup();
+
+    menuCallbacks.find((m) => m.label === "Zotero AI Explain Settings")?.action();
+
+    vi.useFakeTimers();
+    document.querySelector<HTMLButtonElement>('[data-action="save-settings"]')?.click();
+    for (let i = 0; i < 5; i++) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    await vi.advanceTimersByTimeAsync(1100);
+    vi.useRealTimers();
+
+    // Both validate probes (chat + embed) went through with the bearer.
+    expect(fakeFetch).toHaveBeenCalledTimes(2);
+    type FetchInit = { readonly headers?: Record<string, string> };
+    const init0 = fakeFetch.mock.calls[0]?.[1] as FetchInit | undefined;
+    const init1 = fakeFetch.mock.calls[1]?.[1] as FetchInit | undefined;
+    expect(init0?.headers?.Authorization).toBe(fakeBearer);
+    expect(init1?.headers?.Authorization).toBe(fakeBearer);
+    // And the closure was invoked with the trimmed base URL (no
+    // `/api/tags` suffix) so the production closure's hostname/port
+    // gate sees the form it was designed for.
+    expect(getProxyAuthHeader).toHaveBeenCalledWith("http://localhost:11400/codex");
+
+    await runtime.shutdown();
+  });
+
   it("Cancel never writes prefs and closes the dialog", async () => {
     const prefs = makePrefStore();
     const fakeFetch = makeFakeFetch(["gemma4:e4b"]);

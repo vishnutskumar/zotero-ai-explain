@@ -7,7 +7,11 @@ import { runE2eDriver } from "./platform/e2e-driver.js";
 import type { SubprocessLike } from "./platform/proxy-lifecycle.js";
 import { dumpZoteroTokens } from "./platform/token-dump.js";
 import { wireProxyLifecycle, type WiredProxy } from "./platform/wire-proxy-lifecycle.js";
-import { createZoteroRuntime, type ZoteroRuntime } from "./platform/zotero-runtime.js";
+import {
+  createPopupRetrievalChannel,
+  createZoteroRuntime,
+  type ZoteroRuntime
+} from "./platform/zotero-runtime.js";
 import { createZoteroUiAdapter, type ZoteroGlobal } from "./platform/zotero-ui-adapter.js";
 import {
   loadOllamaSettingsFromPrefs,
@@ -352,6 +356,42 @@ function describeDisclosureFor(readProviderProfile: () => ProviderProfileSetting
   return () => providerDisclosure(providerProfileToDisclosure(readProviderProfile()));
 }
 
+/**
+ * Decide whether a request to `requestBaseUrl` is going to the bundled
+ * local LLM proxy and, if so, mint the `Authorization: Bearer <token>`
+ * header the proxy expects. Exported so the wiring rule is testable in
+ * isolation — the bootstrap closure that lives inside `startup()` is a
+ * one-line forward to this helper.
+ *
+ * The match policy mirrors the proxy server's allowed-hosts Set: hostname
+ * must be either `127.0.0.1` OR `localhost`, and the port must equal the
+ * proxy's currently-configured port. URL parse failures degrade to
+ * "no header" so the adapter falls back to the unauthenticated path
+ * (which is what real-Ollama-daemon callers rely on).
+ *
+ * The previous implementation matched a literal `http://127.0.0.1:<port>`
+ * prefix via `startsWith`, which silently dropped the header for the
+ * `localhost` form the proxy presets write. That caused the user-visible
+ * "missing bearer" 401 on the Codex/Claude Proxy presets.
+ */
+export function buildProxyAuthHeader(input: {
+  readonly requestBaseUrl: string;
+  readonly token: string | null;
+  readonly proxyPort: number;
+}): Record<string, string> | undefined {
+  if (input.token === null) return undefined;
+  let parsed: URL;
+  try {
+    parsed = new URL(input.requestBaseUrl);
+  } catch {
+    return undefined;
+  }
+  const hostMatches = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
+  if (!hostMatches) return undefined;
+  if (parsed.port !== String(input.proxyPort)) return undefined;
+  return { Authorization: `Bearer ${input.token}` };
+}
+
 function maybeDumpTokens(zotero: ZoteroWithPrefs): void {
   let enabled = false;
   try {
@@ -626,8 +666,18 @@ async function maybeRunOnboarding(deps: {
   readonly boundFetch: typeof fetch | undefined;
   readonly prefs: StringPrefReader;
   readonly prefsWriter: StringPrefWriter;
+  /**
+   * Optional bundled-proxy bearer accessor. A user who picked a Codex/
+   * Claude Proxy preset has `settings.baseUrl` pointing at
+   * `http://localhost:11400/codex` (applyPreset writes baseUrl ===
+   * chatBaseUrl), and the proxy enforces bearer auth on `/api/tags`.
+   * Without this the first-run probe always reported `ollama-missing`
+   * for proxy users. Closure self-gates on hostname/port; non-proxy
+   * URLs get no header.
+   */
+  readonly getProxyAuthHeader?: (baseUrl: string) => Record<string, string> | undefined;
 }): Promise<void> {
-  const { zotero, runtime, settings, boundFetch, prefs, prefsWriter } = deps;
+  const { zotero, runtime, settings, boundFetch, prefs, prefsWriter, getProxyAuthHeader } = deps;
   if (readOnboardingShown(prefs)) {
     return;
   }
@@ -641,7 +691,8 @@ async function maybeRunOnboarding(deps: {
       baseUrl: settings.baseUrl,
       chatModel: settings.chatModel,
       embeddingModel: settings.embeddingModel,
-      fetch: boundFetch
+      fetch: boundFetch,
+      ...(getProxyAuthHeader !== undefined ? { getProxyAuthHeader } : {})
     });
   } catch (err) {
     zotero.debug(
@@ -744,7 +795,8 @@ async function maybeRunOnboarding(deps: {
             baseUrl: settings.baseUrl,
             chatModel: settings.chatModel,
             embeddingModel: settings.embeddingModel,
-            fetch: boundFetch
+            fetch: boundFetch,
+            ...(getProxyAuthHeader !== undefined ? { getProxyAuthHeader } : {})
           });
         } catch (err) {
           return {
@@ -781,6 +833,7 @@ function createSubprocessAdapter(zotero: ZoteroGlobal): SubprocessLike | null {
         readonly environment?: Readonly<Record<string, string>>;
         readonly environmentAppend?: boolean;
         readonly stderr?: "pipe" | "ignore" | "stdout";
+        readonly stdin?: "pipe" | "ignore" | "stdout";
       }): Promise<{
         readonly pid: number;
         wait(): Promise<{ readonly exitCode: number | null }>;
@@ -820,6 +873,13 @@ function createSubprocessAdapter(zotero: ZoteroGlobal): SubprocessLike | null {
         ...(args.environmentAppend !== undefined
           ? { environmentAppend: args.environmentAppend }
           : {}),
+        // Default to "pipe" on both stdin and stderr to match the
+        // proxy-lifecycle contract: stdin must be a real pipe so the
+        // server's parent-death detector reacts to parent close (not to
+        // a /dev/null EOF on Linux GUI launchers), and stderr is piped
+        // so the lifecycle's rolling-buffer drainer can surface crash
+        // diagnostics into the settings UI.
+        stdin: args.stdin ?? "pipe",
         stderr: args.stderr ?? "pipe"
       });
       return {
@@ -940,6 +1000,146 @@ function makeChromePathExists(zotero: ZoteroGlobal): (path: string) => boolean {
         `Zotero AI Explain: pathExists(${path}) failed ${err instanceof Error ? err.message : String(err)}`
       );
       return false;
+    }
+  };
+}
+
+/**
+ * Build a sync `listDirectory` adapter on top of chrome's nsIFile
+ * directoryEntries enumerator. Used by the nvm scan in
+ * wire-proxy-lifecycle to enumerate `~/.nvm/versions/node` (POSIX) or
+ * `~/AppData/Roaming/nvm` (NVM-Windows). Returns `[]` on missing /
+ * unreadable directories or stripped (test) chrome hosts.
+ */
+function makeChromeListDirectory(zotero: ZoteroGlobal): (path: string) => readonly string[] {
+  type NsFile = {
+    initWithPath(p: string): void;
+    exists(): boolean;
+    isDirectory(): boolean;
+    readonly directoryEntries: {
+      hasMoreElements(): boolean;
+      getNext(): unknown;
+    };
+    readonly leafName?: string;
+  };
+  type FileFactory = {
+    createInstance(iface: unknown): NsFile;
+  };
+  type ComponentsLike = {
+    readonly classes: Record<string, FileFactory>;
+    readonly interfaces: Record<string, unknown>;
+  };
+  const components = (globalThis as unknown as { readonly Components?: ComponentsLike }).Components;
+  if (components === undefined) {
+    return () => [];
+  }
+  return (path: string): readonly string[] => {
+    try {
+      const factory = components.classes["@mozilla.org/file/local;1"];
+      if (factory === undefined) return [];
+      const nsIFile = components.interfaces.nsIFile;
+      const dir = factory.createInstance(nsIFile);
+      dir.initWithPath(path);
+      if (!dir.exists() || !dir.isDirectory()) return [];
+      const entries: string[] = [];
+      const iter = dir.directoryEntries;
+      while (iter.hasMoreElements()) {
+        const next = iter.getNext() as { readonly leafName?: string } | null;
+        const leaf = next?.leafName;
+        if (typeof leaf === "string" && leaf.length > 0) entries.push(leaf);
+      }
+      return entries;
+    } catch (err) {
+      zotero.debug(
+        `Zotero AI Explain: listDirectory(${path}) failed ${err instanceof Error ? err.message : String(err)}`
+      );
+      return [];
+    }
+  };
+}
+
+/**
+ * Sync `readTextFile` adapter for tiny one-line files (specifically
+ * `~/.nvm/alias/default`). Backed by chrome's
+ * `IOUtils.readUTF8` would be async-only; we use the synchronous
+ * `nsIFileInputStream` + `nsIScriptableInputStream` chain instead so
+ * detection stays synchronous during the settings-dialog render.
+ * Returns `null` on missing / unreadable files / stripped chrome hosts.
+ */
+function makeChromeReadTextFile(zotero: ZoteroGlobal): (path: string) => string | null {
+  type NsFile = {
+    initWithPath(p: string): void;
+    exists(): boolean;
+  };
+  type FileFactory = { createInstance(iface: unknown): NsFile };
+  type StreamFactory = {
+    createInstance(iface: unknown): {
+      init(file: NsFile, ioFlags: number, perm: number, behaviorFlags: number): void;
+      close(): void;
+      readonly available?: () => number;
+    };
+  };
+  type ScriptableStreamFactory = {
+    createInstance(iface: unknown): {
+      init(stream: unknown): void;
+      read(count: number): string;
+      close(): void;
+    };
+  };
+  type ComponentsLike = {
+    readonly classes: Record<string, FileFactory | StreamFactory | ScriptableStreamFactory>;
+    readonly interfaces: Record<string, unknown>;
+  };
+  const components = (globalThis as unknown as { readonly Components?: ComponentsLike }).Components;
+  if (components === undefined) {
+    return () => null;
+  }
+  return (path: string): string | null => {
+    try {
+      const fileFactory = components.classes["@mozilla.org/file/local;1"] as
+        | FileFactory
+        | undefined;
+      const streamFactory = components.classes["@mozilla.org/network/file-input-stream;1"] as
+        | StreamFactory
+        | undefined;
+      const scriptableFactory = components.classes["@mozilla.org/scriptableinputstream;1"] as
+        | ScriptableStreamFactory
+        | undefined;
+      if (
+        fileFactory === undefined ||
+        streamFactory === undefined ||
+        scriptableFactory === undefined
+      ) {
+        return null;
+      }
+      const file = fileFactory.createInstance(components.interfaces.nsIFile);
+      file.initWithPath(path);
+      if (!file.exists()) return null;
+      const stream = streamFactory.createInstance(components.interfaces.nsIFileInputStream);
+      stream.init(file, 0x01, 0o444, 0);
+      try {
+        const scriptable = scriptableFactory.createInstance(
+          components.interfaces.nsIScriptableInputStream
+        );
+        scriptable.init(stream);
+        try {
+          // Alias files are a single short line; cap the read at 4 KiB
+          // so a stray large file never blocks startup.
+          const available = stream.available?.() ?? 4096;
+          const cap = Math.min(Math.max(available, 0), 4096);
+          if (cap === 0) return "";
+          return scriptable.read(cap);
+        } finally {
+          scriptable.close();
+        }
+      } finally {
+        stream.close();
+      }
+    } catch (err) {
+      zotero.debug(
+        `Zotero AI Explain: readTextFile(${path}) failed ${err instanceof Error ? err.message : String(err)}`
+      );
+      return null;
     }
   };
 }
@@ -1086,7 +1286,31 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
   }
   const boundFetch = typeof fetchFn === "function" ? fetchFn.bind(globalThis) : globalThis.fetch;
 
-  const ollamaProvider = createOllamaProvider({ fetch: boundFetch });
+  // Build the proxy auth-header closure BEFORE the ollama adapter so
+  // both can capture it. The closure must be lazy because
+  // `proxyWired` is assigned later (the subprocess adapter is built
+  // a few hundred lines down once the runtime context is ready); it
+  // also stays null on non-chrome hosts where the proxy was never
+  // wired. The accessor returns undefined on either of those branches
+  // — exactly the "no auth header" case the adapter's spread relies
+  // on.
+  const getProxyAuthHeader = (requestBaseUrl: string): Record<string, string> | undefined => {
+    const wired = proxyWired;
+    if (wired === null) return undefined;
+    // The proxy's port is read from snapshot() on every call so a mid-
+    // session settings-dialog edit (applyValues → restart on a new
+    // port) is reflected immediately. The token accessor is similarly
+    // lazy because the token rotates on every spawn.
+    return buildProxyAuthHeader({
+      requestBaseUrl,
+      token: wired.getProxyAuthToken(),
+      proxyPort: wired.snapshot().port
+    });
+  };
+  const ollamaProvider = createOllamaProvider({
+    fetch: boundFetch,
+    getProxyAuthHeader
+  });
   const registry = createProviderRegistry([ollamaProvider]);
   // Resolve the prior single-chat-provider for the popup / sidebar
   // entry points. Direct-API providers replace `provider` with the
@@ -1160,6 +1384,11 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
   // best-effort: missing/empty index, embedding failures, or dim-mismatch
   // all fall through to the unwrapped provider so the popup never blocks
   // on retrieval problems.
+  // Pub/sub channel for retrieved chunks. The rag provider publishes
+  // here on each request; the runtime's popup/sidebar conversations
+  // subscribe to populate per-conversation citation lookups for
+  // linkifying `[itemKey#chunkIndex]` tokens in assistant text.
+  const popupRetrievalChannel = createPopupRetrievalChannel();
   const ragProvider = createRagAugmentedProvider({
     inner: provider,
     embeddingProvider,
@@ -1167,6 +1396,18 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
     embedSettings: { baseUrl: settings.embedBaseUrl, model: settings.embeddingModel },
     debug: (msg) => {
       context.Zotero.debug(`Zotero AI Explain: ${msg}`);
+    },
+    onRetrieved: (chunks, context) => {
+      // HIGH-1 follow-up: forward the correlation id (when the caller
+      // stamped one — popup/sidebar controllers do, library-chat
+      // doesn't) so per-conversation subscribers can filter by
+      // conversation id and avoid cross-contaminating each other's
+      // citation lookups.
+      popupRetrievalChannel.publish(
+        context.correlationId !== undefined
+          ? { conversationId: context.correlationId, chunks }
+          : { chunks }
+      );
     }
   });
   const popupController = createPopupController({ store, provider: ragProvider });
@@ -1192,6 +1433,8 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
         }
       },
       pathExists: makeChromePathExists(context.Zotero),
+      listDirectory: makeChromeListDirectory(context.Zotero),
+      readTextFile: makeChromeReadTextFile(context.Zotero),
       ...(detectedHomeDir !== undefined ? { homeDir: detectedHomeDir } : {}),
       // Developer-friendly default: the user's checkout. End users can
       // override via the settings dialog; the XPI does not ship the
@@ -1293,7 +1536,15 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
     prefsWriter: asStringPrefWriter(zotero.Prefs),
     libraryChat: libraryChatDeps,
     zotero: context.Zotero,
+    popupRetrievalChannel,
     providerProfile,
+    // Thread the proxy bearer closure into the runtime so the Save-
+    // button URL probe AND the live model-discovery dropdown attach
+    // `Authorization: Bearer <token>` when targeting the bundled
+    // proxy. Without this, the settings dialog 401s the user out of
+    // the Codex / Claude Proxy presets at validate-and-save time and
+    // at "list models" refresh time.
+    getProxyAuthHeader,
     onProviderProfileChange: (next) => {
       context.Zotero.debug(
         `Zotero AI Explain provider profile saved: chat=${next.chatProvider} embed=${next.embedProvider}. New providers take effect after a Zotero restart.`
@@ -1367,7 +1618,8 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
     settings,
     boundFetch,
     prefs: asStringPrefReader(zotero.Prefs),
-    prefsWriter: asStringPrefWriter(zotero.Prefs)
+    prefsWriter: asStringPrefWriter(zotero.Prefs),
+    getProxyAuthHeader
   });
 
   // Optional diagnostic-driven user journey. Gated on the

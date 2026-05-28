@@ -3,14 +3,25 @@
 A small Node HTTP server that speaks the Ollama `/api/chat` wire protocol on the front side and
 routes each request to one of three backends:
 
-- **Codex CLI** (`POST /codex/api/chat`) — spawns `codex exec --json -` (or
-  `codex exec resume <SESSION_ID> --json -` for follow-up turns) and translates Codex's JSON event
-  stream into Ollama-format NDJSON chunks.
+- **Codex CLI** (`POST /codex/api/chat`) — spawns `codex mcp-server -c mcp_servers={}` and drives it
+  with a three-frame JSON-RPC handshake (`initialize` → `notifications/initialized` →
+  `tools/call codex` for first turns, `tools/call codex-reply { threadId }` for follow-up turns).
+  Per-token deltas arrive as `codex/event` notifications carrying
+  `msg.type === "agent_message_content_delta"` and are translated into Ollama-format NDJSON chunks.
+  The `-c mcp_servers={}` override suppresses any user-configured MCP sidecars (which would
+  otherwise add 1-3 s of avoidable per-turn startup) since the proxy uses `codex mcp-server` purely
+  as a streaming chat backend. Spawned in an isolated environment (`HOME` + `CODEX_HOME` + `cwd`
+  pointed at a per-backend tmpdir; see [Subprocess isolation](#subprocess-isolation)) so the user's
+  `~/.codex/AGENTS.md` and bundled skills do not bleed into Zotero responses.
 - **Claude Code CLI** (`POST /claude/api/chat`) — spawns
-  `claude -p --output-format json --allowedTools "" -` (or
-  `claude --resume <SESSION_ID> -p --output-format json --allowedTools "" -` for follow-up turns)
-  and translates Claude's JSON output into Ollama-format NDJSON chunks. Tool use is hard-disabled
-  via the empty `--allowedTools` allowlist so Claude behaves as a pure chat model.
+  `claude -p --output-format stream-json --verbose --include-partial-messages --allowedTools "" --setting-sources user --strict-mcp-config --disable-slash-commands --system-prompt <NEUTRAL_PREFACE> -`
+  (or the same with a leading `--resume <SESSION_ID>` for follow-up turns) and translates the
+  incremental `content_block_delta` text frames into Ollama-format NDJSON chunks. Tool use is
+  hard-disabled via the empty `--allowedTools` allowlist so Claude behaves as a pure chat model; the
+  trailing four isolation flags suppress user-config sources, MCP sidecars, and slash commands and
+  inject a neutral system prompt (see [Subprocess isolation](#subprocess-isolation)). `cwd` is set
+  to a per-backend tmpdir; `HOME` is **not** overridden because subscription auth resolves through
+  the OS keychain.
 - **Real Ollama** (`POST /ollama/api/chat`) — forwards verbatim to a real Ollama daemon (default
   `http://localhost:11434`).
 
@@ -29,7 +40,7 @@ Output:
 
 ```text
 zotero-ai-llm-proxy listening on http://127.0.0.1:11400
-  /codex   → Codex CLI (multi-turn session_id resume)
+  /codex   → Codex CLI (multi-turn via codex-reply { threadId })
   /claude  → Claude Code CLI (multi-turn --resume)
   /ollama  → http://localhost:11434
 ```
@@ -38,8 +49,8 @@ zotero-ai-llm-proxy listening on http://127.0.0.1:11400
 
 | Method | Path                | Behaviour                                                    |
 | ------ | ------------------- | ------------------------------------------------------------ |
-| POST   | `/codex/api/chat`   | Ollama-compatible chat backed by `codex exec`.               |
-| POST   | `/claude/api/chat`  | Ollama-compatible chat backed by `claude -p`.                |
+| POST   | `/codex/api/chat`   | Ollama-compatible chat backed by `codex mcp-server`.         |
+| POST   | `/claude/api/chat`  | Ollama-compatible chat backed by `claude -p` (stream-json).  |
 | POST   | `/ollama/api/chat`  | Passthrough to a real Ollama daemon.                         |
 | POST   | `/ollama/api/embed` | Passthrough Ollama embeddings (Codex/Claude do not support). |
 | POST   | `/codex/api/embed`  | 501 — Codex does not support embeddings.                     |
@@ -54,17 +65,77 @@ zotero-ai-llm-proxy listening on http://127.0.0.1:11400
 
 All settings are environment variables read at startup.
 
-| Variable                 | Default                  | Purpose                                                  |
-| ------------------------ | ------------------------ | -------------------------------------------------------- |
-| `LLM_PROXY_PORT`         | `11400`                  | Listen port on `127.0.0.1`.                              |
-| `OLLAMA_BASE_URL`        | `http://localhost:11434` | Real Ollama daemon for the passthrough backend.          |
-| `CODEX_DEFAULT_MODEL`    | `gpt-5.2-codex`          | Model passed via `codex exec --model` when none in body. |
-| `CODEX_IDLE_TIMEOUT_MS`  | `60000`                  | Kill `codex` after this long with no output activity.    |
-| `CODEX_HARD_TIMEOUT_MS`  | `300000`                 | Kill `codex` after this long regardless of activity.     |
-| `CLAUDE_BINARY`          | `claude` (search `PATH`) | Path to the `claude` CLI executable.                     |
-| `CLAUDE_DEFAULT_MODEL`   | _(empty)_                | Model passed via `claude --model` when none in body.     |
-| `CLAUDE_IDLE_TIMEOUT_MS` | `60000`                  | Kill `claude` after this long with no output activity.   |
-| `CLAUDE_HARD_TIMEOUT_MS` | `300000`                 | Kill `claude` after this long regardless of activity.    |
+| Variable                     | Default                  | Purpose                                                                                                                                                                                                                |
+| ---------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LLM_PROXY_PORT`             | `11400`                  | Listen port on `127.0.0.1`.                                                                                                                                                                                            |
+| `LLM_PROXY_AUTH_TOKEN`       | _(unset)_                | Bearer token the proxy requires on the auth-gated routes. Unset → no-auth dev mode (canary log). See [Auth](#authentication).                                                                                          |
+| `LLM_PROXY_MAX_BODY_BYTES`   | `1048576` (1 MiB)        | Per-request body cap; overflow drains remaining body bytes silently then returns `413 Payload Too Large` with a JSON error body (see the [Troubleshooting](#troubleshooting) row for the full settlement contract).    |
+| `LLM_PROXY_DRAIN_TIMEOUT_MS` | `5000` (5 s)             | Upper bound on how long the overflow path will wait for a half-open client to send FIN or further bytes before writing the 413 and force-closing the socket. Set smaller (e.g. `150`) in tests to keep the suite fast. |
+| `OLLAMA_BASE_URL`            | `http://localhost:11434` | Real Ollama daemon for the passthrough backend.                                                                                                                                                                        |
+| `CODEX_DEFAULT_MODEL`        | `gpt-5.5`                | Model passed via `-c model=<name>` to `codex mcp-server` when none in body.                                                                                                                                            |
+| `CODEX_IDLE_TIMEOUT_MS`      | `60000`                  | Kill `codex` after this long with no output activity.                                                                                                                                                                  |
+| `CODEX_HARD_TIMEOUT_MS`      | `300000`                 | Kill `codex` after this long regardless of activity.                                                                                                                                                                   |
+| `CLAUDE_BINARY`              | `claude` (search `PATH`) | Path to the `claude` CLI executable.                                                                                                                                                                                   |
+| `CLAUDE_DEFAULT_MODEL`       | _(empty)_                | Model passed via `claude --model` when none in body.                                                                                                                                                                   |
+| `CLAUDE_IDLE_TIMEOUT_MS`     | `60000`                  | Kill `claude` after this long with no output activity.                                                                                                                                                                 |
+| `CLAUDE_HARD_TIMEOUT_MS`     | `300000`                 | Kill `claude` after this long regardless of activity.                                                                                                                                                                  |
+
+The env-var names that cross the parent/child boundary (`LLM_PROXY_AUTH_TOKEN`,
+`LLM_PROXY_MAX_BODY_BYTES`) are exported as constants from
+`scripts/llm-proxy/protocol-constants.mjs` so the plugin-side wiring
+(`src/platform/wire-proxy-lifecycle.ts`) and the server consume the same literal — a typo on either
+side would silently downgrade to no-auth mode and is caught by a round-trip test.
+
+## Authentication
+
+The proxy enforces three defense layers on the sensitive routes (`/codex|claude|ollama/api/chat`,
+`/codex|claude|ollama/api/tags`, `/api/tags`, `/codex|claude|ollama/api/embed`, `/api/diagnostics`):
+
+1. **Host header gate.** The `Host` header must match `127.0.0.1:<port>` or `localhost:<port>`
+   (using the OS-assigned port after `listen()` resolves). A foreign Host returns `403`. This blocks
+   DNS-rebinding attacks where a browser is tricked into resolving an attacker-controlled name to
+   `127.0.0.1` and posting to the proxy from a malicious page.
+2. **Origin header gate.** When an `Origin` header is present it must match the loopback host
+   (`http://127.0.0.1:<port>` / `http://localhost:<port>`) or be omitted. A foreign Origin
+   (`https://attacker.example`) returns `403` even with a valid bearer token.
+3. **Bearer-token gate.** When `LLM_PROXY_AUTH_TOKEN` is set, every auth-gated route requires
+   `Authorization: Bearer <token>` and the proxy compares with `crypto.timingSafeEqual` (with a
+   length pre-check). Missing bearer → `401 missing bearer`; wrong token → `401 invalid token`.
+
+Two routes are **exempt from bearer auth** (still Host/Origin gated):
+
+- `POST /api/shutdown` — preserves the orphan-takeover path. Under normal operation the proxy
+  self-terminates on stdin EOF when Zotero exits or is killed (see
+  [Parent-death detection](#parent-death-detection) below), but on Windows the named-pipe semantics
+  differ and stdin-EOF detection is not guaranteed; if an orphan proxy is ever left listening on the
+  configured port, the new plugin instance cannot know the orphan's token, so this route must remain
+  bearer-exempt. Host/Origin gates still prevent network attackers, and DoS via shutdown is
+  acceptable on a single-user desktop.
+- `GET /` — the route catalogue is intentionally unauthenticated so a developer poking at the proxy
+  with `curl` can discover the surface.
+
+**No-auth dev mode.** When `LLM_PROXY_AUTH_TOKEN` is unset (e.g. `npm run proxy:llm` or existing
+integration-test paths that spawn the proxy without the env var), the bearer gate is a no-op and the
+proxy emits a loud `console.warn` on startup:
+
+```text
+llm-proxy: AUTH DISABLED — set LLM_PROXY_AUTH_TOKEN to enable bearer auth
+```
+
+When the token IS set, the corresponding canary is
+`llm-proxy: auth enabled on 127.0.0.1:<port> (token length <N>)`. Both canaries are the first line
+of process output so a misconfigured production spawn (env var dropped on the floor) shouts loudly
+in the Zotero error console.
+
+When the plugin auto-spawns the proxy via `src/platform/wire-proxy-lifecycle.ts`, a fresh
+`crypto.randomUUID()` token is minted per spawn and threaded into the child's environment under
+`LLM_PROXY_AUTH_TOKEN`; the chrome-side callers (ollama chat/embed adapter, settings model-list
+discovery, Save-button validation probe, and first-run onboarding probe) all consult a shared
+`buildProxyAuthHeader(...)` helper that URL-parses the request base URL and adds the
+`Authorization: Bearer <token>` header when the hostname is either `127.0.0.1` or `localhost` at the
+proxy's configured port (so Codex/Claude Proxy presets, which use `localhost` URLs by default, match
+just as cleanly as a hand-edited `127.0.0.1` URL). The lifecycle's diagnostics fetch threads the
+bearer too.
 
 ## Wire contract
 
@@ -102,31 +173,40 @@ When `stream: false`, the response is a single JSON object of the same shape wit
 ## Codex multi-turn
 
 The proxy correlates conversations using **the SHA-256 of the first user message in `messages[]`**
-(truncated to 16 hex chars). For each unique fingerprint, it stores the Codex `session_id` returned
-by the first invocation:
+(truncated to 16 hex chars). For each unique fingerprint, it stores the Codex `threadId` returned by
+the first invocation's `tools/call` response:
 
-1. **First turn** — `codex exec --json --skip-git-repo-check --model <M> -` with the latest user
-   message on stdin.
-2. **Subsequent turn** — `codex exec resume <SESSION_ID> --json --skip-git-repo-check --model <M> -`
-   with the latest user message on stdin.
+1. **First turn** — spawn `codex mcp-server -c mcp_servers={}` (plus an optional `-c model=<M>`) and
+   write three JSON-RPC frames to stdin: `initialize`, `notifications/initialized`, and `tools/call`
+   with `name: "codex"` whose `arguments` carry the latest user message as `prompt` (plus
+   `sandbox: "read-only"`, `approval-policy: "never"`, and `cwd: <isolationDir>` — the same
+   per-backend tmpdir the spawn's `cwd`/`HOME`/`CODEX_HOME` point at; see
+   [Subprocess isolation](#subprocess-isolation)).
+2. **Subsequent turn** — same `initialize` / `notifications/initialized` framing, but the
+   `tools/call` arguments use `name: "codex-reply"` with `{ threadId: "<stored>", prompt: "…" }`.
+
+`threadId` is the MCP-server's name for what `codex exec resume <SESSION_ID>` used to consume — the
+UUID shape is unchanged, only the transport. After the `id:1 tools/call` response arrives the proxy
+closes stdin so the MCP-server child exits cleanly.
 
 Session state lives in-memory only — restarting the proxy starts every conversation fresh, which
 matches the plugin's behaviour of treating each pop-up as a new conversation by default.
 
-### Session-ID discovery
+### Thread-ID discovery
 
-Codex's `--json` event stream evolves between releases. The proxy is defensive about it:
+The MCP envelope shape evolves between releases. The proxy is defensive about it:
 
-1. Every stdout line is parsed as JSON; for each parsed object we recursively search **all keys**
-   for `session_id` and accept the first hit. This covers top-level shapes
-   (`{"type":"session_configured","session_id":"…"}`) as well as nested shapes
-   (`{"msg":{"session_id":"…"}}`).
-2. If stdout does not expose a `session_id` by the time the child exits, the proxy scans
+1. The `tools/call` response carries `result.structuredContent.threadId` — this is the documented
+   MCP result shape and the primary source.
+2. Every incoming JSON-RPC frame is also walked recursively; the walker accepts any string-valued
+   `threadId` (camelCase, e.g. `params._meta.threadId`), `thread_id`, or `session_id` field. This
+   covers nested shapes some Codex releases emit via `codex/event` notifications.
+3. If neither mechanism produces an id by the time the child exits, the proxy scans
    `~/.codex/sessions/**` for the newest `*.jsonl` file modified after the spawn began and extracts
-   the UUID from either the filename (`rollout-<TIMESTAMP>-<SESSION_ID>.jsonl` — the Codex
-   documented convention) or the first JSONL line.
+   the UUID from either the filename (`rollout-<TIMESTAMP>-<UUID>.jsonl` — `codex mcp-server` writes
+   the same rollout files as `codex exec`) or the first JSONL line.
 
-If neither mechanism produces a `session_id`, follow-up turns simply fall back to starting a fresh
+If none of the three mechanisms produces an id, follow-up turns simply fall back to starting a fresh
 session (the next request still works, it just can't resume).
 
 ## Claude Code backend
@@ -154,18 +234,35 @@ Per request the proxy spawns the CLI with the prompt on stdin:
 
 ```text
 # First turn
-claude -p --output-format json --allowedTools ""
+claude -p --output-format stream-json --verbose --include-partial-messages --allowedTools "" \
+  --setting-sources user --strict-mcp-config --disable-slash-commands \
+  --system-prompt <NEUTRAL_PREFACE>
 
 # Subsequent turn (same conversation key — see "Multi-turn" below)
-claude --resume <SESSION_ID> -p --output-format json --allowedTools ""
+claude --resume <SESSION_ID> -p --output-format stream-json --verbose --include-partial-messages --allowedTools "" \
+  --setting-sources user --strict-mcp-config --disable-slash-commands \
+  --system-prompt <NEUTRAL_PREFACE>
 ```
 
 - `-p` puts the CLI in print mode (one-shot, non-interactive).
-- `--output-format json` returns one structured object containing `session_id` and the result text.
+- `--output-format stream-json` emits a sequence of JSON objects — `system_init`, `stream_event`
+  (carrying incremental `content_block_delta` text fragments every ~300-500 ms), the terminal
+  `assistant` envelope with the full assembled message, and a final `result` envelope with
+  `session_id` and usage. The proxy extracts only the per-token deltas; the terminal `assistant` /
+  `system` / `result` envelopes are denied so the assembled response is not re-emitted.
+- `--verbose` is mandatory whenever `--output-format stream-json` is used — the Claude CLI rejects
+  stream-json without it.
+- `--include-partial-messages` is what turns on the per-chunk `content_block_delta` frames; without
+  it stream-json would only emit the final assembled `assistant` envelope.
 - `--allowedTools ""` passes an **empty allowlist** — this disables ALL built-in tools
   (Read/Bash/Edit/etc.), so Claude behaves as a pure chat model. This is a hard requirement of the
   Zotero plugin's contract (the popup and sidebar are conversational explainers, not agents) and is
   enforced by `buildClaudeArgs` in `scripts/llm-proxy/backends/claude.mjs`.
+- `--setting-sources user --strict-mcp-config --disable-slash-commands --system-prompt <NEUTRAL>`
+  are the **isolation flags** — they suppress user-config layers (CLAUDE.md / settings.json), MCP
+  sidecars, and slash commands, and replace the user's default system prompt with a short neutral
+  preface so the model treats the proxy turn as a plain chat request. See
+  [Subprocess isolation](#subprocess-isolation) for the full rationale and accepted limitations.
 - `--model` is added only when `CLAUDE_DEFAULT_MODEL` is set (or the request body specifies one); by
   default the CLI picks the model from the user's `claude` config.
 
@@ -206,6 +303,59 @@ Expected: zero or more `done:false` chunks followed by exactly one `done:true` c
 exit the terminal chunk will have `done_reason:"error"` and an `error` field — never a silent
 `done_reason:"stop"` (this is the BUG-AC8-1 contract).
 
+## Subprocess isolation
+
+Both the Codex and Claude backends spawn CLIs that, by default, load extensive user developer
+configuration — `~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md`, settings files, MCP sidecars, custom
+skills, slash commands. None of that is appropriate for Zotero responses: a user's "act as a senior
+code reviewer" CLAUDE.md instruction would warp every popup explanation. The proxy isolates each CLI
+from that configuration at spawn time.
+
+### Codex isolation
+
+The codex backend lazily creates a per-backend tmpdir (`/tmp/zotero-ai-codex-*` via `mkdtemp`) on
+first use and best-effort copies `~/.codex/auth.json` into it (silently skipped on `ENOENT`).
+`codex mcp-server` is then spawned with:
+
+- `env.HOME = <tmpdir>` and `env.CODEX_HOME = <tmpdir>` — codex reads `AGENTS.md`, `config.toml`,
+  and per-project skills relative to `$CODEX_HOME`/`$HOME`; pointing both at a fresh empty directory
+  neutralises them.
+- `cwd = <tmpdir>` — also reflected in the `tools/call codex` arguments' `cwd` field so the model
+  cannot see the user's actual working directory.
+
+Copying `auth.json` is what lets codex remain authenticated against the user's ChatGPT login while
+running out of the isolated `$CODEX_HOME`.
+
+### Claude isolation
+
+The claude backend lazily creates a per-backend tmpdir (`/tmp/zotero-ai-claude-*`) and spawns
+`claude -p …` with:
+
+- `cwd = <tmpdir>` — keeps the CLI from picking up the user's project CLAUDE.md / .claude config.
+- `--setting-sources user` — restricts settings to the user-global layer only (no project/local).
+- `--strict-mcp-config` — refuses to load MCP sidecars from the user's settings.
+- `--disable-slash-commands` — turns off slash-command dispatch entirely.
+- `--system-prompt <NEUTRAL_PREFACE>` — replaces the user's default system prompt with a short
+  neutral preface; biases the model against treating any residual pollution as instructions.
+
+`HOME` is **deliberately not overridden** for claude. Subscription auth resolves through the OS
+keychain (macOS Keychain / libsecret / Windows Credential Manager) which the CLI accesses via
+`$HOME`-scoped paths; isolating `HOME` would break authentication.
+
+### Accepted limitations
+
+Two pollution sources are not blocked by this isolation:
+
+- **Bundled `.system` skills (codex).** Codex ships 5 baked-in skills (imagegen, openai-docs,
+  plugin-creator, skill-creator, skill-installer). They are compiled into the binary and cannot be
+  suppressed by environment isolation.
+- **SessionStart hooks (claude).** `--setting-sources user` + `--strict-mcp-config` +
+  `--disable-slash-commands` do not prevent SessionStart hooks from firing. The neutral
+  `--system-prompt` is the bias against the model treating any hook output as instructions.
+
+Both are documented as accepted limitations in ADR
+[0001 — LLM proxy architecture](../../docs/decisions/0001-llm-proxy-architecture.md).
+
 ## Smoke tests
 
 ### Codex backend
@@ -239,22 +389,56 @@ curl http://127.0.0.1:11400/api/tags
 
 ## Troubleshooting
 
-| Symptom                                  | Likely cause                                                                                      |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `Ollama unreachable at …`                | `ollama serve` not running, or wrong `OLLAMA_BASE_URL`.                                           |
-| `codex: authentication failed`           | Run `codex login`.                                                                                |
-| `codex exited with code 127`             | `codex` not on `PATH`. Install via Homebrew or the official installer.                            |
-| `claude exited with code 127`            | `claude` not on `PATH`. Set `CLAUDE_BINARY=/full/path/to/claude` or install the CLI globally.     |
-| `claude` errors with "not authenticated" | Run `claude login` in the shell that launches the proxy, then restart the proxy.                  |
-| Empty popup with no error                | Should not happen anymore — the proxy emits a `done_reason: "error"` chunk on failure.            |
-| `gpt-5.2-codex` not recognised by Codex  | Set `CODEX_DEFAULT_MODEL` to a model your `codex` CLI supports, or pass `model` in the chat body. |
+| Symptom                                           | Likely cause                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Ollama unreachable at …`                         | `ollama serve` not running, or wrong `OLLAMA_BASE_URL`.                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `codex: authentication failed`                    | Run `codex login`. If you have authenticated but isolation broke OAuth, confirm `~/.codex/auth.json` exists before the proxy spawns codex — the proxy copies it into the isolation tmpdir at spawn time.                                                                                                                                                                                                                                                                                               |
+| `codex exited with code 127`                      | `codex` not on `PATH`. Install via Homebrew or the official installer.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `claude exited with code 127`                     | `claude` not on `PATH`. Set `CLAUDE_BINARY=/full/path/to/claude` or install the CLI globally.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `claude` errors with "not authenticated"          | Run `claude login` in the shell that launches the proxy, then restart the proxy.                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Empty popup with no error                         | Should not happen anymore — the proxy emits a `done_reason: "error"` chunk on failure.                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `gpt-5.2-codex` not recognised by Codex           | Set `CODEX_DEFAULT_MODEL` to a model your `codex` CLI supports, or pass `model` in the chat body.                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `401 missing bearer` / `401 invalid token`        | The proxy is in auth-enabled mode (`LLM_PROXY_AUTH_TOKEN` set) and the caller did not present the matching bearer. Plugin auto-spawn handles this; manual `curl` callers need `Authorization: Bearer <token>` or to start the proxy without the env var (no-auth dev mode).                                                                                                                                                                                                                            |
+| `403 host not allowed` / `403 origin not allowed` | Host/Origin defense-in-depth rejected the request. The proxy only accepts `Host: 127.0.0.1:<port>` / `localhost:<port>` and (when present) the same loopback Origin. Browser-origin requests from arbitrary pages are intentionally refused.                                                                                                                                                                                                                                                           |
+| `413 Payload Too Large`                           | The request body exceeded `LLM_PROXY_MAX_BODY_BYTES` (1 MiB default). The proxy silently drains the remaining body bytes before responding with the structured 413, so the client observes a normal HTTP response instead of an `ECONNRESET`. Raise the env var if you legitimately need bigger payloads; tune `LLM_PROXY_DRAIN_TIMEOUT_MS` if a half-open upload needs more than the 5 s default to settle.                                                                                           |
+| Plugin can't find Node on Linux/Windows           | The plugin auto-detects Node on macOS Homebrew (Apple Silicon + Intel), Linux apt (`/usr/bin/node`), Linux snap (`/snap/bin/node`), Linux Homebrew (both the system prefix and the per-user `~/.linuxbrew/bin/node` shim), Windows Program Files, and the volta / asdf / fnm / n / mise / nodenv shims; it also scans the per-user nvm `versions/node` tree (POSIX nvm) and `%APPDATA%\nvm` (NVM-Windows). If your install lives elsewhere, set the **Node binary path** field in the settings dialog. |
 
 ## Security
 
 - Binds to `127.0.0.1` only — never the public network.
-- No authentication on the proxy itself; assumes a single-user developer machine.
-- Forwards request bodies verbatim. Do not place the proxy behind a public reverse proxy without
-  adding authentication first.
+- Plugin-spawned: bearer-token auth is enforced. The plugin mints a fresh `crypto.randomUUID()` per
+  spawn and threads it via `LLM_PROXY_AUTH_TOKEN` so each proxy instance has a unique token; the
+  plugin's ollama adapter and diagnostics fetch carry the matching `Authorization: Bearer <token>`
+  header. The proxy also gates every auth-gated route on `Host` + `Origin` headers (blocks browser
+  DNS-rebinding attacks) and caps request bodies at 1 MiB by default (memory DoS).
+- Dev mode (`npm run proxy:llm`, integration tests): the bearer gate is permissively disabled when
+  `LLM_PROXY_AUTH_TOKEN` is unset; the proxy emits a loud `console.warn` canary at startup so a
+  misconfigured production spawn is impossible to miss. Host/Origin gates and the body cap remain in
+  force.
+- `POST /api/shutdown` and `GET /` (route catalogue) are bearer-exempt by design — see
+  [Authentication](#authentication) for the orphan-takeover rationale. They remain Host/Origin
+  gated.
+- Forwards request bodies verbatim. Do not place the proxy behind a public reverse proxy.
+
+## Parent-death detection
+
+The proxy self-terminates when its parent process (Zotero) exits, crashes, or is OS-killed. macOS
+does not expose Linux's `PR_SET_PDEATHSIG`, so the cross-platform parent-death signal the proxy
+relies on is **stdin EOF**: when the parent closes its end of the proxy's stdin pipe (or the kernel
+closes it on parent death), Node emits `'end'` on `process.stdin`, and the proxy runs the shared
+idempotent `shutdown("stdin-eof")` — closing the HTTP server and exiting `0`. A single-shot guard
+makes the shutdown safe under concurrent EOF + SIGTERM.
+
+Implications for callers:
+
+- Mozilla's `Subprocess.sys.mjs` (the plugin's spawn path) unconditionally pipes stdin, so the
+  detector works under normal operation.
+- Manual smoke runs (`npm run proxy:llm`) keep their terminal stdin open and behave unchanged. Tests
+  or scripts that spawn the server with `stdio: ["ignore", ...]` will trigger immediate
+  self-shutdown at startup (stdin is routed to `/dev/null`, which the proxy reads as EOF); use
+  `"pipe"` and keep the parent-side handle open instead.
+- Windows named-pipe semantics differ from POSIX. The new tests skip on Windows; the
+  `POST /api/shutdown` orphan-takeover path covers that platform.
 
 ## Implementation notes
 

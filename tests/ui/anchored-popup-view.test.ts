@@ -3,6 +3,10 @@
 import { describe, expect, it } from "vitest";
 
 import { renderAnchoredPopup } from "../../src/ui/anchored-popup-view.js";
+import { attachCitationClickHandler } from "../../src/ui/citation-click.js";
+import { buildCitationLookup } from "../../src/ui/citation-lookup.js";
+import type { CitationClick } from "../../src/ui/library-chat-view.js";
+import { renderMarkdownWithCitations } from "../../src/ui/markdown.js";
 
 describe("renderAnchoredPopup", () => {
   it("renders provider disclosure and content; positioning is handled by the wrapper", () => {
@@ -93,5 +97,65 @@ describe("renderAnchoredPopup", () => {
     const body = view.querySelector<HTMLElement>(".zotero-ai-explain-popup__body");
     const style = body?.getAttribute("style") ?? "";
     expect(style).not.toMatch(/overflow\s*:\s*hidden/iu);
+  });
+
+  it("citation click wiring: a delegated click on a rendered citation anchor fires the handler with the right payload (plumbed-not-wired guard)", () => {
+    // Wiring contract pinned at this level: the runtime's
+    // `startExplain` path renders citation anchors into the popup body
+    // (via `renderMarkdownWithCitations`) and attaches a DELEGATED
+    // click handler at the popup root. This test pins the delegation
+    // shape — anchor → bubble to root → handler reads dataset →
+    // dispatches `onCitationClick` — so a regression that stamps
+    // anchors but never wires the listener (the literal
+    // "plumbed-not-wired" failure mode) trips here.
+    const view = renderAnchoredPopup({
+      disclosure: "d",
+      anchor: null,
+      text: ""
+    });
+    const body = view.querySelector<HTMLElement>(".zotero-ai-explain-popup__body");
+    if (body === null) {
+      throw new Error("popup body element is missing");
+    }
+    const lookup = buildCitationLookup([
+      {
+        itemKey: "ABCD1234",
+        title: "T",
+        text: "x",
+        score: 1,
+        chunkIndex: 3,
+        attachmentKey: "ATT00007",
+        pageIndex: 16
+      }
+    ]);
+    renderMarkdownWithCitations(body, "Claim [ABCD1234#3] holds.", { lookup });
+
+    // Exercise the SHARED `attachCitationClickHandler` helper that the
+    // runtime's popup + sidebar wiring and `library-chat-view.ts` all
+    // delegate to. Re-implementing the click-walk in the test would let
+    // it pass even if the helper regressed — pinning the production
+    // helper directly catches that drift.
+    const dispatched: CitationClick[] = [];
+    const detach = attachCitationClickHandler(view, (citation) => {
+      dispatched.push(citation);
+    });
+
+    const anchor = body.querySelector<HTMLAnchorElement>("a[data-item-key]");
+    if (anchor === null) {
+      throw new Error("citation anchor was not rendered");
+    }
+    anchor.click();
+
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]?.itemKey).toBe("ABCD1234");
+    expect(dispatched[0]?.attachmentKey).toBe("ATT00007");
+    expect(dispatched[0]?.pageIndex).toBe(16);
+
+    // Teardown must remove the listener — subsequent clicks must not
+    // re-dispatch. Symmetric with the `cleanupExplain` teardown in
+    // `zotero-runtime.ts`.
+    detach();
+    anchor.click();
+    expect(dispatched).toHaveLength(1);
   });
 });

@@ -27,6 +27,7 @@
  * The plugin appends `/api/chat` and `/api/embed` itself.
  */
 
+import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
@@ -35,8 +36,31 @@ import { createClaudeBackend } from "./backends/claude.mjs";
 import { createCodexBackend } from "./backends/codex.mjs";
 import { createOllamaBackend } from "./backends/ollama.mjs";
 import { enrichEnvironmentPath, findBinary } from "./path-discovery.mjs";
+import { LLM_PROXY_AUTH_TOKEN_ENV, LLM_PROXY_MAX_BODY_BYTES_ENV } from "./protocol-constants.mjs";
 
 const DEFAULT_PORT = 11400;
+
+/* ---------------------------------------------------------------------------
+ * Protocol constants
+ *
+ * All wire-visible string literals (bearer prefix, error response bodies,
+ * env-var names) live here so a rename surfaces in one place. The env-var
+ * names are re-exported from `protocol-constants.mjs` because they also
+ * have to match a literal on the TypeScript wiring side
+ * (`src/platform/wire-proxy-lifecycle.ts`); centralizing them lets a
+ * round-trip test catch a typo in either consumer.
+ * ------------------------------------------------------------------------ */
+const AUTH_BEARER_PREFIX = "Bearer ";
+const AUTH_ERR_MISSING_BEARER = "missing bearer";
+const AUTH_ERR_INVALID_TOKEN = "invalid token";
+const AUTH_ERR_HOST_NOT_ALLOWED = "host not allowed";
+const AUTH_ERR_ORIGIN_NOT_ALLOWED = "origin not allowed";
+
+// Defensive fallback for the Host gate when a request somehow lands
+// before `listen()`'s callback hoists the port-aware Set. The bare-
+// hostname entries match the common case where a client elides the
+// `:port` suffix on a default-bind probe.
+const FALLBACK_ALLOWED_HOSTS = new Set(["127.0.0.1", "localhost"]);
 
 function readEnvInt(name, fallback) {
   const raw = process.env[name];
@@ -45,12 +69,190 @@ function readEnvInt(name, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-function readBody(req) {
+/**
+ * Per-request body cap. Default 1 MiB; override via the
+ * `LLM_PROXY_MAX_BODY_BYTES` env var. The cap protects the chrome-side
+ * fetch stack from a malicious local process pinning the proxy on a
+ * huge POST — the proxy is bound to 127.0.0.1 but any local process can
+ * connect. A 100k-token chat history JSON-encodes to about 400 KB, so
+ * 1 MiB is generous in practice.
+ */
+const MAX_BODY_BYTES = readEnvInt(LLM_PROXY_MAX_BODY_BYTES_ENV, 1_048_576);
+
+/**
+ * Overflow drain timeout (F1). Default 5 s; override via the
+ * `LLM_PROXY_DRAIN_TIMEOUT_MS` env var. Used by the overflow path in
+ * `readBody` to bound the time the proxy will wait for a half-open
+ * client to send FIN/RST or another byte after the body-cap fires. Set
+ * smaller in tests to keep the suite fast.
+ */
+const DRAIN_TIMEOUT_MS_ENV = "LLM_PROXY_DRAIN_TIMEOUT_MS";
+
+function readBody(req, res) {
   return new Promise((resolve, reject) => {
+    let size = 0;
+    let aborted = false;
+    let finished = false;
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("error", reject);
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    const handleOverflow = () => {
+      if (aborted) return;
+      aborted = true;
+      // Drop the original listeners so accumulated chunks stop growing
+      // and the resolve/reject path runs at most once.
+      req.removeAllListeners("data");
+      req.removeAllListeners("end");
+      req.removeAllListeners("error");
+      // `close` may have a default listener attached by the HTTP server;
+      // we don't remove all of those here — we only added our own below,
+      // and `cleanup()` removes that one specifically.
+      const err = new Error(`body exceeds ${String(MAX_BODY_BYTES)} bytes`);
+      err.code = "EBODYLIMIT";
+      // Silently drain the remaining body BEFORE responding. The cap on
+      // memory still holds (we discard each chunk), but letting the
+      // client finish its upload eliminates the ECONNRESET race that
+      // tearing the socket down mid-write produces — at the cost of
+      // continuing to read N more bytes off the local-bound socket.
+      // The proxy listens on 127.0.0.1 with bearer auth, so unbounded
+      // local upload is not a real attack surface.
+      const drain = () => {
+        try {
+          if (res !== undefined && !res.headersSent) {
+            const payload = JSON.stringify({
+              error: `body exceeds ${String(MAX_BODY_BYTES)} bytes`
+            });
+            res.writeHead(413, {
+              "content-type": "application/json",
+              "content-length": Buffer.byteLength(payload),
+              connection: "close"
+            });
+            res.end(payload);
+          }
+        } catch {
+          // Response writing failed (socket already closed); fall through.
+        }
+        reject(err);
+      };
+      // F1 + F2: track all four listeners (data, end, error, close) plus
+      // the drain timer so the FIRST settlement (clean `end`, drain
+      // timeout, `error`, or socket `close`) tears down the others. A
+      // half-open client that pauses mid-upload (F1) settles via the
+      // timer; a client that destroys the socket without a parser-level
+      // `error` (F2) settles via the `close` listener. Without this,
+      // the route's `readBody` promise hangs indefinitely and the slot
+      // never frees.
+      let drainTimer = null;
+      let settled = false;
+      const onData = () => {
+        // Discard any further data — already over cap.
+      };
+      const onEnd = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        drain();
+      };
+      const onError = (cause) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        // Preserve the underlying transport error as `cause` so logs
+        // surface what actually went wrong (ECONNRESET, parser error,
+        // etc.) rather than only the generic EBODYLIMIT rejection.
+        if (cause !== undefined) {
+          Object.assign(err, { cause });
+        }
+        reject(err);
+      };
+      const onClose = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        // Skip writing the 413 body here: the socket has already
+        // closed (that is exactly why `close` fired without a prior
+        // `end` or `error`), so any res.write/end would throw. The
+        // route's outer catch swallows the EBODYLIMIT rejection.
+        reject(err);
+      };
+      const onDrainTimeout = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        // The client is half-open: connection alive but no FIN/RST and
+        // no further bytes. We've waited DRAIN_TIMEOUT_MS for it to
+        // make up its mind; write the 413 body BEFORE tearing the
+        // socket down so the wire still carries the structured error
+        // response. Then force-close the socket so the route slot
+        // frees and the client observes a teardown instead of hanging
+        // on our side. Wrapped in try because either step may fail if
+        // the socket is already in an unwritable state.
+        try {
+          drain();
+        } catch {
+          // drain() itself defends with try/catch; this outer guard
+          // covers any future throws the helper might add.
+        }
+        try {
+          if (res !== undefined) {
+            res.socket?.destroy();
+          }
+        } catch {
+          // ignore — best-effort teardown
+        }
+        // drain() already called reject(err); calling again is a no-op
+        // because we hold the `settled` guard above.
+      };
+      const cleanup = () => {
+        req.removeListener("data", onData);
+        req.removeListener("end", onEnd);
+        req.removeListener("error", onError);
+        req.removeListener("close", onClose);
+        if (drainTimer !== null) {
+          clearTimeout(drainTimer);
+          drainTimer = null;
+        }
+      };
+      req.on("data", onData);
+      req.on("end", onEnd);
+      req.on("error", onError);
+      req.on("close", onClose);
+      const drainTimeoutMs = readEnvInt(DRAIN_TIMEOUT_MS_ENV, 5_000);
+      drainTimer = setTimeout(onDrainTimeout, drainTimeoutMs);
+    };
+    req.on("data", (c) => {
+      if (aborted) return;
+      size += c.length;
+      if (size > MAX_BODY_BYTES) {
+        handleOverflow();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("error", (err) => {
+      if (!aborted && !finished) {
+        finished = true;
+        reject(err);
+      }
+    });
+    req.on("end", () => {
+      if (!aborted && !finished) {
+        finished = true;
+        resolve(Buffer.concat(chunks).toString("utf8"));
+      }
+    });
+    // Under-cap abortive disconnect: if the client closes the socket
+    // before sending FIN AND without emitting a parser-level `error`,
+    // neither `end` nor `error` fires and the promise would hang
+    // forever. Defensive `close` listener mirrors the overflow path's
+    // pattern and frees the route slot. The `finished` guard prevents
+    // a spurious reject after a clean `end` (close always fires after
+    // end on a Connection: close response); the `aborted` check skips
+    // this path entirely once the overflow handler has taken over.
+    req.on("close", () => {
+      if (!aborted && !finished) {
+        finished = true;
+        reject(new Error("request closed before body finished"));
+      }
+    });
   });
 }
 
@@ -116,6 +318,80 @@ export function summarizeBinaryLookup(lookup) {
  */
 export function createProxyServer(deps = {}) {
   const pathEnrichmentSnapshot = deps.pathEnrichment ?? null;
+  // AUTH_TOKEN lives on the closure (not module scope) so two server
+  // instances in the same Vitest worker can each pick up their own
+  // env-driven token without interfering with each other. Production
+  // semantics are unchanged: the env var is captured once per proxy
+  // process at startup, before any request is served. See the
+  // docstring on LLM_PROXY_AUTH_TOKEN_ENV for the rename contract.
+  const AUTH_TOKEN = process.env[LLM_PROXY_AUTH_TOKEN_ENV] ?? null;
+  // Precompute the expected-token Buffer once per server construction:
+  // `AUTH_TOKEN` is frozen for the lifetime of the proxy, so allocating
+  // its Buffer on every authenticated request just churns the young
+  // generation. The per-request presented-token Buffer is still
+  // unavoidable (it's per-request input).
+  const AUTH_TOKEN_BUF = AUTH_TOKEN !== null ? Buffer.from(AUTH_TOKEN) : null;
+  // Built once inside listen()'s callback (after the OS assigns the
+  // bound port) so the Host gate doesn't rebuild a 4-element Set on
+  // every request. Stays null until the server is listening; the gate
+  // falls back to the bare-hostname allowlist in that brief window
+  // (which in practice never opens because the gate only runs after
+  // the server has accepted a connection). Stored on the closure (NOT
+  // module scope) so two server instances spun up in the same process
+  // never clobber each other.
+  let allowedHostsSet = null;
+
+  function enforceTransportPolicy(req, res) {
+    // 1. Host normalization — reject DNS-rebinding attacks against
+    //    the loopback bind by demanding the Host header point at a
+    //    loopback name (or the bare hostname without a port for the
+    //    rare client that elides it on default-bind).
+    const host = (req.headers.host ?? "").toLowerCase();
+    const allowed = allowedHostsSet ?? FALLBACK_ALLOWED_HOSTS;
+    if (!allowed.has(host)) {
+      writeJson(res, 403, { error: AUTH_ERR_HOST_NOT_ALLOWED });
+      return false;
+    }
+
+    // 2. Origin — node fetch sends no Origin header (verified in P2
+    //    smoke test), so the plugin's own requests pass. Browser
+    //    fetches always set Origin (chrome-extension://, https://...)
+    //    and get rejected. Empty / "null" are tolerated for callers
+    //    behind sandboxed iframes that strip the value.
+    const origin = req.headers.origin;
+    if (origin !== undefined && origin !== "" && origin !== "null") {
+      writeJson(res, 403, { error: AUTH_ERR_ORIGIN_NOT_ALLOWED });
+      return false;
+    }
+    return true;
+  }
+
+  function enforceBearerPolicy(req, res) {
+    // Bearer token — skipped entirely when no env var was set (the
+    // `npm run proxy:llm` dev path stays unauthenticated).
+    if (AUTH_TOKEN === null || AUTH_TOKEN_BUF === null) return true;
+    const header = req.headers.authorization ?? "";
+    if (!header.startsWith(AUTH_BEARER_PREFIX)) {
+      writeJson(res, 401, { error: AUTH_ERR_MISSING_BEARER });
+      return false;
+    }
+    const presented = header.slice(AUTH_BEARER_PREFIX.length);
+    // Length-check first — timingSafeEqual throws on differing
+    // lengths, and the wrong-length case is itself a constant-time
+    // reject (the leak is "you got the length wrong", which doesn't
+    // narrow the token).
+    if (presented.length !== AUTH_TOKEN.length) {
+      writeJson(res, 401, { error: AUTH_ERR_INVALID_TOKEN });
+      return false;
+    }
+    const presentedBuf = Buffer.from(presented);
+    if (!timingSafeEqual(presentedBuf, AUTH_TOKEN_BUF)) {
+      writeJson(res, 401, { error: AUTH_ERR_INVALID_TOKEN });
+      return false;
+    }
+    return true;
+  }
+
   // Resolve absolute paths for codex/claude up-front so /api/diagnostics
   // can report them. The backends still call spawn() at run time; passing
   // the resolved path here also makes the spawn fail predictably when the
@@ -167,7 +443,7 @@ export function createProxyServer(deps = {}) {
    * the HTTP wrapper is identical apart from which backend is invoked.
    */
   async function handleCliBackendChat(req, res, backend) {
-    const raw = await readBody(req);
+    const raw = await readBody(req, res);
     const body = parseJson(raw);
     if (!body || !Array.isArray(body.messages)) {
       writeJson(res, 400, { error: "expected JSON body with messages[]" });
@@ -248,7 +524,7 @@ export function createProxyServer(deps = {}) {
   }
 
   async function handleOllamaChat(req, res) {
-    const raw = await readBody(req);
+    const raw = await readBody(req, res);
     // Quick sanity: still POST JSON; but we forward verbatim regardless.
     const body = parseJson(raw);
     if (!body || !Array.isArray(body.messages)) {
@@ -334,18 +610,49 @@ export function createProxyServer(deps = {}) {
   const server = createServer((req, res) => {
     void (async () => {
       try {
+        // Transport policy (Host + Origin) runs BEFORE any route
+        // dispatch so a misconfigured client can never reach a body-
+        // reading handler. The bearer-token check is per-route
+        // (`enforceBearerPolicy`) — most routes require it, but
+        // `/api/shutdown` and `GET /` opt out by design (see below).
+        if (!enforceTransportPolicy(req, res)) return;
         const url = req.url ?? "";
         const method = req.method ?? "GET";
-        if (method === "POST" && url === "/codex/api/chat") return handleCodexChat(req, res);
-        if (method === "POST" && url === "/claude/api/chat") return handleClaudeChat(req, res);
-        if (method === "POST" && url === "/ollama/api/chat") return handleOllamaChat(req, res);
-        if (method === "GET" && url === "/codex/api/tags") return handleCodexTags(req, res);
-        if (method === "GET" && url === "/claude/api/tags") return handleClaudeTags(req, res);
-        if (method === "GET" && url === "/ollama/api/tags") return handleOllamaTags(req, res);
-        if (method === "GET" && url === "/api/tags") return handleCombinedTags(req, res);
+        if (method === "POST" && url === "/codex/api/chat") {
+          if (!enforceBearerPolicy(req, res)) return;
+          await handleCodexChat(req, res);
+          return;
+        }
+        if (method === "POST" && url === "/claude/api/chat") {
+          if (!enforceBearerPolicy(req, res)) return;
+          await handleClaudeChat(req, res);
+          return;
+        }
+        if (method === "POST" && url === "/ollama/api/chat") {
+          if (!enforceBearerPolicy(req, res)) return;
+          await handleOllamaChat(req, res);
+          return;
+        }
+        if (method === "GET" && url === "/codex/api/tags") {
+          if (!enforceBearerPolicy(req, res)) return;
+          return handleCodexTags(req, res);
+        }
+        if (method === "GET" && url === "/claude/api/tags") {
+          if (!enforceBearerPolicy(req, res)) return;
+          return handleClaudeTags(req, res);
+        }
+        if (method === "GET" && url === "/ollama/api/tags") {
+          if (!enforceBearerPolicy(req, res)) return;
+          return handleOllamaTags(req, res);
+        }
+        if (method === "GET" && url === "/api/tags") {
+          if (!enforceBearerPolicy(req, res)) return;
+          return handleCombinedTags(req, res);
+        }
         // Codex embeddings are not supported; surface a clear error rather than
         // 404 to help users debug provider-profile misconfiguration.
         if (method === "POST" && url === "/codex/api/embed") {
+          if (!enforceBearerPolicy(req, res)) return;
           writeJson(res, 501, {
             error:
               "Codex backend does not support embeddings. Use the /ollama route or a remote embedding provider."
@@ -353,6 +660,7 @@ export function createProxyServer(deps = {}) {
           return;
         }
         if (method === "POST" && url === "/claude/api/embed") {
+          if (!enforceBearerPolicy(req, res)) return;
           writeJson(res, 501, {
             error:
               "Claude backend does not support embeddings. Use the /ollama route or a remote embedding provider."
@@ -360,9 +668,10 @@ export function createProxyServer(deps = {}) {
           return;
         }
         if (method === "POST" && url === "/ollama/api/embed") {
+          if (!enforceBearerPolicy(req, res)) return;
           // Passthrough embeddings to real Ollama. Keep it minimal — just
           // forward request body and response body.
-          const raw = await readBody(req);
+          const raw = await readBody(req, res);
           const fetchImpl = globalThis.fetch;
           const r = await fetchImpl(`${ollamaBackend.baseUrl}/api/embed`, {
             method: "POST",
@@ -377,6 +686,11 @@ export function createProxyServer(deps = {}) {
           return;
         }
         if (method === "GET" && url === "/api/diagnostics") {
+          // Bearer-gated: the diagnostics payload leaks codex/claude
+          // binary paths, which we don't want to hand to other local
+          // processes on the machine. The plugin sends the bearer
+          // explicitly from `wire-proxy-lifecycle.ts:fetchDiagnostics`.
+          if (!enforceBearerPolicy(req, res)) return;
           // Bug B2 surface: report what the proxy found at startup so
           // the plugin's settings dialog can render "Codex CLI: found at
           // /opt/homebrew/bin/codex" or "Codex CLI: NOT FOUND (set
@@ -410,6 +724,20 @@ export function createProxyServer(deps = {}) {
           return;
         }
         if (method === "POST" && url === "/api/shutdown") {
+          // INTENTIONALLY bearer-exempt. The orphan-takeover path in
+          // `src/platform/wire-proxy-lifecycle.ts:tryTakeoverOrphan`
+          // POSTs here when a new plugin instance detects a stale proxy
+          // listening on the configured port (typical after a Zotero
+          // restart with the prior session's child still alive). The
+          // new instance cannot know the orphan's token — it died with
+          // the prior process — so requiring bearer here would 401 the
+          // takeover and leave the user stuck with a stale proxy until
+          // they manually killed it. The local-only Host + Origin gates
+          // above still block any network attacker; the only attack
+          // vector that survives is "another local process can ask the
+          // proxy to exit", which is an acceptable DoS on a single-user
+          // desktop.
+          //
           // Owner-controlled shutdown. The plugin's proxy-lifecycle calls
           // this when it detects an orphaned proxy on the configured port
           // (the typical "stale CLI event shape after XPI upgrade" loop)
@@ -433,6 +761,10 @@ export function createProxyServer(deps = {}) {
           return;
         }
         if (method === "GET" && url === "/") {
+          // Bearer-exempt: returns only a static route catalog (no
+          // configuration, no binary paths, no secrets). The Host +
+          // Origin gates above still apply so a browser visiting
+          // http://127.0.0.1:<port>/ from a foreign tab is rejected.
           writeJson(res, 200, {
             name: "zotero-ai-llm-proxy",
             routes: [
@@ -452,8 +784,17 @@ export function createProxyServer(deps = {}) {
         writeJson(res, 404, { error: `not found: ${method} ${url}` });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        // Body-limit overflow: `readBody` already wrote the 413
+        // response (we needed to answer the client without waiting
+        // for the upload to finish), so the outer catch just swallows
+        // the rejection. Any other thrown error becomes a 500 — but
+        // only when headers haven't already been sent.
+        const code = err instanceof Error ? /** @type {{ code?: string }} */ (err).code : undefined;
+        if (code === "EBODYLIMIT") {
+          return;
+        }
         try {
-          writeJson(res, 500, { error: message });
+          if (!res.headersSent) writeJson(res, 500, { error: message });
         } catch {
           // headers already written
           try {
@@ -476,8 +817,37 @@ export function createProxyServer(deps = {}) {
         server.once("error", reject);
         server.listen(port, "127.0.0.1", () => {
           const addr = server.address();
-          if (addr && typeof addr === "object") resolve(addr.port);
-          else reject(new Error("could not determine listen port"));
+          if (addr && typeof addr === "object") {
+            // Build the Host-gate allowlist once per server instance,
+            // here at `listen()`-resolve time (the OS-assigned port is
+            // immutable for the rest of the server's lifetime). The
+            // Host gate consults this Set on every request instead of
+            // rebuilding it from scratch.
+            allowedHostsSet = new Set([
+              `127.0.0.1:${String(addr.port)}`,
+              `localhost:${String(addr.port)}`,
+              "127.0.0.1",
+              "localhost"
+            ]);
+            // Auth-state canary so a misconfigured production spawn
+            // (env var dropped on the floor) shouts loudly in the
+            // Zotero error console. The wiring layer always sets the
+            // env var; surfacing this on the no-auth fallback catches
+            // wiring bugs at the point of failure rather than at the
+            // first 200-OK-from-anyone request.
+            if (AUTH_TOKEN === null) {
+              console.warn(
+                `llm-proxy: AUTH DISABLED — set ${LLM_PROXY_AUTH_TOKEN_ENV} to enable bearer auth`
+              );
+            } else {
+              console.log(
+                `llm-proxy: auth enabled on 127.0.0.1:${String(addr.port)} (token length ${String(AUTH_TOKEN.length)})`
+              );
+            }
+            resolve(addr.port);
+          } else {
+            reject(new Error("could not determine listen port"));
+          }
         });
       });
     },
@@ -485,6 +855,46 @@ export function createProxyServer(deps = {}) {
       return new Promise((resolve) => server.close(() => resolve()));
     }
   };
+}
+
+/**
+ * Cross-platform "parent-died" detector.
+ *
+ * macOS has no `prctl(PR_SET_PDEATHSIG)` and POSIX has no automatic
+ * child-cleanup on parent death; when Zotero is force-quit / crashes
+ * / OS-killed, the proxy is reparented to launchd (PID 1) and survives
+ * as an orphan holding the configured port. The plugin's clean-exit JS
+ * callback only fires on a graceful Zotero shutdown, so orphans
+ * accumulate across crashes.
+ *
+ * The reliable cross-platform trick: when the parent process dies, the
+ * OS closes the writable end of any pipe the parent had to the child's
+ * stdin. The child then sees stdin emit `'end'` (clean EOF) or
+ * `'error'` (rare; e.g. EBADF). Mozilla's `Subprocess.sys.mjs` always
+ * spawns children with stdin as a pipe (it's a writable stream on
+ * `proc.stdin`), so the EOF arrives reliably under chrome.
+ *
+ * Edge cases:
+ *   - `node server.mjs < /dev/null`: stdin EOFs immediately at startup.
+ *     This is intended — no parent is writing, so there's nothing to
+ *     wait on. The dev workflow (`npm run proxy:llm` from a terminal)
+ *     keeps a TTY attached, so EOF only arrives on Ctrl-D.
+ *   - Concurrent SIGTERM + EOF: the caller's `shutdownFn` MUST be
+ *     idempotent (single-shot). See the `shuttingDown` guard below.
+ *
+ * Without `process.stdin.resume()` Node's default-paused stdin never
+ * emits `'end'` — the kernel-level EOF is buffered but the JS event
+ * loop never observes it. `.resume()` opts in to the byte stream.
+ *
+ * @param {(signal: string) => void} shutdownFn
+ */
+function installParentDeathDetector(shutdownFn) {
+  process.stdin.on("end", () => shutdownFn("stdin-eof"));
+  process.stdin.on("error", (err) => {
+    console.error(`zotero-ai-llm-proxy: stdin error: ${err?.message ?? String(err)}`);
+    shutdownFn("stdin-error");
+  });
+  process.stdin.resume();
 }
 
 // Entrypoint: only run when invoked directly (node scripts/llm-proxy/server.mjs).
@@ -526,12 +936,20 @@ if (isDirect) {
         }
       );
 
+      // Single-shot guard: EOF on stdin may arrive concurrently with a
+      // SIGTERM the lifecycle controller is sending. Both code paths call
+      // `shutdown`, so without a guard we'd hit `process.exit(0)` twice
+      // (the second after `proxy.close()` resolves on a torn-down server).
+      let shuttingDown = false;
       const shutdown = (signal) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
         console.log(`zotero-ai-llm-proxy: received ${signal}, shutting down`);
         proxy.close().then(() => process.exit(0));
       };
       process.on("SIGINT", () => shutdown("SIGINT"));
       process.on("SIGTERM", () => shutdown("SIGTERM"));
+      installParentDeathDetector(shutdown);
     },
     (err) => {
       // enrichEnvironmentPath promises to never reject, but defend in

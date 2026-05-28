@@ -38,10 +38,29 @@ tests/
   routes the plugin at a real Ollama daemon. **Auto-skips in CI** (no Ollama available); also
   auto-skips when the daemon is offline or the required models (`gemma4:e4b` / `embeddinggemma`)
   aren't pulled. Used as the final release smoke-test against a live model.
+- **Version-guard + packaging tests** — `tests/addon/version-guards.test.ts` reads
+  `addon/manifest.json` and `package.json` at test time and asserts both declare a string version of
+  shape `/^\d+\.\d+\.\d+(?:-dev)?$/`, that the two values agree, and that the dev-suffix state is
+  symmetric across both files (catches half-strip mistakes during release prep).
+  `tests/scripts/package-xpi-local-build.test.mjs` spawns `node scripts/package-xpi.mjs` with
+  `GITHUB_REF_NAME` scrubbed and asserts the local-build path reads the manifest version verbatim
+  (including any `-dev` suffix), writes the dist XPI + latest-alias, and emits a matching
+  `updates.json`. Skips on hosts without `zip`/`7z` on PATH.
 - **LLM proxy tests (`tests/scripts/llm-proxy.test.ts`)** — full HTTP-surface coverage of the
   bundled `scripts/llm-proxy/` server. Mocks `spawn` and `fetch` so the suite never spawns real
   `codex` / `claude` or hits real Ollama. Includes the BUG-AC8-1 contract test that asserts errors
-  surface as `done_reason: "error"` terminal chunks rather than silent empty completions.
+  surface as `done_reason: "error"` terminal chunks rather than silent empty completions, and the
+  `auth + host + origin gate` block (A1–A12) covering bearer-token auth, Host/Origin gating, the 1
+  MiB body cap, the `LLM_PROXY_AUTH_TOKEN` unset → no-auth-mode canary path, and the bearer
+  carve-outs for `POST /api/shutdown` + `GET /`. The plugin-side bearer wiring is covered in
+  `tests/providers/adapters/ollama.test.ts` (B1/B2: `getProxyAuthHeader` dep is honoured and
+  omitted-dep stays backward-compatible) and `tests/platform/wire-proxy-lifecycle.test.ts` (C1–C6:
+  per-spawn UUID rotation, parent/child env round-trip through the shared `LLM_PROXY_AUTH_TOKEN_ENV`
+  constant, and `diagnosticsFetch` bearer). Parent-death self-shutdown is covered by
+  `tests/scripts/llm-proxy-stdin-shutdown.test.ts` (SE-1/SE-2/SE-3: real-subprocess spawns that
+  close stdin and assert the child exits 0, logs the `stdin-eof` signal name, and survives a
+  concurrent SIGTERM via the single-shot guard; POSIX-only — Windows is covered by the
+  `POST /api/shutdown` orphan-takeover path).
 
 ## Extending
 

@@ -1,9 +1,10 @@
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   buildClaudeArgs,
+  CLAUDE_ISOLATION_SYSTEM_PROMPT,
   createClaudeBackend,
   describeClaudeFailure,
   extractDeltaText as extractClaudeDeltaText,
@@ -35,6 +36,10 @@ type SpawnCall = {
   readonly cmd: string;
   readonly args: readonly string[];
   readonly stdin: string;
+  // Spawn options captured so isolation tests can assert env / cwd.
+  // Empty/undefined when the caller didn't pass any (existing tests).
+  readonly env: Record<string, string | undefined> | undefined;
+  readonly cwd: string | undefined;
 };
 
 function makeFakeChild(opts: FakeChildOptions) {
@@ -84,13 +89,23 @@ function makeFakeChild(opts: FakeChildOptions) {
 function makeSpawnRecorder(scripts: readonly FakeChildOptions[]) {
   const calls: SpawnCall[] = [];
   let i = 0;
-  function spawn(cmd: string, args: readonly string[]): unknown {
+  function spawn(
+    cmd: string,
+    args: readonly string[],
+    opts?: { env?: Record<string, string | undefined>; cwd?: string }
+  ): unknown {
     const script = scripts[Math.min(i, scripts.length - 1)] ?? { stdoutLines: [] };
     i++;
     const { child, getStdin } = makeFakeChild(script);
     // Capture stdin after the child consumes it (settled on next tick).
     setImmediate(() => {
-      calls.push({ cmd, args: [...args], stdin: getStdin() });
+      calls.push({
+        cmd,
+        args: [...args],
+        stdin: getStdin(),
+        env: opts?.env,
+        cwd: opts?.cwd
+      });
     });
     return child;
   }
@@ -128,15 +143,59 @@ function ndjsonLines(text: string): unknown[] {
 // Suite
 // ---------------------------------------------------------------------------
 
+/**
+ * Build a `codex/event` JSON-RPC notification carrying a single
+ * `agent_message_content_delta` chunk — the per-token frame the
+ * `codex mcp-server` backend now parses.
+ */
+function mcpDelta(delta: string): string {
+  return JSON.stringify({
+    jsonrpc: "2.0",
+    method: "codex/event",
+    params: { msg: { type: "agent_message_content_delta", delta } }
+  });
+}
+
+/**
+ * Build the JSON-RPC response for `tools/call codex` carrying a
+ * `structuredContent.threadId`. The codex backend uses this to capture
+ * the threadId for resume and to close stdin so the child exits.
+ */
+function mcpToolCallResponse(threadId: string): string {
+  return JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    result: {
+      content: [{ type: "text", text: "" }],
+      structuredContent: { threadId }
+    }
+  });
+}
+
+/**
+ * Build a `codex/event` JSON-RPC notification carrying a non-delta
+ * `msg` (e.g. `session_configured`, `task_started`). All of these
+ * MUST flow through `extractDeltaText` as null so the assembled response
+ * doesn't replay after the deltas.
+ */
+function mcpFraming(msg: Record<string, unknown>): string {
+  return JSON.stringify({
+    jsonrpc: "2.0",
+    method: "codex/event",
+    params: { msg }
+  });
+}
+
 describe("llm-proxy / codex backend", () => {
   it("non-streaming chat assembles deltas into one Ollama-shape object", async () => {
     const { spawn } = makeSpawnRecorder([
       {
         stdoutLines: [
-          JSON.stringify({ type: "session_configured", session_id: "sess-1" }),
-          JSON.stringify({ type: "agent_message_delta", delta: "Hello " }),
-          JSON.stringify({ type: "agent_message_delta", delta: "world" }),
-          JSON.stringify({ type: "task_complete" })
+          mcpFraming({ type: "session_configured", session_id: "sess-1" }),
+          mcpDelta("Hello "),
+          mcpDelta("world"),
+          mcpFraming({ type: "task_complete" }),
+          mcpToolCallResponse("sess-1")
         ]
       }
     ]);
@@ -163,13 +222,15 @@ describe("llm-proxy / codex backend", () => {
     }
   });
 
-  it("streaming chat emits at least one done:false chunk then a done:true chunk", async () => {
+  it("streaming chat emits multiple done:false chunks then a done:true chunk", async () => {
     const { spawn } = makeSpawnRecorder([
       {
         stdoutLines: [
-          JSON.stringify({ type: "session_configured", session_id: "sess-2" }),
-          JSON.stringify({ type: "agent_message_delta", delta: "alpha" }),
-          JSON.stringify({ type: "agent_message_delta", delta: " beta" })
+          mcpFraming({ type: "session_configured", session_id: "sess-2" }),
+          mcpDelta("alpha"),
+          mcpDelta(" beta"),
+          mcpDelta(" gamma"),
+          mcpToolCallResponse("sess-2")
         ]
       }
     ]);
@@ -190,27 +251,32 @@ describe("llm-proxy / codex backend", () => {
       }[];
       const partials = lines.filter((l) => !l.done);
       const terminals = lines.filter((l) => l.done);
-      expect(partials.length).toBeGreaterThan(0);
+      // Hard streaming contract: at least TWO done:false chunks for a
+      // three-delta upstream. A backend that buffered the deltas into a
+      // single final emission would land at 1 here.
+      expect(partials.length).toBeGreaterThanOrEqual(2);
       expect(terminals.length).toBe(1);
       expect(terminals[0]?.done_reason).toBe("stop");
-      expect(partials.map((p) => p.message?.content ?? "").join("")).toBe("alpha beta");
+      expect(partials.map((p) => p.message?.content ?? "").join("")).toBe("alpha beta gamma");
     } finally {
       await proxy.close();
     }
   });
 
-  it("multi-turn: same first-user-message hash → first turn exec, second turn resume", async () => {
+  it("multi-turn: same first-user-message hash → first turn `codex`, second turn `codex-reply`", async () => {
     const recorder = makeSpawnRecorder([
       {
         stdoutLines: [
-          JSON.stringify({ type: "session_configured", session_id: "sess-multi" }),
-          JSON.stringify({ type: "agent_message_delta", delta: "one" })
+          mcpFraming({ type: "session_configured", session_id: "sess-multi" }),
+          mcpDelta("one"),
+          mcpToolCallResponse("sess-multi")
         ]
       },
       {
         stdoutLines: [
-          JSON.stringify({ type: "session_configured", session_id: "sess-multi" }),
-          JSON.stringify({ type: "agent_message_delta", delta: "two" })
+          mcpFraming({ type: "session_configured", session_id: "sess-multi" }),
+          mcpDelta("two"),
+          mcpToolCallResponse("sess-multi")
         ]
       }
     ]);
@@ -224,7 +290,7 @@ describe("llm-proxy / codex backend", () => {
         messages: [{ role: "user", content: firstUserContent }],
         stream: false
       });
-      // Turn 2 with the same first-user-message → must hit resume.
+      // Turn 2 with the same first-user-message → must hit codex-reply.
       await postJson(port, "/codex/api/chat", {
         messages: [
           { role: "user", content: firstUserContent },
@@ -238,15 +304,45 @@ describe("llm-proxy / codex backend", () => {
       expect(recorder.calls.length).toBe(2);
       const firstArgs = recorder.calls[0]?.args ?? [];
       const secondArgs = recorder.calls[1]?.args ?? [];
-      expect(firstArgs[0]).toBe("exec");
-      expect(firstArgs).not.toContain("resume");
-      expect(secondArgs[0]).toBe("exec");
-      expect(secondArgs[1]).toBe("resume");
-      expect(secondArgs[2]).toBe("sess-multi");
-      // Stdin of resume should contain only the latest user message.
-      expect(recorder.calls[1]?.stdin).toBe("follow-up");
-      // Stdin of first turn should be the original prompt.
-      expect(recorder.calls[0]?.stdin).toBe(firstUserContent);
+      // Both turns spawn `codex mcp-server` — resume flows through the
+      // tools/call payload, not the argv.
+      expect(firstArgs[0]).toBe("mcp-server");
+      expect(secondArgs[0]).toBe("mcp-server");
+      // The MCP handshake on stdin carries the turn-specific tools/call.
+      const firstStdin = recorder.calls[0]?.stdin ?? "";
+      const secondStdin = recorder.calls[1]?.stdin ?? "";
+      const firstToolCall = firstStdin
+        .split("\n")
+        .filter((l) => l.length > 0)
+        .map(
+          (l) =>
+            JSON.parse(l) as {
+              method?: string;
+              params?: { name?: string; arguments?: Record<string, unknown> };
+            }
+        )
+        .find((m) => m.method === "tools/call");
+      const secondToolCall = secondStdin
+        .split("\n")
+        .filter((l) => l.length > 0)
+        .map(
+          (l) =>
+            JSON.parse(l) as {
+              method?: string;
+              params?: { name?: string; arguments?: Record<string, unknown> };
+            }
+        )
+        .find((m) => m.method === "tools/call");
+      expect(firstToolCall?.params?.name).toBe("codex");
+      expect(firstToolCall?.params?.arguments?.prompt).toBe(firstUserContent);
+      expect(firstToolCall?.params?.arguments?.sandbox).toBe("read-only");
+      expect(firstToolCall?.params?.arguments?.["approval-policy"]).toBe("never");
+      expect(secondToolCall?.params?.name).toBe("codex-reply");
+      expect(secondToolCall?.params?.arguments?.threadId).toBe("sess-multi");
+      // The follow-up stdin must carry ONLY the latest user message in
+      // the tools/call arguments — codex's resume reloads the session
+      // on its end.
+      expect(secondToolCall?.params?.arguments?.prompt).toBe("follow-up");
     } finally {
       await proxy.close();
     }
@@ -254,15 +350,16 @@ describe("llm-proxy / codex backend", () => {
 
   // AC-12 Adv-8 — codex spawn is MEASURED, not warmed (codex has no
   // daemon mode, SP-12.5). The high-value guard is "exactly one
-  // `codex exec` child per turn, and turn N>1 passes `exec resume
-  // <sessionId>`" so multi-turn chats do not pay a cold first-turn
-  // re-init each time. Plan L702-704, L728.
+  // `codex mcp-server` child per turn, and turn N>1 passes
+  // `codex-reply` with the prior threadId" so multi-turn chats do not
+  // pay a cold first-turn re-init each time.
   it("AC-12 Adv-8: runTurn spawns exactly ONE codex child per turn", async () => {
     const recorder = makeSpawnRecorder([
       {
         stdoutLines: [
-          JSON.stringify({ type: "session_configured", session_id: "sess-once" }),
-          JSON.stringify({ type: "agent_message_delta", delta: "answer" })
+          mcpFraming({ type: "session_configured", session_id: "sess-once" }),
+          mcpDelta("answer"),
+          mcpToolCallResponse("sess-once")
         ]
       }
     ]);
@@ -275,21 +372,23 @@ describe("llm-proxy / codex backend", () => {
     // One turn → exactly one spawned child. A redundant re-spawn (e.g. a
     // speculative warm-up or a double-exec) turns this red.
     expect(recorder.calls.length).toBe(1);
-    expect(recorder.calls[0]?.args[0]).toBe("exec");
+    expect(recorder.calls[0]?.args[0]).toBe("mcp-server");
   });
 
-  it("AC-12 Adv-8: turn N>1 of the same conversation passes `exec resume <sessionId>` — one child each", async () => {
+  it("AC-12 Adv-8: turn N>1 of the same conversation passes `codex-reply` with the captured threadId — one child each", async () => {
     const recorder = makeSpawnRecorder([
       {
         stdoutLines: [
-          JSON.stringify({ type: "session_configured", session_id: "sess-resume" }),
-          JSON.stringify({ type: "agent_message_delta", delta: "first" })
+          mcpFraming({ type: "session_configured", session_id: "sess-resume" }),
+          mcpDelta("first"),
+          mcpToolCallResponse("sess-resume")
         ]
       },
       {
         stdoutLines: [
-          JSON.stringify({ type: "session_configured", session_id: "sess-resume" }),
-          JSON.stringify({ type: "agent_message_delta", delta: "second" })
+          mcpFraming({ type: "session_configured", session_id: "sess-resume" }),
+          mcpDelta("second"),
+          mcpToolCallResponse("sess-resume")
         ]
       }
     ]);
@@ -312,14 +411,24 @@ describe("llm-proxy / codex backend", () => {
     expect(recorder.calls.length).toBe(2);
     const firstArgs = recorder.calls[0]?.args ?? [];
     const secondArgs = recorder.calls[1]?.args ?? [];
-    // Turn 1 is a fresh `codex exec`, NOT a resume.
-    expect(firstArgs[0]).toBe("exec");
-    expect(firstArgs).not.toContain("resume");
-    // Turn 2 reuses the codex session via `exec resume <sessionId>` so
+    // Both turns invoke the MCP server; argv is identical (no resume flag).
+    expect(firstArgs[0]).toBe("mcp-server");
+    expect(secondArgs[0]).toBe("mcp-server");
+    const secondToolCall = (recorder.calls[1]?.stdin ?? "")
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map(
+        (l) =>
+          JSON.parse(l) as {
+            method?: string;
+            params?: { name?: string; arguments?: Record<string, unknown> };
+          }
+      )
+      .find((m) => m.method === "tools/call");
+    // Turn 2 reuses the codex session via `codex-reply { threadId }` so
     // the model does not pay a cold first-turn re-init.
-    expect(secondArgs[0]).toBe("exec");
-    expect(secondArgs[1]).toBe("resume");
-    expect(secondArgs[2]).toBe("sess-resume");
+    expect(secondToolCall?.params?.name).toBe("codex-reply");
+    expect(secondToolCall?.params?.arguments?.threadId).toBe("sess-resume");
   });
 
   it("non-zero codex exit emits a terminal error chunk with stderr (no silent completion)", async () => {
@@ -453,30 +562,39 @@ describe("llm-proxy / codex backend", () => {
     }
   });
 
-  it("thread_id from `thread.started` is captured for resume (current codex CLI shape)", async () => {
-    // Codex CLI renamed `session_id` → `thread_id`. The argument that
-    // `codex exec resume` accepts is documented as "Conversation/session
-    // id (UUID) or thread name" — UUIDs take precedence. The proxy must
-    // recognise the new field name so multi-turn explain doesn't keep
-    // spawning fresh codex sessions (which re-narrate their own
-    // onboarding instead of continuing the conversation).
+  it("threadId from `_meta.threadId` on a codex/event notification is captured for resume", async () => {
+    // The MCP-server protocol carries the threadId in two places: the
+    // structuredContent of the tools/call response AND every
+    // notification's `params._meta.threadId`. The proxy must recognise
+    // either so multi-turn explain doesn't keep spawning fresh codex
+    // sessions (which re-narrate their own onboarding instead of
+    // continuing the conversation).
     const recorder = makeSpawnRecorder([
       {
         stdoutLines: [
-          JSON.stringify({ type: "thread.started", thread_id: "019e3ea7-thread-uuid" }),
           JSON.stringify({
-            type: "item.completed",
-            item: { type: "agent_message", text: "first" }
-          })
+            jsonrpc: "2.0",
+            method: "codex/event",
+            params: {
+              _meta: { requestId: 1, threadId: "019e3ea7-thread-uuid" },
+              msg: {
+                type: "session_configured",
+                session_id: "019e3ea7-thread-uuid",
+                thread_id: "019e3ea7-thread-uuid"
+              }
+            }
+          }),
+          mcpDelta("first")
+          // Intentionally omit the tools/call response so the test
+          // exercises the per-notification _meta walker, not the
+          // structuredContent path.
         ]
       },
       {
         stdoutLines: [
-          JSON.stringify({ type: "thread.started", thread_id: "019e3ea7-thread-uuid" }),
-          JSON.stringify({
-            type: "item.completed",
-            item: { type: "agent_message", text: "second" }
-          })
+          mcpFraming({ type: "session_configured", session_id: "019e3ea7-thread-uuid" }),
+          mcpDelta("second"),
+          mcpToolCallResponse("019e3ea7-thread-uuid")
         ]
       }
     ]);
@@ -496,25 +614,44 @@ describe("llm-proxy / codex backend", () => {
     });
     await new Promise((r) => setImmediate(r));
     expect(recorder.calls.length).toBe(2);
-    const secondArgs = recorder.calls[1]?.args ?? [];
-    expect(secondArgs).toContain("resume");
-    expect(secondArgs).toContain("019e3ea7-thread-uuid");
-    // The follow-up stdin must carry ONLY the latest user message, not
-    // the prior history — codex's resume reloads the session on its end.
-    expect(recorder.calls[1]?.stdin).toBe("follow-up");
+    const secondToolCall = (recorder.calls[1]?.stdin ?? "")
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map(
+        (l) =>
+          JSON.parse(l) as {
+            method?: string;
+            params?: { name?: string; arguments?: Record<string, unknown> };
+          }
+      )
+      .find((m) => m.method === "tools/call");
+    expect(secondToolCall?.params?.name).toBe("codex-reply");
+    expect(secondToolCall?.params?.arguments?.threadId).toBe("019e3ea7-thread-uuid");
+    // The follow-up stdin must carry ONLY the latest user message in
+    // the tools/call arguments — codex's resume reloads the session
+    // on its end.
+    expect(secondToolCall?.params?.arguments?.prompt).toBe("follow-up");
   });
 
-  it("session_id discovered in a nested msg shape is captured for resume", async () => {
+  it("threadId discovered in a nested msg.thread_id is captured for resume", async () => {
     const recorder = makeSpawnRecorder([
       {
         stdoutLines: [
-          // Nested under `msg` instead of top level.
-          JSON.stringify({ id: "1", msg: { type: "session_configured", session_id: "nested-id" } }),
-          JSON.stringify({ msg: { type: "agent_message", message: "ok" } })
+          // Nested under `msg` (no _meta, no structuredContent).
+          JSON.stringify({
+            jsonrpc: "2.0",
+            method: "codex/event",
+            params: { msg: { type: "session_configured", thread_id: "nested-id" } }
+          }),
+          mcpDelta("ok")
         ]
       },
       {
-        stdoutLines: [JSON.stringify({ msg: { type: "agent_message", message: "two" } })]
+        stdoutLines: [
+          mcpFraming({ type: "session_configured", session_id: "nested-id" }),
+          mcpDelta("two"),
+          mcpToolCallResponse("nested-id")
+        ]
       }
     ]);
     const codexBackend = createCodexBackend({ spawn: recorder.spawn });
@@ -536,20 +673,123 @@ describe("llm-proxy / codex backend", () => {
     });
     expect(drainedSecond.length).toBeGreaterThan(0);
     await new Promise((r) => setImmediate(r));
-    const secondArgs = recorder.calls[1]?.args ?? [];
-    expect(secondArgs).toContain("resume");
-    expect(secondArgs).toContain("nested-id");
+    const secondToolCall = (recorder.calls[1]?.stdin ?? "")
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map(
+        (l) =>
+          JSON.parse(l) as {
+            method?: string;
+            params?: { name?: string; arguments?: Record<string, unknown> };
+          }
+      )
+      .find((m) => m.method === "tools/call");
+    expect(secondToolCall?.params?.name).toBe("codex-reply");
+    expect(secondToolCall?.params?.arguments?.threadId).toBe("nested-id");
   });
 
-  it("extractDeltaText handles agent_message_delta, agent_message, and content arrays", () => {
-    expect(extractDeltaText({ type: "agent_message_delta", delta: "hi" })).toBe("hi");
-    expect(extractDeltaText({ msg: { type: "agent_message", message: "yo" } })).toBe("yo");
-    expect(extractDeltaText({ content: [{ type: "text", text: "abc" }] })).toBe("abc");
-    expect(extractDeltaText({ type: "user_message", message: "ignored" })).toBeNull();
+  it("extractDeltaText: codex/event agent_message_content_delta surfaces the delta string", () => {
+    expect(
+      extractDeltaText({
+        method: "codex/event",
+        params: { msg: { type: "agent_message_content_delta", delta: "hi" } }
+      })
+    ).toBe("hi");
+    // The same shape with metadata still resolves.
+    expect(
+      extractDeltaText({
+        jsonrpc: "2.0",
+        method: "codex/event",
+        params: {
+          _meta: { requestId: 1, threadId: "abc" },
+          msg: { type: "agent_message_content_delta", item_id: "msg_0", delta: "world" }
+        }
+      })
+    ).toBe("world");
+    // A delta msg with an EMPTY string must not return the string.
+    expect(
+      extractDeltaText({
+        method: "codex/event",
+        params: { msg: { type: "agent_message_content_delta", delta: "" } }
+      })
+    ).toBeNull();
+    // Non-codex/event events fall through to the legacy branches.
     expect(extractDeltaText(null)).toBeNull();
   });
 
-  it("extractDeltaText handles the `item.completed` / `agent_message` envelope (current codex CLI)", () => {
+  it("extractDeltaText denies the three MCP terminal envelopes to prevent duplicate emission", () => {
+    // After streaming `agent_message_content_delta` chunks, codex
+    // mcp-server emits THREE more `codex/event` notifications carrying
+    // the full assembled response: `item_completed AgentMessage`,
+    // `raw_response_item`, and `agent_message`. Surfacing any of them
+    // would echo the final answer two or three times into the popup.
+    expect(
+      extractDeltaText({
+        method: "codex/event",
+        params: {
+          msg: {
+            type: "item_completed",
+            item: { type: "AgentMessage", content: [{ type: "Text", text: "x" }] }
+          }
+        }
+      })
+    ).toBeNull();
+    expect(
+      extractDeltaText({
+        method: "codex/event",
+        params: {
+          msg: {
+            type: "raw_response_item",
+            item: { type: "message", content: [{ type: "output_text", text: "leak" }] }
+          }
+        }
+      })
+    ).toBeNull();
+    expect(
+      extractDeltaText({
+        method: "codex/event",
+        params: { msg: { type: "agent_message", message: "leak" } }
+      })
+    ).toBeNull();
+    expect(
+      extractDeltaText({
+        method: "codex/event",
+        params: {
+          msg: { type: "AgentMessage", content: [{ type: "Text", text: "leak" }] }
+        }
+      })
+    ).toBeNull();
+  });
+
+  it("extractDeltaText denies MCP framing events (session_configured, task_*, mcp_startup_update, *Reasoning*, UserMessage)", () => {
+    // These all arrive on the codex/event stream BEFORE / DURING the
+    // turn and never carry assistant text. The denylist gates them so
+    // a future codex release that adds a top-level `text` to one
+    // doesn't accidentally bleed shell output into the popup.
+    const denied = [
+      "session_configured",
+      "mcp_startup_update",
+      "task_started",
+      "task_complete",
+      "item_started",
+      "Reasoning",
+      "UserMessage"
+    ];
+    for (const type of denied) {
+      expect(
+        extractDeltaText({
+          method: "codex/event",
+          params: { msg: { type, text: "<<<leak>>>", delta: "<<<leak>>>", message: "<<<leak>>>" } }
+        })
+      ).toBeNull();
+    }
+  });
+
+  it("extractDeltaText still handles legacy item.completed / agent_message envelope", () => {
+    // The integration test fake-codex (tests/integration/
+    // codex-proxy-pipeline.test.ts) emits the pre-MCP `codex exec
+    // --json` shape. Retaining the legacy branches lets the integration
+    // test continue to exercise the extraction path.
     expect(
       extractDeltaText({
         type: "item.completed",
@@ -565,8 +805,7 @@ describe("llm-proxy / codex backend", () => {
         }
       })
     ).toBe("nested");
-    // Speculative streaming variant — accepted so a future codex release
-    // that emits `item.delta` doesn't regress us back into stuck-loading.
+    // Speculative streaming variant.
     expect(
       extractDeltaText({
         type: "item.delta",
@@ -630,42 +869,64 @@ describe("llm-proxy / codex backend", () => {
     expect(extractDeltaText({ content: [{ type: "text", text: "ok" }] })).toBe("ok");
   });
 
-  it("end-to-end: codex `item.completed` event stream → assistant text reaches the client", async () => {
+  it("extractDeltaText denylist matches PascalCase and snake_case interchangeably (normalization)", () => {
+    // Codex has shipped at least two casings for the same logical event
+    // (e.g. `agent_message` and `AgentMessage`, `reasoning` and
+    // `Reasoning`, `user_message` and `UserMessage`). The denylist holds
+    // one canonical snake_case entry per logical type; the comparison
+    // site normalizes the incoming msg.type before lookup. Both casings
+    // must therefore return null even when the event carries leak-shaped
+    // top-level `text` / `delta` fields.
+    for (const pair of [
+      ["agent_message", "AgentMessage"],
+      ["reasoning", "Reasoning"],
+      ["user_message", "UserMessage"]
+    ]) {
+      for (const t of pair) {
+        expect(extractDeltaText({ type: t, text: "<<<leak>>>" })).toBeNull();
+        expect(extractDeltaText({ type: t, delta: "<<<leak>>>" })).toBeNull();
+        expect(extractDeltaText({ type: t, message: "<<<leak>>>" })).toBeNull();
+        // Same denial under the nested `msg` envelope.
+        expect(extractDeltaText({ msg: { type: t, delta: "<<<leak>>>" } })).toBeNull();
+      }
+    }
+  });
+
+  it("end-to-end: codex MCP event stream → assistant text reaches the client without duplicates", async () => {
     const { spawn } = makeSpawnRecorder([
       {
         stdoutLines: [
-          JSON.stringify({ type: "thread.started", thread_id: "thread-1" }),
-          JSON.stringify({ type: "turn.started" }),
+          mcpFraming({ type: "session_configured", session_id: "thread-1", thread_id: "thread-1" }),
+          mcpFraming({ type: "task_started", turn_id: "1" }),
+          mcpDelta("hello"),
+          mcpDelta(" world"),
+          // Terminal envelopes — must NOT replay the text.
           JSON.stringify({
-            type: "item.started",
-            item: {
-              id: "item_0",
-              type: "command_execution",
-              command: "/bin/zsh -lc 'sed -n 1,10p ~/SKILL.md'",
-              aggregated_output: "",
-              exit_code: null,
-              status: "in_progress"
+            jsonrpc: "2.0",
+            method: "codex/event",
+            params: {
+              msg: {
+                type: "item_completed",
+                item: {
+                  type: "AgentMessage",
+                  content: [{ type: "Text", text: "hello world" }],
+                  phase: "final_answer"
+                }
+              }
             }
           }),
           JSON.stringify({
-            type: "item.completed",
-            item: {
-              id: "item_0",
-              type: "command_execution",
-              command: "/bin/zsh -lc 'sed -n 1,10p ~/SKILL.md'",
-              aggregated_output: "<<<must-not-leak>>>",
-              exit_code: 0,
-              status: "completed"
+            jsonrpc: "2.0",
+            method: "codex/event",
+            params: {
+              msg: {
+                type: "raw_response_item",
+                item: { type: "message", content: [{ type: "output_text", text: "hello world" }] }
+              }
             }
           }),
-          JSON.stringify({
-            type: "item.completed",
-            item: { id: "item_1", type: "agent_message", text: "hello world" }
-          }),
-          JSON.stringify({
-            type: "turn.completed",
-            usage: { input_tokens: 100, output_tokens: 3 }
-          })
+          mcpFraming({ type: "agent_message", message: "hello world" }),
+          mcpToolCallResponse("thread-1")
         ]
       }
     ]);
@@ -688,9 +949,9 @@ describe("llm-proxy / codex backend", () => {
         .filter((l) => !l.done)
         .map((l) => l.message?.content ?? "")
         .join("");
+      // The deltas concatenate to the answer ONCE — terminal envelopes
+      // must not replay it.
       expect(assembled).toBe("hello world");
-      // The tool-call envelope must not leak into the popup.
-      expect(assembled).not.toContain("must-not-leak");
       const terminal = lines.find((l) => l.done);
       expect(terminal?.done_reason).toBe("stop");
     } finally {
@@ -881,8 +1142,9 @@ describe("llm-proxy / tags + routing", () => {
       {
         stdoutLines: [
           "codex CLI v1.2.3 — connected as alice@example.com",
-          JSON.stringify({ type: "session_configured", session_id: "sess-banner" }),
-          JSON.stringify({ type: "agent_message_delta", delta: "OK" })
+          mcpFraming({ type: "session_configured", session_id: "sess-banner" }),
+          mcpDelta("OK"),
+          mcpToolCallResponse("sess-banner")
         ]
       }
     ]);
@@ -945,7 +1207,7 @@ describe("llm-proxy / lifecycle", () => {
 // ---------------------------------------------------------------------------
 
 describe("llm-proxy / claude backend", () => {
-  it('first turn spawns `claude -p --output-format json --allowedTools ""` and parses session_id', async () => {
+  it('first turn spawns `claude -p --output-format stream-json --verbose --include-partial-messages --allowedTools ""` and parses session_id', async () => {
     const recorder = makeSpawnRecorder([
       {
         stdoutLines: [
@@ -978,16 +1240,73 @@ describe("llm-proxy / claude backend", () => {
       await new Promise((r) => setImmediate(r));
       expect(recorder.calls.length).toBe(1);
       const args = recorder.calls[0]?.args ?? [];
-      // Must use print mode and JSON output. `--resume` must NOT appear on the
-      // first turn (no session_id known yet).
+      // Must use print mode and stream-json output. `--verbose` and
+      // `--include-partial-messages` are mandatory for the per-token
+      // content_block_delta frames that drive streaming. `--resume` must
+      // NOT appear on the first turn (no session_id known yet).
       expect(args).toContain("-p");
       expect(args).toContain("--output-format");
-      expect(args).toContain("json");
+      expect(args).toContain("stream-json");
+      expect(args).toContain("--verbose");
+      expect(args).toContain("--include-partial-messages");
       expect(args).not.toContain("--resume");
       // Session id captured for reuse.
       expect(claudeBackend._sessionMap.size).toBe(1);
       const stored = [...claudeBackend._sessionMap.values()][0];
       expect(stored).toBe("11111111-2222-3333-4444-555555555555");
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("streaming claude turn emits multiple done:false chunks for a multi-delta upstream", async () => {
+    // Drive the backend with three content_block_delta frames and a
+    // terminal `assistant` envelope; the proxy must surface ≥2
+    // done:false chunks (not buffer all three deltas into one).
+    function streamFrame(text: string): string {
+      return JSON.stringify({
+        type: "stream_event",
+        event: { type: "content_block_delta", delta: { type: "text_delta", text } }
+      });
+    }
+    const { spawn } = makeSpawnRecorder([
+      {
+        stdoutLines: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: "sess-stream" }),
+          streamFrame("alpha "),
+          streamFrame("beta "),
+          streamFrame("gamma"),
+          // The final `assistant` envelope carries the full message; must
+          // not double-emit. The `result` envelope in stream-json carries
+          // usage metadata only.
+          JSON.stringify({
+            type: "assistant",
+            message: { content: [{ type: "text", text: "alpha beta gamma" }] }
+          }),
+          JSON.stringify({ type: "result", session_id: "sess-stream", usage: { output_tokens: 3 } })
+        ]
+      }
+    ]);
+    const claudeBackend = createClaudeBackend({ spawn });
+    const proxy = createProxyServer({ claudeBackend });
+    const port = await proxy.listen(0);
+    try {
+      const { status, text } = await postJson(port, "/claude/api/chat", {
+        messages: [{ role: "user", content: "say something multi-token" }],
+        stream: true
+      });
+      expect(status).toBe(200);
+      const lines = ndjsonLines(text) as {
+        done: boolean;
+        message?: { content: string };
+        done_reason?: string;
+      }[];
+      const partials = lines.filter((l) => !l.done);
+      expect(partials.length).toBeGreaterThanOrEqual(2);
+      const assembled = partials.map((p) => p.message?.content ?? "").join("");
+      expect(assembled).toBe("alpha beta gamma");
+      const terminal = lines.find((l) => l.done);
+      expect(terminal?.done_reason).toBe("stop");
     } finally {
       await proxy.close();
     }
@@ -1227,7 +1546,7 @@ describe("llm-proxy / claude backend", () => {
         origKill(sig);
       };
       setImmediate(() => {
-        calls.push({ cmd, args: [...args], stdin: getStdin() });
+        calls.push({ cmd, args: [...args], stdin: getStdin(), env: undefined, cwd: undefined });
       });
       return child;
     }
@@ -1279,15 +1598,35 @@ describe("llm-proxy / claude backend", () => {
       await proxy.close();
     }
 
-    // Pure-function check: buildClaudeArgs always emits the empty allowlist.
+    // Pure-function check: buildClaudeArgs always emits the empty
+    // allowlist AND the stream-json triple (--output-format stream-json,
+    // --verbose, --include-partial-messages) AND the isolation block.
     const noSession = buildClaudeArgs({ sessionId: null });
     expect(noSession).toContain("--allowedTools");
     expect(noSession[noSession.indexOf("--allowedTools") + 1]).toBe("");
+    expect(noSession).toContain("--output-format");
+    expect(noSession[noSession.indexOf("--output-format") + 1]).toBe("stream-json");
+    expect(noSession).toContain("--verbose");
+    expect(noSession).toContain("--include-partial-messages");
+    // Isolation block — always present (no per-call gating).
+    expect(noSession).toContain("--setting-sources");
+    expect(noSession[noSession.indexOf("--setting-sources") + 1]).toBe("user");
+    expect(noSession).toContain("--strict-mcp-config");
+    expect(noSession).toContain("--disable-slash-commands");
+    expect(noSession).toContain("--system-prompt");
     const withSession = buildClaudeArgs({ sessionId: "abc", model: "opus" });
     expect(withSession[0]).toBe("--resume");
     expect(withSession[1]).toBe("abc");
     expect(withSession).toContain("--allowedTools");
     expect(withSession[withSession.indexOf("--allowedTools") + 1]).toBe("");
+    expect(withSession).toContain("--output-format");
+    expect(withSession[withSession.indexOf("--output-format") + 1]).toBe("stream-json");
+    expect(withSession).toContain("--verbose");
+    expect(withSession).toContain("--include-partial-messages");
+    expect(withSession).toContain("--setting-sources");
+    expect(withSession).toContain("--strict-mcp-config");
+    expect(withSession).toContain("--disable-slash-commands");
+    expect(withSession).toContain("--system-prompt");
     expect(withSession).toContain("--model");
     expect(withSession[withSession.indexOf("--model") + 1]).toBe("opus");
   });
@@ -1350,6 +1689,62 @@ describe("llm-proxy / claude backend", () => {
     expect(extractClaudeDeltaText({ type: "user_message", text: "ignored" })).toBeNull();
     expect(extractClaudeDeltaText({ type: "user", result: "ignored" })).toBeNull();
     expect(extractClaudeDeltaText(null)).toBeNull();
+  });
+
+  it("extractDeltaText: stream_event → content_block_delta → text_delta surfaces the chunk", () => {
+    expect(
+      extractClaudeDeltaText({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          delta: { type: "text_delta", text: "hello" }
+        }
+      })
+    ).toBe("hello");
+    // A stream_event for a NON content_block_delta (e.g.
+    // message_start, content_block_start) must not surface text.
+    expect(
+      extractClaudeDeltaText({
+        type: "stream_event",
+        event: { type: "message_start", message: { id: "msg_1" } }
+      })
+    ).toBeNull();
+    // A content_block_delta whose delta type is NOT text_delta (e.g.
+    // input_json_delta for tool input) must not surface text.
+    expect(
+      extractClaudeDeltaText({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          delta: { type: "input_json_delta", partial_json: "{" }
+        }
+      })
+    ).toBeNull();
+  });
+
+  it("extractDeltaText denies stream-json framing envelopes (system/result/rate_limit_event/assistant)", () => {
+    // The `assistant` envelope arrives AFTER all content_block_delta
+    // chunks carrying the full message; surfacing it would emit the
+    // streamed text a second time into the popup.
+    expect(
+      extractClaudeDeltaText({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "full reply" }] }
+      })
+    ).toBeNull();
+    // Framing envelopes from --verbose stream-json carry usage /
+    // metadata and never assistant text — must produce no delta even
+    // if they incidentally have a `text` or `delta` field on them.
+    expect(
+      extractClaudeDeltaText({ type: "system", subtype: "init", text: "<<<leak>>>" })
+    ).toBeNull();
+    expect(extractClaudeDeltaText({ type: "rate_limit_event", text: "<<<leak>>>" })).toBeNull();
+    // The `result` envelope in stream-json mode carries usage and
+    // session metadata (no `result` string), distinct from the legacy
+    // single-shot `{type:"result", result:"…"}` shape that fixtures
+    // still rely on. The denylist gates it when no `result` string is
+    // present.
+    expect(extractClaudeDeltaText({ type: "result", usage: { input_tokens: 10 } })).toBeNull();
   });
 });
 
@@ -1826,5 +2221,720 @@ describe("llm-proxy / /api/diagnostics (Bug B2)", () => {
     } finally {
       await proxy.close();
     }
+  });
+});
+
+// -----------------------------------------------------------------------
+// CLI subprocess config isolation (Bug A)
+//
+// `codex mcp-server` and `claude -p` each have no flag to suppress the
+// user's global config / skills / hooks. The fix is environment-based:
+//   - codex: HOME + CODEX_HOME both pointed at an empty tmpdir on spawn,
+//            with ~/.codex/auth.json copied in so OAuth still works; the
+//            tools/call `cwd` argument also points at the tmpdir.
+//   - claude: spawn cwd pointed at an empty tmpdir (HOME left intact so
+//            subscription-OAuth keychain reads keep working) + a fixed
+//            isolation system prompt overrides any pollution that leaks
+//            through SessionStart hooks.
+//
+// The four tests below pin those behaviors against the mock-spawn harness.
+// -----------------------------------------------------------------------
+describe("llm-proxy / CLI isolation (Bug A)", () => {
+  it("A1: codex runTurn spawn env carries HOME + CODEX_HOME pointing at the same isolation tmpdir", async () => {
+    const recorder = makeSpawnRecorder([
+      {
+        stdoutLines: [
+          mcpFraming({ type: "session_configured", session_id: "iso-1" }),
+          mcpDelta("ok"),
+          mcpToolCallResponse("iso-1")
+        ]
+      }
+    ]);
+    const codexBackend = createCodexBackend({ spawn: recorder.spawn });
+    await codexBackend.runTurn({
+      messages: [{ role: "user", content: "hi" }],
+      onEvent: () => undefined
+    });
+    await new Promise((r) => setImmediate(r));
+    const env = recorder.calls[0]?.env ?? {};
+    // Both HOME and CODEX_HOME must point at the same tmpdir-shaped path
+    // — the exact dir name varies per run (mkdtemp template), so we
+    // assert on the `zotero-ai-codex-` prefix.
+    expect(env.HOME).toEqual(expect.stringMatching(/zotero-ai-codex-/u));
+    expect(env.CODEX_HOME).toEqual(expect.stringMatching(/zotero-ai-codex-/u));
+    expect(env.HOME).toBe(env.CODEX_HOME);
+  });
+
+  it("A2: codex tools/call arguments carry cwd matching the isolation tmpdir (not process.cwd())", async () => {
+    const recorder = makeSpawnRecorder([
+      {
+        stdoutLines: [
+          mcpFraming({ type: "session_configured", session_id: "iso-2" }),
+          mcpDelta("ok"),
+          mcpToolCallResponse("iso-2")
+        ]
+      }
+    ]);
+    const codexBackend = createCodexBackend({ spawn: recorder.spawn });
+    await codexBackend.runTurn({
+      messages: [{ role: "user", content: "hi" }],
+      onEvent: () => undefined
+    });
+    await new Promise((r) => setImmediate(r));
+    const stdin = recorder.calls[0]?.stdin ?? "";
+    const toolCall = stdin
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map(
+        (l) =>
+          JSON.parse(l) as {
+            method?: string;
+            params?: { name?: string; arguments?: Record<string, unknown> };
+          }
+      )
+      .find((m) => m.method === "tools/call");
+    expect(toolCall).toBeDefined();
+    const args = toolCall?.params?.arguments ?? {};
+    expect(args.cwd).toEqual(expect.stringMatching(/zotero-ai-codex-/u));
+    // Same tmpdir as the spawn env — codex's tools/call cwd MUST match
+    // the spawn cwd, otherwise AGENTS.md from the spawn cwd still leaks.
+    expect(args.cwd).toBe(recorder.calls[0]?.env?.HOME);
+  });
+
+  it("A3: claude buildClaudeArgs always emits the isolation flags + CLAUDE_ISOLATION_SYSTEM_PROMPT", () => {
+    const argv = buildClaudeArgs({ sessionId: null });
+    // The four isolation flags appear in fixed order: --setting-sources
+    // user, --strict-mcp-config, --disable-slash-commands, --system-prompt
+    // <NEUTRAL>.
+    const idxSettingSources = argv.indexOf("--setting-sources");
+    expect(idxSettingSources).toBeGreaterThanOrEqual(0);
+    expect(argv[idxSettingSources + 1]).toBe("user");
+    expect(argv).toContain("--strict-mcp-config");
+    expect(argv).toContain("--disable-slash-commands");
+    const idxSystemPrompt = argv.indexOf("--system-prompt");
+    expect(idxSystemPrompt).toBeGreaterThanOrEqual(0);
+    expect(argv[idxSystemPrompt + 1]).toBe(CLAUDE_ISOLATION_SYSTEM_PROMPT);
+    // Sanity: the prompt itself is non-empty and starts with the
+    // research-assistant framing.
+    expect(CLAUDE_ISOLATION_SYSTEM_PROMPT.length).toBeGreaterThan(0);
+    expect(CLAUDE_ISOLATION_SYSTEM_PROMPT).toMatch(/research/u);
+  });
+
+  it("A4: claude runTurn spawn options carry cwd matching the isolation tmpdir", async () => {
+    const recorder = makeSpawnRecorder([
+      {
+        stdoutLines: [JSON.stringify({ type: "result", session_id: "claude-iso", result: "ok" })]
+      }
+    ]);
+    const claudeBackend = createClaudeBackend({ spawn: recorder.spawn });
+    await claudeBackend.runTurn({
+      messages: [{ role: "user", content: "hi" }],
+      onEvent: () => undefined
+    });
+    await new Promise((r) => setImmediate(r));
+    const cwd = recorder.calls[0]?.cwd;
+    expect(cwd).toEqual(expect.stringMatching(/zotero-ai-claude-/u));
+    // We deliberately do NOT override HOME for claude — subscription
+    // OAuth needs the real $HOME to reach the keychain. Asserting `env`
+    // is undefined (the spawn call passed no env override) keeps the
+    // backend honest about that choice.
+    expect(recorder.calls[0]?.env).toBeUndefined();
+  });
+});
+
+// -----------------------------------------------------------------------
+// Auth + Host + Origin gate (Bug: proxy-auth)
+//
+// `enforceRequestPolicy` runs BEFORE any route dispatch. Three checks
+// in order: Host (allow loopback only), Origin (allow missing/null,
+// reject any non-empty value), bearer token (skip in dev no-auth-mode,
+// constant-time-compare otherwise). Body cap is enforced inside the
+// shared `readBody` helper as a 413.
+//
+// `AUTH_TOKEN` is captured at `createProxyServer` call time from
+// `process.env.LLM_PROXY_AUTH_TOKEN`, so each test mutates the env
+// (within a try/finally) before constructing the server.
+// -----------------------------------------------------------------------
+describe("llm-proxy / auth + host + origin gate", () => {
+  function makeStubBackends() {
+    // The auth gate fires BEFORE route dispatch, so the backends are
+    // only here to satisfy createProxyServer's type expectations. They
+    // are wired with throwing spawn fakes so a regression that bypassed
+    // the gate would surface as "backend spawn was attempted".
+    const throwingSpawn = (): never => {
+      throw new Error("auth gate must reject before reaching the backend");
+    };
+    return {
+      codexBackend: createCodexBackend({ spawn: throwingSpawn }),
+      claudeBackend: createClaudeBackend({ spawn: throwingSpawn })
+    };
+  }
+
+  function withAuthEnv<T>(token: string | null, fn: () => Promise<T>): Promise<T> {
+    const original = process.env.LLM_PROXY_AUTH_TOKEN;
+    if (token === null) delete process.env.LLM_PROXY_AUTH_TOKEN;
+    else process.env.LLM_PROXY_AUTH_TOKEN = token;
+    return fn().finally(() => {
+      if (original === undefined) delete process.env.LLM_PROXY_AUTH_TOKEN;
+      else process.env.LLM_PROXY_AUTH_TOKEN = original;
+    });
+  }
+
+  // The proxy treats any 36-char UUID-shaped string as equivalent for
+  // length-check purposes; mint two distinct ones so wrong-token vs
+  // right-token assertions don't accidentally collide.
+  const RIGHT_TOKEN = "11111111-1111-4111-8111-111111111111";
+  const WRONG_TOKEN = "22222222-2222-4222-8222-222222222222";
+
+  it("A1: rejects a request with no Authorization header in auth-enabled mode (401)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`);
+        expect(r.status).toBe(401);
+        const body = (await r.json()) as { error: string };
+        expect(body.error).toMatch(/missing bearer/u);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A2: rejects a request bearing a WRONG-token of the right length (401)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`, {
+          headers: { authorization: `Bearer ${WRONG_TOKEN}` }
+        });
+        expect(r.status).toBe(401);
+        const body = (await r.json()) as { error: string };
+        expect(body.error).toMatch(/invalid token/u);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A3: accepts a request bearing the correct token (200)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`, {
+          headers: { authorization: `Bearer ${RIGHT_TOKEN}` }
+        });
+        expect(r.status).toBe(200);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A4: rejects a request bearing a foreign Origin header (403) even with a valid token", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`, {
+          headers: {
+            authorization: `Bearer ${RIGHT_TOKEN}`,
+            origin: "https://attacker.example"
+          }
+        });
+        expect(r.status).toBe(403);
+        const body = (await r.json()) as { error: string };
+        expect(body.error).toMatch(/origin/u);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A5: rejects a request with a non-loopback Host header (403)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        // node's `fetch` derives Host from the URL; to inject an
+        // attacker Host we drop down to the raw `net` socket and
+        // hand-craft the HTTP/1.1 request line.
+        const { Socket } = await import("node:net");
+        const responseText = await new Promise<string>((resolve, reject) => {
+          const socket = new Socket();
+          let buf = "";
+          socket.on("data", (chunk) => {
+            buf += chunk.toString("utf8");
+          });
+          socket.on("end", () => {
+            resolve(buf);
+          });
+          socket.on("error", reject);
+          socket.connect(port, "127.0.0.1", () => {
+            socket.write(
+              `GET /api/tags HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer ${RIGHT_TOKEN}\r\nConnection: close\r\n\r\n`
+            );
+          });
+        });
+        const firstLine = responseText.split("\r\n", 1)[0] ?? "";
+        expect(firstLine).toMatch(/^HTTP\/1\.1 403/u);
+        expect(responseText).toMatch(/host not allowed/u);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A6: rejects a POST with a body larger than MAX_BODY_BYTES (413)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      // The default MAX_BODY_BYTES is 1 MiB. Compose a body well over
+      // that to ensure the cap fires (the JSON body is a flat string;
+      // the overflow check runs on the first chunk that pushes the
+      // total past the cap).
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        // Build a 2 MiB payload — guaranteed to overflow the 1 MiB cap.
+        const big = JSON.stringify({
+          messages: [{ role: "user", content: "x".repeat(2 * 1024 * 1024) }]
+        });
+        const r = await fetch(`http://127.0.0.1:${String(port)}/codex/api/chat`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${RIGHT_TOKEN}`
+          },
+          body: big
+        });
+        expect(r.status).toBe(413);
+        const body = (await r.json()) as { error: string };
+        expect(body.error).toMatch(/body exceeds/u);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A7: starts in no-auth mode without LLM_PROXY_AUTH_TOKEN — emits console.warn AND accepts unauthenticated requests", async () => {
+    // Capture console.warn so we can assert the canary fired. The dev
+    // path (`npm run proxy:llm`) and the integration test
+    // `codex-proxy-pipeline.test.ts` both rely on this branch.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {
+      // swallow the canary line so test output stays clean
+    });
+    try {
+      await withAuthEnv(null, async () => {
+        const proxy = createProxyServer(makeStubBackends());
+        const port = await proxy.listen(0);
+        try {
+          // Unauthenticated request should pass with 200 — the gate's
+          // bearer check is skipped entirely in no-auth mode.
+          const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`);
+          expect(r.status).toBe(200);
+          // The startup warn line fired on `listen()` resolve.
+          const warnedMessages = warnSpy.mock.calls
+            .map((args) => (typeof args[0] === "string" ? args[0] : ""))
+            .filter((m) => m.includes("llm-proxy"));
+          expect(warnedMessages.length).toBeGreaterThan(0);
+          expect(warnedMessages.some((m) => m.includes("AUTH DISABLED"))).toBe(true);
+        } finally {
+          await proxy.close();
+        }
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  // -------------------------------------------------------------------
+  // Per-route auth carve-out (A8-A11).
+  //
+  // `/api/shutdown` and `GET /` are INTENTIONALLY bearer-exempt so the
+  // orphan-takeover path in `wire-proxy-lifecycle.ts:tryTakeoverOrphan`
+  // still works after a Zotero restart (the new plugin instance has no
+  // way to know the prior session's token). The Host + Origin gates
+  // still apply, so a network attacker cannot exploit the carve-out;
+  // the only attack vector that survives is "another local process can
+  // shut us down", which is an acceptable DoS on a single-user desktop.
+  // -------------------------------------------------------------------
+  it("A8: POST /api/shutdown succeeds WITHOUT a bearer token even in auth-enabled mode", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/shutdown`, {
+          method: "POST"
+        });
+        expect(r.status).toBe(200);
+        const body = (await r.json()) as { exiting: boolean };
+        expect(body.exiting).toBe(true);
+      } finally {
+        // The shutdown handler exits the process on the next tick; in
+        // a test context we close the server explicitly so the suite
+        // doesn't kill the Vitest worker. The shutdown handler's
+        // `setTimeout(..).unref()` is the safety net for the prod path.
+        try {
+          await proxy.close();
+        } catch {
+          // already closing
+        }
+      }
+    });
+  });
+
+  it("A9: /api/shutdown still rejects a request with a foreign Host header (403)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const { Socket } = await import("node:net");
+        const responseText = await new Promise<string>((resolve, reject) => {
+          const socket = new Socket();
+          let buf = "";
+          socket.on("data", (chunk) => {
+            buf += chunk.toString("utf8");
+          });
+          socket.on("end", () => {
+            resolve(buf);
+          });
+          socket.on("error", reject);
+          socket.connect(port, "127.0.0.1", () => {
+            // Forge a non-loopback Host; the transport gate must reject
+            // this BEFORE the shutdown carve-out can grant the request.
+            socket.write(
+              `POST /api/shutdown HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`
+            );
+          });
+        });
+        const firstLine = responseText.split("\r\n", 1)[0] ?? "";
+        expect(firstLine).toMatch(/^HTTP\/1\.1 403/u);
+        expect(responseText).toMatch(/host not allowed/u);
+      } finally {
+        try {
+          await proxy.close();
+        } catch {
+          // ignore — shutdown may have already fired
+        }
+      }
+    });
+  });
+
+  it("A10: /api/shutdown still rejects a request with a foreign Origin header (403)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/shutdown`, {
+          method: "POST",
+          headers: { origin: "https://attacker.example" }
+        });
+        expect(r.status).toBe(403);
+        const body = (await r.json()) as { error: string };
+        expect(body.error).toMatch(/origin/u);
+      } finally {
+        try {
+          await proxy.close();
+        } catch {
+          // ignore
+        }
+      }
+    });
+  });
+
+  it("A11: GET / route catalog is bearer-exempt but still Host-gated (200 without auth)", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        // No Authorization header — would 401 on any auth-gated route,
+        // but `/` is the public route catalog (no secrets) and is
+        // bearer-exempt.
+        const r = await fetch(`http://127.0.0.1:${String(port)}/`);
+        expect(r.status).toBe(200);
+        const body = (await r.json()) as { name: string; routes: string[] };
+        expect(body.name).toBe("zotero-ai-llm-proxy");
+        expect(Array.isArray(body.routes)).toBe(true);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  it("A12: /api/diagnostics REMAINS bearer-gated (401 without auth)", async () => {
+    // The route is bearer-gated because the response leaks codex/claude
+    // binary paths. The plugin sends its bearer explicitly via
+    // wire-proxy-lifecycle.ts:fetchDiagnostics. A local attacker without
+    // the token must get 401.
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/diagnostics`);
+        expect(r.status).toBe(401);
+        const okResp = await fetch(`http://127.0.0.1:${String(port)}/api/diagnostics`, {
+          headers: { authorization: `Bearer ${RIGHT_TOKEN}` }
+        });
+        expect(okResp.status).toBe(200);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // F1 + F2 — `readBody` overflow drain settlement (codex review #1/#2).
+  //
+  // After the body-cap fires, the proxy "drains" the rest of the
+  // incoming body BEFORE replying so the client doesn't see ECONNRESET
+  // mid-write. Settlement of the drain promise depends on the client
+  // sending FIN, RST, or another byte:
+  //   F1: a half-open client that pauses without FIN/RST → settle via
+  //       a drain timeout, not by hanging forever.
+  //   F2: a client that destroys the socket without a parser-level
+  //       `error` → settle via the `close` listener.
+  //
+  // Both cases bypass `fetch` (which always sends FIN), so we use a
+  // raw `net.Socket` and hand-craft the HTTP/1.1 request line + an
+  // oversize Content-Length header. The route slot is freed iff the
+  // promise settles; we assert that by issuing a SECOND well-formed
+  // request on a NEW connection and expecting a normal-looking
+  // response. Without F1/F2, the server can still accept TCP
+  // connections (sockets are independent), so the load-bearing
+  // observation is that the FIRST socket closes within a bounded
+  // window.
+  // -------------------------------------------------------------------
+  function withDrainTimeoutEnv<T>(ms: number, fn: () => Promise<T>): Promise<T> {
+    const original = process.env.LLM_PROXY_DRAIN_TIMEOUT_MS;
+    process.env.LLM_PROXY_DRAIN_TIMEOUT_MS = String(ms);
+    return fn().finally(() => {
+      if (original === undefined) delete process.env.LLM_PROXY_DRAIN_TIMEOUT_MS;
+      else process.env.LLM_PROXY_DRAIN_TIMEOUT_MS = original;
+    });
+  }
+
+  it("F1: half-open client that pauses without FIN settles within the drain timeout AND receives the 413 body", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      await withDrainTimeoutEnv(150, async () => {
+        const proxy = createProxyServer(makeStubBackends());
+        const port = await proxy.listen(0);
+        try {
+          const { Socket } = await import("node:net");
+          // The cap is 1 MiB. Send a Content-Length much larger than
+          // the cap, then transmit a small chunk that exceeds the cap
+          // and STOP — never FIN. Without F1, the proxy waits forever.
+          const oversize = 8 * 1024 * 1024;
+          const prelude =
+            `POST /codex/api/chat HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${String(port)}\r\n` +
+            `Authorization: Bearer ${RIGHT_TOKEN}\r\n` +
+            `Content-Type: application/json\r\n` +
+            `Content-Length: ${String(oversize)}\r\n` +
+            `Connection: close\r\n\r\n`;
+          // Push a 2 MiB chunk; that alone exceeds the cap so the
+          // overflow path fires on the very first `data` event after
+          // headers. Then sit on the socket without sending FIN.
+          const overflowChunk = "x".repeat(2 * 1024 * 1024);
+          const start = Date.now();
+          const result = await new Promise<{
+            readonly elapsed: number;
+            readonly closedByServer: boolean;
+            readonly responseText: string;
+          }>((resolve, reject) => {
+            const socket = new Socket();
+            const chunks: Buffer[] = [];
+            let closedByServer = false;
+            socket.on("data", (buf) => {
+              chunks.push(buf);
+            });
+            socket.on("end", () => {
+              closedByServer = true;
+            });
+            socket.on("close", () => {
+              resolve({
+                elapsed: Date.now() - start,
+                closedByServer,
+                responseText: Buffer.concat(chunks).toString("utf8")
+              });
+            });
+            socket.on("error", (err: NodeJS.ErrnoException) => {
+              // ECONNRESET from the server tearing the socket down is
+              // acceptable — it means the drain path settled.
+              if (err.code === "ECONNRESET" || err.code === "EPIPE") {
+                resolve({
+                  elapsed: Date.now() - start,
+                  closedByServer: true,
+                  responseText: Buffer.concat(chunks).toString("utf8")
+                });
+                return;
+              }
+              reject(err);
+            });
+            socket.connect(port, "127.0.0.1", () => {
+              socket.write(prelude);
+              socket.write(overflowChunk);
+              // Crucially: NO FIN. Don't call `socket.end()`.
+            });
+          });
+          // The drain timer fired (150 ms) + a small margin for the
+          // overflow handler bookkeeping. Cap at 3 s so a regression
+          // that hangs forever surfaces as a test-timeout failure.
+          expect(result.elapsed).toBeLessThan(3_000);
+          // The server is the one that closed the socket — the client
+          // never sent FIN. Either `end` from the server side or a
+          // RST-induced `error` proves the route slot freed.
+          expect(result.closedByServer).toBe(true);
+          // The drain-timeout path now writes the 413 BEFORE destroying
+          // the socket so the client observes a structured error
+          // response, not a raw teardown. Tighten the assertion: the
+          // response status line is 413 and the JSON body parses.
+          const responseText = result.responseText;
+          const firstLine = responseText.split("\r\n", 1)[0] ?? "";
+          expect(firstLine).toMatch(/^HTTP\/1\.1 413/u);
+          // Body lives after the headers/body separator. Locate it
+          // robustly: split on the blank line and parse the trailing
+          // JSON payload.
+          const sepIndex = responseText.indexOf("\r\n\r\n");
+          expect(sepIndex).toBeGreaterThan(0);
+          const body = responseText.slice(sepIndex + 4);
+          const parsed = JSON.parse(body) as { error: string };
+          expect(parsed.error).toMatch(/body exceeds/u);
+        } finally {
+          await proxy.close();
+        }
+      });
+    });
+  });
+
+  it("F2: client destroys the socket without a parser error — drain settles via close", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      await withDrainTimeoutEnv(5_000, async () => {
+        const proxy = createProxyServer(makeStubBackends());
+        const port = await proxy.listen(0);
+        try {
+          const { Socket } = await import("node:net");
+          const oversize = 8 * 1024 * 1024;
+          const prelude =
+            `POST /codex/api/chat HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${String(port)}\r\n` +
+            `Authorization: Bearer ${RIGHT_TOKEN}\r\n` +
+            `Content-Type: application/json\r\n` +
+            `Content-Length: ${String(oversize)}\r\n` +
+            `Connection: close\r\n\r\n`;
+          const overflowChunk = "x".repeat(2 * 1024 * 1024);
+          // Settlement signal: a SECOND request on a new connection
+          // must be accepted normally. The first connection is destroyed
+          // mid-flight; without F2's `close` listener the server's
+          // route slot for that first request would leak — but slot
+          // exhaustion is a hard symptom; the directly observable one
+          // is that the destroyed socket's promise must settle before
+          // the drain timeout (5 s here). We bound the wait at 3 s.
+          const start = Date.now();
+          await new Promise<void>((resolve, reject) => {
+            const socket = new Socket();
+            socket.on("error", (err: NodeJS.ErrnoException) => {
+              if (err.code === "ECONNRESET" || err.code === "EPIPE") {
+                resolve();
+                return;
+              }
+              reject(err);
+            });
+            socket.on("close", () => {
+              resolve();
+            });
+            socket.connect(port, "127.0.0.1", () => {
+              socket.write(prelude);
+              socket.write(overflowChunk, () => {
+                // Destroy immediately after the overflow chunk is
+                // queued — no FIN, no graceful close. This is the
+                // class Codex flagged as "close without parser error".
+                socket.destroy();
+              });
+            });
+          });
+          const elapsed = Date.now() - start;
+          // Settlement must be near-instant via the close listener;
+          // certainly well under the 5 s drain timeout configured above.
+          expect(elapsed).toBeLessThan(3_000);
+          // Server is still responsive on a fresh connection.
+          const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`, {
+            headers: { authorization: `Bearer ${RIGHT_TOKEN}` }
+          });
+          expect(r.status).toBe(200);
+        } finally {
+          await proxy.close();
+        }
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // F4 — happy-path under-cap abortive disconnect (HIGH-4 follow-up).
+  //
+  // The body-cap-overflow branch installs its own `close` listener to
+  // settle the drain promise when a client destroys the socket without
+  // a parser-level `error`. The happy-path (under-cap) branch used to
+  // have only `data` / `end` / `error` listeners — a half-open client
+  // that destroyed mid-stream below the cap would leave the promise
+  // pending forever. The fix adds a defensive `close` listener that
+  // rejects with "request closed before body finished" so the route
+  // slot frees. This test exercises that path.
+  // -------------------------------------------------------------------
+  it("F4: client destroys the socket mid-body BELOW the cap — settles without hanging", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const { Socket } = await import("node:net");
+        // Send a small Content-Length and a partial body that is BELOW
+        // the cap; then destroy the socket without FIN. Without the
+        // outer `close` listener the server would wait forever for
+        // `end` that never arrives.
+        const partial = "x".repeat(64);
+        const fullLen = 1024; // Promise the server many more bytes than we send.
+        const prelude =
+          `POST /codex/api/chat HTTP/1.1\r\n` +
+          `Host: 127.0.0.1:${String(port)}\r\n` +
+          `Authorization: Bearer ${RIGHT_TOKEN}\r\n` +
+          `Content-Type: application/json\r\n` +
+          `Content-Length: ${String(fullLen)}\r\n` +
+          `Connection: close\r\n\r\n`;
+        const start = Date.now();
+        await new Promise<void>((resolve, reject) => {
+          const socket = new Socket();
+          socket.on("error", (err: NodeJS.ErrnoException) => {
+            if (err.code === "ECONNRESET" || err.code === "EPIPE") {
+              resolve();
+              return;
+            }
+            reject(err);
+          });
+          socket.on("close", () => {
+            resolve();
+          });
+          socket.connect(port, "127.0.0.1", () => {
+            socket.write(prelude);
+            socket.write(partial, () => {
+              // Destroy mid-stream — well under cap, no FIN.
+              socket.destroy();
+            });
+          });
+        });
+        const elapsed = Date.now() - start;
+        // The close listener fires synchronously when the socket is
+        // destroyed; settlement is near-instant. Cap at 3 s to catch a
+        // regression that hangs.
+        expect(elapsed).toBeLessThan(3_000);
+        // Server is still responsive on a fresh connection — the
+        // route slot freed, no resource leak.
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`, {
+          headers: { authorization: `Bearer ${RIGHT_TOKEN}` }
+        });
+        expect(r.status).toBe(200);
+      } finally {
+        await proxy.close();
+      }
+    });
   });
 });

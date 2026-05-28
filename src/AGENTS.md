@@ -16,7 +16,7 @@ src/
   bootstrap.ts           # Plugin entrypoint; wires runtime, proxy lifecycle, onboarding
   project-info.ts        # Plugin name/version metadata baked into the bundle
   conversation/
-    conversation-store.ts            # Per-selection popup conversation
+    conversation-store.ts            # Per-selection popup conversation; `attachCitationLookup(id, messageIndex, lookup)` mutator keys citation tables per assistant message so two reader windows never share a mutable lookup
     library-conversation-store.ts    # Singleton library-chat conversation
     conversation-types.ts
   indexing/
@@ -34,7 +34,7 @@ src/
     citation-open.ts           # Resolves a library-chat citation click to Zotero.Reader.open
     e2e-driver.ts              # In-process driver used by the e2e suite
     proxy-lifecycle.ts         # Headless lifecycle controller for the llm-proxy child
-    wire-proxy-lifecycle.ts    # Wires Subprocess + settings prefs + Node-binary auto-detect
+    wire-proxy-lifecycle.ts    # Wires Subprocess + settings prefs + Node-binary auto-detect; mints a per-spawn `crypto.randomUUID()` auth token, threads it into the child via `LLM_PROXY_AUTH_TOKEN`, exposes a `getProxyAuthToken()` accessor, and threads the bearer into `diagnosticsFetch`
     reader-dom-adapter.ts, reader-integration.ts, zotero-env.ts, token-dump.ts
   preferences/
     provider-profile.ts          # ChatProvider + EmbedProvider + per-provider API keys
@@ -45,8 +45,9 @@ src/
     onboarding-state.ts          # First-run dialog pref
   providers/
     provider-registry.ts, provider-types.ts, stream-events.ts
+    rag-augmented-provider.ts    # Wraps a chat provider with retrieval; fires `onRetrieved` for per-conversation citation lookups
     adapters/
-      ollama.ts                  # Chat (NDJSON) + embed against Ollama / proxy
+      ollama.ts                  # Chat (NDJSON) + embed against Ollama / proxy; accepts an optional `getProxyAuthHeader(baseUrl)` dep that conditionally adds `Authorization: Bearer <token>` when the request targets the bundled proxy prefix
       openai-chat.ts             # SSE chat-completions against OpenAI
       openai-embed.ts            # OpenAI embeddings + dim cross-check
       claude-api.ts              # Direct Anthropic /v1/messages with SSE parser
@@ -60,11 +61,12 @@ src/
     popup-controller.ts
     sidebar-view.ts, sidebar-controller.ts
     library-chat-view.ts         # NotebookLM-style "Ask your library" dialog
-    citation-lookup.ts           # Parses [itemKey#chunkIndex] tokens; per-turn lookup table
+    citation-lookup.ts           # Parses [itemKey#chunkIndex] tokens; per-turn lookup table; `resolveCitation` handles full-key hits and bare-key fallback; exports the shared `emitTextWithCitations` + `renderCitationAnchor` helpers used by popup, sidebar, and library-chat surfaces (citation regex is constructed per-call so a shared `lastIndex` cannot leak across surfaces)
+    citation-click.ts            # Shared delegated click handler (`attachCitationClickHandler`) for popup, sidebar, and library-chat citation anchors
     index-controls-view.ts       # Settings dialog's Library Index controls
     settings-view.ts             # Preset dropdown + provider selectors + proxy controls
     onboarding-view.ts           # First-run onboarding state machine
-    markdown.ts                  # XSS-safe streaming markdown renderer
+    markdown.ts                  # XSS-safe streaming markdown renderer; `renderMarkdownWithCitations` swaps in clickable citation anchors when a lookup is provided
     styles.ts                    # Shared style constants + MARKDOWN_CSS for popup + sidebar
     privacy-label.ts
 ```

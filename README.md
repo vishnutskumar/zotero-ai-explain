@@ -66,8 +66,9 @@ windows asking questions about two different PDFs never cross-contaminate.
 
 ### Citation jump-to-page
 
-Library-chat citations are chunk-scoped. Each chunk knows its source PDF page, so clicking a
-citation opens (or navigates an already-open reader to) the exact cited page via
+Citations are chunk-scoped and clickable from every chat surface — the library-chat dialog, the
+reader popup, and the sidebar. Each chunk knows its source PDF page, so clicking a citation opens
+(or navigates an already-open reader to) the exact cited page via
 `Zotero.Reader.open(attachmentId, { pageIndex })`. Two citations from different pages of the same
 paper navigate the same reader tab rather than spawning duplicates. A hallucinated or legacy
 citation token falls back gracefully — it opens the item at page 1 or renders inert, never silently
@@ -93,7 +94,13 @@ sidecar marker, and concurrent readers always see a fully-populated file.
 A small Node HTTP service ships inside the XPI. It speaks the Ollama wire protocol on the front side
 and routes each request to the **Codex CLI**, the **Claude Code CLI**, or a real **Ollama** daemon.
 The plugin auto-spawns it from the settings dialog. This lets you plug a ChatGPT or Claude
-subscription into the plugin without ever pasting an API key.
+subscription into the plugin without ever pasting an API key. The proxy binds to `127.0.0.1` only,
+authenticates plugin requests with a per-spawn bearer token (`crypto.randomUUID()` threaded into the
+child via `LLM_PROXY_AUTH_TOKEN`), rejects requests from foreign Hosts or Origins (blocks browser
+DNS-rebinding), and caps request bodies at 1 MiB. It also spawns each CLI in an isolated environment
+so the user's developer config (`~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md`, custom skills, MCP
+sidecars, slash commands) does not bleed into Zotero responses — see
+[`scripts/llm-proxy/README.md#subprocess-isolation`](scripts/llm-proxy/README.md#subprocess-isolation).
 
 ### Keyboard shortcuts
 
@@ -110,7 +117,24 @@ Zotero **8.0 – 9.99.99** (the plugin manifest's `strict_min_version` / `strict
 
 ## Install
 
-The plugin is installed as an XPI built from this repository:
+### Download the latest release (recommended)
+
+1. Open <https://github.com/vishnutskumar/zotero-ai-explain/releases/latest>.
+2. Download the `zotero-ai-explain-v<version>.xpi` asset.
+3. In Zotero: **Tools → Plugins → gear menu → Install Plugin From File…** and pick the `.xpi`.
+4. Restart Zotero if prompted.
+
+Future versions arrive automatically for Zotero installs with automatic-update enabled — the plugin
+manifest's `update_url` points at
+`https://github.com/vishnutskumar/zotero-ai-explain/releases/latest/download/updates.json`.
+
+If you intend to use the Codex or Claude backends, you also need **Node.js ≥ 22** installed on the
+machine — the bundled proxy runs under your system Node (see [Configuration](#configuration)).
+
+### Build from source (contributors / unreleased changes)
+
+If you want to install the latest unreleased changes or you are developing against the plugin, build
+the XPI from this repository:
 
 ```bash
 npm install
@@ -118,11 +142,16 @@ npm run build      # esbuild → addon/content/zotero-ai-explain.js
 npm run package    # zip addon/ + bundled llm-proxy/ → zotero-ai-explain.xpi
 ```
 
-Then in Zotero: **Tools → Plugins → gear menu → Install Plugin From File…** and pick
-`zotero-ai-explain.xpi`. Restart Zotero if prompted.
+Then install the freshly built `zotero-ai-explain.xpi` via the same **Tools → Plugins → gear menu →
+Install Plugin From File…** flow.
 
-If you intend to use the Codex or Claude backends, you also need **Node.js ≥ 22** installed on the
-machine — the bundled proxy runs under your system Node (see [Configuration](#configuration)).
+Dev branches advance the manifest version to the next clean semver ahead of the latest GitHub
+release (e.g. `0.4.0` while the latest release is `v0.3.0`). `npm run package` runs without
+arguments and reads that version verbatim, producing `dist/zotero-ai-explain-v0.4.0.xpi` plus the
+`zotero-ai-explain.xpi` latest-alias. Because the dev manifest is strictly newer than the latest
+release, Zotero's auto-updater leaves locally-installed dev XPIs alone across restarts. Bumping the
+manifest happens in a stand-alone "version bump" commit that lands on the feature branch (see
+[Releasing](#releasing)).
 
 ## Configuration
 
@@ -162,9 +191,11 @@ resolves the key at request time.
 For the **Codex via Proxy**, **Claude via Proxy**, and **Anthropic Direct** presets, the bundled LLM
 proxy must be running. Click **Start** in the settings dialog's _Local LLM Proxy_ section and the
 plugin spawns it for you via Mozilla's `Subprocess.sys.mjs`. It auto-detects a Node binary
-(`/opt/homebrew/bin/node` first to match Apple Silicon, then `which node`, then a fallback list); if
-auto-detection fails the dialog reveals a **Node binary path** field. The child is sent SIGTERM
-(with a 3 s grace before SIGKILL) on plugin shutdown.
+(`/opt/homebrew/bin/node` first to match Apple Silicon, then `which node`, then a fallback list that
+covers Linux apt/snap/linuxbrew, the Windows Program Files MSI, and common version managers — volta,
+asdf, fnm, n, mise, nodenv, and a directory scan of `~/.nvm/versions/node` for POSIX nvm plus
+`%APPDATA%\nvm` for NVM-Windows); if auto-detection fails the dialog reveals a **Node binary path**
+field. The child is sent SIGTERM (with a 3 s grace before SIGKILL) on plugin shutdown.
 
 For the **Local Ollama** preset you instead need `ollama serve` running on `http://localhost:11434`.
 
@@ -280,6 +311,30 @@ as a release gate rather than a fast per-PR gate.
 
 Use [`docs/manual-verification/zotero.md`](docs/manual-verification/zotero.md) for the human
 acceptance pass after building and packaging the `addon/` directory.
+
+## Releasing
+
+Feature branches carry a manifest version that is one clean semver ahead of the latest GitHub
+release (e.g. `0.4.0` while the latest tagged release is `v0.3.0`), so Zotero's auto-updater treats
+locally-installed XPIs as strictly newer than the latest release and leaves them alone. To cut a
+release:
+
+1. Confirm `addon/manifest.json` and `package.json` already declare the intended release version
+   (they should — the version bump landed in a stand-alone commit on the feature branch). The
+   `version-guards` test enforces that the pair stays in sync.
+2. Open the release-prep pull request against `main` (or reuse the merged feature branch's landing
+   commit if the version is already on `main`).
+3. Merge the release-prep PR to `main`, then wait for all required checks (`CI`, `Zotero E2E`,
+   `E2E Cross-Platform`) to report green on the merge commit. The release workflow itself re-gates
+   on these three checks against the tagged SHA and aborts after 60 minutes if any is missing or
+   red, so tagging before `main` is green wastes a release-workflow run.
+4. Tag the green `main` commit and push: `git tag v<MAJOR>.<MINOR>.<PATCH> && git push --tags`.
+5. The release workflow's `v[0-9]+.[0-9]+.[0-9]+` tag filter accepts only clean semver.
+   `validateReleaseVersions` then asserts that the tag, `package.json`, and `addon/manifest.json`
+   all agree.
+6. After the release, open a follow-up PR that bumps both files to the next clean semver one minor
+   (or patch) ahead of the just-tagged release, so the next feature branch's dev manifest stays
+   strictly newer than the new latest release.
 
 ## Project layout
 

@@ -27,7 +27,11 @@ const MERGE_CONFLICT_PATTERN = /^(<{7}|={7}|>{7})/m;
 // meaningful without false-positiving on prose.
 const LOCAL_PATH_PATTERNS = [
   /(?:file:\/\/)?\/Users\/[^\s)'"}>]+/u,
-  /(?:file:\/\/)?\/home\/[^\s)'"}>]+/u
+  // Allow the canonical Linuxbrew system install location under
+  // `/home/linuxbrew/.linuxbrew` — it's the same path on every
+  // Linuxbrew install, not per-user. Other home-prefixed paths still
+  // get flagged since they leak the developer's username.
+  /(?:file:\/\/)?\/home\/(?!linuxbrew\/)[^\s)'"}>]+/u
 ];
 const TMP_PATH_PATTERNS = [
   /(?:file:\/\/)?\/private\/(?:tmp|var)\/[^\s)'"}>]+/u,

@@ -4,6 +4,7 @@ import {
   buildUpdateManifest,
   formatCompatibilitySummary,
   parseReleaseVersion,
+  readProjectVersions,
   validateReleaseVersions
 } from "../../scripts/release-version.mjs";
 
@@ -16,6 +17,26 @@ describe("parseReleaseVersion", () => {
   it("rejects partial or prerelease tags", () => {
     expect(() => parseReleaseVersion("v1.2")).toThrow("Release tag must be");
     expect(() => parseReleaseVersion("v1.2.3-beta.1")).toThrow("Release tag must be");
+  });
+
+  it("rejects dev-suffixed tags (release artifacts must be clean semver)", () => {
+    // The strict regex is the guarantee that release tags + release
+    // artifacts never carry a `-dev` suffix. Local-development builds
+    // route around this through `package-xpi.mjs`'s local-build branch,
+    // never through `parseReleaseVersion`.
+    expect(() => parseReleaseVersion("v0.4.0-dev")).toThrow("Release tag must be");
+    expect(() => parseReleaseVersion("0.4.0-dev")).toThrow("Release tag must be");
+  });
+});
+
+describe("readProjectVersions", () => {
+  it("returns matching manifest + package versions from disk", () => {
+    const versions = readProjectVersions();
+    expect(typeof versions.packageVersion).toBe("string");
+    expect(typeof versions.manifestVersion).toBe("string");
+    expect(versions.packageVersion).toBe(versions.manifestVersion);
+    // Either dev-suffixed (feature branch) or clean semver (release prep).
+    expect(versions.manifestVersion).toMatch(/^\d+\.\d+\.\d+(?:-dev)?$/u);
   });
 });
 

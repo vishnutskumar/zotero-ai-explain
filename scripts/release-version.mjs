@@ -2,6 +2,16 @@ import { readFileSync } from "node:fs";
 
 export const releaseDownloadBaseUrl =
   "https://github.com/vishnutskumar/zotero-ai-explain/releases/download";
+// Strict by design: release artifacts must be clean semver. Dev branches
+// advance the manifest version to the NEXT clean semver (e.g. "0.4.0"
+// while the latest release is "0.3.0") so Zotero's auto-updater treats
+// locally-installed XPIs as strictly newer than the latest GitHub
+// release without needing a prerelease suffix. The local-build path in
+// `scripts/package-xpi.mjs` exists for CI workflows that aren't on a
+// release tag (PR builds, feature-branch matrix). Prerelease suffixes
+// like `-dev` MUST NOT flow through here; future contributors may not
+// loosen the regex. Release tags also go through
+// `.github/workflows/release.yml`'s `v[0-9]+.[0-9]+.[0-9]+` filter.
 export const semverPattern = /^(?:v)?(?<version>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$/u;
 
 export function parseReleaseVersion(tag) {

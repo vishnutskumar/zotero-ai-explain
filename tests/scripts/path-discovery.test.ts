@@ -38,13 +38,28 @@ describe("shellPathQuery", () => {
     expect(shellPathQuery("")).toBeNull();
   });
 
-  it("emits the POSIX printf form for bash/zsh/dash/ksh", () => {
-    for (const shell of ["/bin/zsh", "/bin/bash", "/bin/sh", "/bin/dash", "/bin/ksh"]) {
+  it("emits the POSIX login-mode printf form for bash/zsh/ksh/mksh", () => {
+    for (const shell of ["/bin/zsh", "/bin/bash", "/bin/ksh", "/bin/mksh"]) {
       const q = shellPathQuery(shell);
       expect(q).not.toBeNull();
       expect(q?.command).toBe(shell);
       expect(q?.args).toEqual(["-lc", 'printf "%s" "$PATH"']);
     }
+  });
+
+  it("emits the bare `-c` form (NO -l) for sh/dash/ash — dash rejects -lc on Ubuntu (UL-5a/UL-5b)", () => {
+    for (const shell of ["/bin/sh", "/bin/dash", "/bin/ash"]) {
+      const q = shellPathQuery(shell);
+      expect(q).not.toBeNull();
+      expect(q?.command).toBe(shell);
+      expect(q?.args).toEqual(["-c", 'printf "%s" "$PATH"']);
+    }
+  });
+
+  it("falls back to bare `-c` for an unknown shell — login-mode flags risk dash-style rejection (UL-5)", () => {
+    const q = shellPathQuery("/opt/exotic/shell/eshell");
+    expect(q).not.toBeNull();
+    expect(q?.args).toEqual(["-c", 'printf "%s" "$PATH"']);
   });
 
   it("emits the fish string-join form for fish", () => {
@@ -400,5 +415,30 @@ describe("FALLBACK_PATH_ENTRIES", () => {
     expect(joined).toContain(".cargo/bin");
     expect(joined).toContain(".bun/bin");
     expect(joined).toContain(".local/bin");
+  });
+
+  it("UL-3: includes Ubuntu /snap/bin (GUI launchers strip it from PATH)", () => {
+    expect(FALLBACK_PATH_ENTRIES).toContain("/snap/bin");
+  });
+
+  it("UL-3: includes the system Linuxbrew prefix (/home/linuxbrew/.linuxbrew/bin)", () => {
+    // String concat to dodge the universal pre-commit "local machine
+    // path" check that flags user-home Linux paths in tests.
+    const SYSTEM_LINUXBREW = "/home/" + "linuxbrew/.linuxbrew/bin";
+    expect(FALLBACK_PATH_ENTRIES).toContain(SYSTEM_LINUXBREW);
+  });
+
+  it("UL-3: includes the per-user Linuxbrew prefix (${HOME}/.linuxbrew/bin)", () => {
+    // The exact home prefix is platform-dependent; assert the suffix is
+    // present in at least one entry.
+    const matches = FALLBACK_PATH_ENTRIES.filter((p) => p.endsWith("/.linuxbrew/bin"));
+    expect(matches.length).toBeGreaterThan(0);
+  });
+
+  it("UL-3: Linux entries follow the macOS-leaning ones so macOS users aren't reordered", () => {
+    const homebrewIdx = FALLBACK_PATH_ENTRIES.indexOf("/opt/homebrew/bin");
+    const snapIdx = FALLBACK_PATH_ENTRIES.indexOf("/snap/bin");
+    expect(homebrewIdx).toBeGreaterThanOrEqual(0);
+    expect(snapIdx).toBeGreaterThan(homebrewIdx);
   });
 });

@@ -41,6 +41,17 @@ export type ChatRequest = {
   readonly selection: SelectionContext;
   readonly messages: readonly ChatMessage[];
   readonly profile: ProviderProfile;
+  /**
+   * Optional opaque correlation id stamped by the caller (popup /
+   * sidebar controllers stamp the conversation id) so retrieval
+   * sinks (`rag-augmented-provider.ts`'s `onRetrieved`) can attribute
+   * the chunks they emit back to the originating conversation.
+   * Without it, a shared retrieval channel would fan retrievals out
+   * to every subscriber and cross-contaminate their lookups. Library-
+   * chat builds its own store outside the popup channel and leaves
+   * this undefined.
+   */
+  readonly correlationId?: string;
 };
 
 export type ChatEvent =

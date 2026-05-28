@@ -37,7 +37,8 @@ export function createPopupController(deps: {
         {
           selection: conversation.selection,
           messages: conversation.messages,
-          profile: conversation.profile
+          profile: conversation.profile,
+          correlationId: conversationId
         },
         abortController.signal
       )) {
@@ -89,7 +90,8 @@ export function createPopupController(deps: {
         {
           selection: conversation.selection,
           messages: deps.store.get(conversationId)?.messages ?? conversation.messages,
-          profile: conversation.profile
+          profile: conversation.profile,
+          correlationId: conversationId
         },
         abortController.signal
       )) {

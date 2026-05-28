@@ -236,9 +236,19 @@ export async function probeOllamaForOnboarding(input: {
   readonly embeddingModel: string;
   readonly fetch: (
     url: string,
-    init?: { readonly signal?: AbortSignal }
+    init?: { readonly signal?: AbortSignal; readonly headers?: Record<string, string> }
   ) => Promise<{ readonly ok: boolean; readonly status: number; json(): Promise<unknown> }>;
   readonly timeoutMs?: number;
+  /**
+   * Optional accessor for the bundled-proxy bearer header. A user who
+   * picked the Codex / Claude Proxy preset has `baseUrl` pointing at
+   * `http://localhost:11400/codex` (the preset writes baseUrl ===
+   * chatBaseUrl). The proxy enforces bearer auth on `/api/tags`, so
+   * without this the probe always returned `ollama-missing` for proxy
+   * users on first run. The closure self-gates: real-Ollama-daemon
+   * URLs get no header.
+   */
+  readonly getProxyAuthHeader?: (baseUrl: string) => Record<string, string> | undefined;
 }): Promise<OllamaProbeResult> {
   const timeoutMs = input.timeoutMs ?? 1500;
   let url: string;
@@ -253,7 +263,12 @@ export async function probeOllamaForOnboarding(input: {
   }, timeoutMs);
   let payload: unknown;
   try {
-    const response = await input.fetch(url, { signal: controller.signal });
+    const proxyAuth = input.getProxyAuthHeader?.(input.baseUrl);
+    const fetchInit: { signal: AbortSignal; headers?: Record<string, string> } = {
+      signal: controller.signal,
+      ...(proxyAuth !== undefined ? { headers: proxyAuth } : {})
+    };
+    const response = await input.fetch(url, fetchInit);
     if (!response.ok)
       return { state: "ollama-missing", reason: `status ${String(response.status)}` };
     payload = await response.json();

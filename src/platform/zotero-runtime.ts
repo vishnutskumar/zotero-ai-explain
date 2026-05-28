@@ -35,8 +35,11 @@ import {
   wireLibraryChatView,
   type CitationClick
 } from "../ui/library-chat-view.js";
+import { attachCitationClickHandler } from "../ui/citation-click.js";
 import { buildCitationLookup } from "../ui/citation-lookup.js";
-import { renderMarkdown } from "../ui/markdown.js";
+import { renderMarkdown, renderMarkdownWithCitations } from "../ui/markdown.js";
+import type { RetrievedChunk } from "../indexing/index-search.js";
+import { openCitationInReader, type CitationReaderZotero } from "./citation-open.js";
 import type { PopupController } from "../ui/popup-controller.js";
 import { discoverModels, type DiscoveryFetch } from "../preferences/model-discovery.js";
 import {
@@ -164,6 +167,88 @@ export type LibraryChatDeps = {
   readonly openItem: (citation: CitationClick) => void;
 };
 
+/**
+ * Per-startup pub/sub channel for the RAG-augmented popup/sidebar
+ * provider's `onRetrieved` callback. Bootstrap constructs an instance
+ * and wires it into BOTH the rag provider deps (publisher side) and the
+ * runtime deps (subscriber side). The runtime's `startExplain` /
+ * `startAskQuestion` subscribe ONCE per conversation, snapshot the most
+ * recent chunks into a per-conversation `CitationLookup`, and feed that
+ * lookup into the popup/sidebar render path so `[itemKey#chunkIndex]`
+ * tokens linkify to live clickable anchors.
+ *
+ * Single shared publisher + per-conversation subscribers is correct
+ * because the popup/sidebar serve a single conversation per active
+ * stream — when the user starts a new explain the old subscriber is
+ * still attached, but it's filtering by conversation-creation order
+ * (the last subscriber to attach wins for the next published event).
+ * Concurrent explain requests are not supported today (one popup at a
+ * time); when they are, this channel will need request-ID dispatch.
+ *
+ * FOLLOW-UP (P5 quality H1 / MEDIUM-4): the channel exists only to
+ * bridge the bootstrap-runtime indirection — the rag provider is built
+ * in bootstrap and consumed by the runtime. A cleaner shape would move
+ * the per-message lookup into `ConversationStore` (mirroring
+ * `LibraryConversationStore.attachCitationLookup`) so the rag provider
+ * can mutate the store directly and the channel disappears. Deferred —
+ * the present implementation is correct for the one-popup-at-a-time
+ * UI and tearing it down properly (see Fix 1 in this patch) closes
+ * the only concrete bug it shipped with.
+ */
+/**
+ * Payload published on the retrieval channel. `conversationId` is
+ * stamped by `rag-augmented-provider.ts`'s `onRetrieved` sink from
+ * the originating `ChatRequest.correlationId` — popup/sidebar
+ * controllers fill it in with the conversation id. Subscribers ignore
+ * publishes whose `conversationId` does not match their own,
+ * eliminating the cross-conversation contamination that the old
+ * single-global subscriber set leaked.
+ */
+export type PopupRetrievalEvent = {
+  readonly conversationId?: string;
+  readonly chunks: readonly RetrievedChunk[];
+};
+
+export type PopupRetrievalChannel = {
+  /** Publish a retrieval event for the most recent popup/sidebar
+   * request. Called by bootstrap's wiring to the rag provider's
+   * `onRetrieved`. Subscribers filter by `conversationId`. */
+  publish(event: PopupRetrievalEvent): void;
+  /** Subscribe to retrieval publications. The returned function
+   * detaches the subscriber. Subscribers are invoked synchronously
+   * inside `publish`, matching the rag provider's "must complete
+   * synchronously" contract. */
+  subscribe(handler: (event: PopupRetrievalEvent) => void): Unsubscribe;
+};
+
+/**
+ * Construct a fresh `PopupRetrievalChannel`. The channel keeps a small
+ * subscriber set and synchronously fans out each published event.
+ * Exported so bootstrap (production) and tests can both build one
+ * without depending on the runtime construction.
+ */
+export function createPopupRetrievalChannel(): PopupRetrievalChannel {
+  const subscribers = new Set<(event: PopupRetrievalEvent) => void>();
+  return {
+    publish(event) {
+      for (const handler of subscribers) {
+        try {
+          handler(event);
+        } catch {
+          // A subscriber throw must not poison the publish loop or break
+          // the rag provider's streaming contract. Swallow defensively.
+        }
+      }
+    },
+    subscribe(handler) {
+      subscribers.add(handler);
+      return () => {
+        subscribers.delete(handler);
+      };
+    }
+  };
+}
+
 /** Number of top-ranked chunks to include as context in the prompt. */
 const LIBRARY_CHAT_TOP_K = 8;
 
@@ -257,6 +342,27 @@ export function createZoteroRuntime(deps: {
    * the keyboard path so they don't need to stub the Zotero global.
    */
   readonly zotero?: ZoteroGlobal;
+  /**
+   * Optional retrieval channel that the popup + sidebar conversations
+   * subscribe to so they can linkify `[itemKey#chunkIndex]` citations
+   * against the same retrieval that the rag-augmented provider used.
+   * Bootstrap pairs this with `onRetrieved:` on `createRagAugmentedProvider`.
+   * Omitted in tests that don't exercise the citation rendering path —
+   * the popup then falls back to legacy `renderMarkdown` (citations
+   * render as literal `[ABCD1234]` text without anchors).
+   */
+  readonly popupRetrievalChannel?: PopupRetrievalChannel;
+  /**
+   * Optional accessor for the bundled-proxy bearer header. When the
+   * URL the runtime is about to hit targets the local LLM proxy, the
+   * closure returns an `Authorization: Bearer <token>` header; for
+   * every other URL it returns undefined. Two runtime call sites must
+   * apply it or the proxy returns 401:
+   *   - `probeOneUrl` (Save-button URL validation via `/api/tags`).
+   *   - `discoverModels` (live model dropdown in the settings dialog).
+   * Omitted in tests / hosts that don't wire the proxy lifecycle.
+   */
+  readonly getProxyAuthHeader?: (baseUrl: string) => Record<string, string> | undefined;
 }): ZoteroRuntime {
   const cleanup: Unsubscribe[] = [];
   // Mutable cache so the next "open settings" click reflects the values
@@ -380,6 +486,15 @@ export function createZoteroRuntime(deps: {
    * the explain and ask-question flows — both render the first assistant
    * turn into the body, follow-up turns into the turns container, and
    * manage the loading + error affordances identically.
+   *
+   * Citation rendering: each assistant turn reads its OWN lookup table
+   * from `updated.citationLookups.get(messageIndex)` (F3). When the
+   * entry is absent (no retrieval ran for that specific turn) the text
+   * renders through plain `renderMarkdown` — citation tokens land as
+   * literal `[itemKey]` text. When present the text routes through
+   * `renderMarkdownWithCitations` so chunk-scoped tokens linkify to
+   * clickable `<a data-item-key>` anchors. Either path is XSS-safe — no
+   * `innerHTML` interpolation.
    */
   function renderPopupConversation(
     updated: Conversation,
@@ -392,6 +507,7 @@ export function createZoteroRuntime(deps: {
     }
   ): void {
     const firstAssistant = firstAssistantMessage(updated);
+    const firstAssistantIndex = updated.messages.findIndex((m) => m.role === "assistant");
     const followTurns = followUpTurns(updated);
     // Loading indicator visibility: shown whenever the stream is running
     // AND the currently-streaming turn has not yet produced text.
@@ -418,16 +534,36 @@ export function createZoteroRuntime(deps: {
         refs.errorMessageEl.textContent = "";
       }
     }
-    // The error block owns the failure UX — keep the body free of an
+    // F3: per-assistant-turn render. Each message reads its own lookup
+    // from `updated.citationLookups`, keyed by the message's index. The
+    // error block owns the failure UX — keep the body free of an
     // "Error:" prefix so a retry leaves a clean tree behind.
+    const renderTextForIndex = (host: HTMLElement, text: string, messageIndex: number): void => {
+      const lookup = updated.citationLookups.get(messageIndex);
+      if (lookup !== undefined) {
+        renderMarkdownWithCitations(host, text, { lookup });
+      } else {
+        renderMarkdown(host, text);
+      }
+    };
     if (firstAssistant !== undefined && firstAssistant.content.length > 0) {
-      renderMarkdown(refs.body, firstAssistant.content);
+      renderTextForIndex(refs.body, firstAssistant.content, firstAssistantIndex);
     } else {
-      renderMarkdown(refs.body, "");
+      // Empty body: route through renderTextForIndex anyway so the
+      // per-turn-lookup gate symmetry is preserved. Today the empty
+      // string has no citation tokens, so the lookup is a no-op; if
+      // the rendering pipeline ever changes (e.g. placeholder text
+      // with embedded citations) this branch stays consistent with
+      // the populated path.
+      renderTextForIndex(refs.body, "", firstAssistantIndex);
     }
     const turnsContainer = refs.turnsContainer;
     if (turnsContainer !== null) {
-      const fragments = followTurns.map((message) => {
+      const fragments = followTurns.map((message, offset) => {
+        // followTurns starts at firstAssistantIndex + 1; the offset
+        // within followTurns plus that base recovers the message's
+        // index in the full `messages` array, which is the F3 lookup key.
+        const messageIndex = firstAssistantIndex + 1 + offset;
         const article = turnsContainer.ownerDocument.createElement("article");
         article.className = `zotero-ai-explain-popup__turn`;
         article.dataset.role = message.role;
@@ -440,7 +576,10 @@ export function createZoteroRuntime(deps: {
         attribution.textContent = `${message.role}: `;
         const turnBody = turnsContainer.ownerDocument.createElement("div");
         turnBody.className = "zotero-ai-explain-popup__turn-body";
-        renderMarkdown(turnBody, message.content);
+        // Assistant follow-ups can also carry citations; user turns
+        // render through the same path (their text contains no citations
+        // and falls through both renderers unchanged).
+        renderTextForIndex(turnBody, message.content, messageIndex);
         article.append(attribution, turnBody);
         return article;
       });
@@ -448,9 +587,59 @@ export function createZoteroRuntime(deps: {
     }
   }
 
+  /**
+   * Dispatch a citation click through `openCitationInReader`. Used as
+   * the callback supplied to `attachCitationClickHandler` at the popup
+   * and sidebar DOM roots. The chrome Zotero global is read off the
+   * runtime deps so the same routing the library-chat dialog uses
+   * carries through; tests that omit `deps.zotero` see the dispatch
+   * resolve to a no-op rather than throwing.
+   */
+  function dispatchPopupCitation(citation: CitationClick): void {
+    const zoteroForCitation = deps.zotero as unknown as CitationReaderZotero | undefined;
+    if (zoteroForCitation !== undefined) {
+      openCitationInReader(citation, zoteroForCitation);
+    }
+  }
+
   function startExplain(rawSelection: SelectionContext): void {
     const selection = withReaderScope(rawSelection);
     const conversation = deps.store.createFromSelection(selection, deps.profile());
+    // F3: each retrieval pins its lookup to the SPECIFIC assistant turn
+    // that will consume it, so a follow-up retrieval cannot leak its
+    // chunks into the prior turn's anchors. The retrieval callback
+    // fires inside `rag-augmented-provider.ts` BEFORE the streaming
+    // delta lands, so the assistant message may not yet exist at
+    // subscription time — we compute the index the next
+    // `appendAssistantDelta` will land at.
+    const retrievalUnsubscribe = deps.popupRetrievalChannel?.subscribe((event) => {
+      // HIGH-1: cross-conversation isolation. The channel is a single
+      // global publisher; without a correlation-id filter, conversation
+      // A's retrieval would also land in conversation B's lookups when
+      // both have an active subscriber. Publishes that don't carry a
+      // matching `conversationId` are ignored. A publish with no id
+      // (legacy / library-chat path) also doesn't match — drop those
+      // here too.
+      if (event.conversationId !== conversation.id) return;
+      const conv = deps.store.get(conversation.id);
+      if (conv === null) return;
+      // MED-5+#6: only pin when the conversation is in a state where
+      // the next message will be an assistant turn — i.e. the latest
+      // message is the user's question. Anything else is a race we
+      // shouldn't pin against:
+      //   - empty messages: no user turn yet
+      //   - last === "system": a system message just landed; the user
+      //     message comes next (would have pinned to the user's slot)
+      //   - last === "assistant" (in-flight stream): we'd overwrite the
+      //     streaming turn's lookup mid-delta — exactly the race
+      //     observed when a follow-up retrieval fires before the prior
+      //     delta finished
+      const lastIdx = conv.messages.length - 1;
+      const last = conv.messages[lastIdx];
+      if (last?.role !== "user") return;
+      const idx = lastIdx + 1;
+      deps.store.attachCitationLookup(conversation.id, idx, buildCitationLookup(event.chunks));
+    });
     // AC-2: seed the PDF-identity prompt frame as a leading system
     // message so the model sees the document title + page reference +
     // Zotero keys alongside the quote. Skipped when the selection has no
@@ -477,15 +666,35 @@ export function createZoteroRuntime(deps: {
 
     let popupUnmount: Unsubscribe | null = null;
     let popupUnsubscribe: Unsubscribe | null = null;
+    let detachPopupCitationClicks: (() => void) | null = null;
     let sidebarUnmount: Unsubscribe | null = null;
     let sidebarUnsubscribe: Unsubscribe | null = null;
+    let detachSidebarCitationClicks: (() => void) | null = null;
     let sidebarMessages: HTMLOListElement | null = null;
+    // Single owner for the channel subscription. Tear down once at the
+    // first of: popup dismissal (when no sidebar was ever mounted),
+    // sidebar dismissal (after the popup→sidebar transition), or runtime
+    // shutdown. Nulling the local on first teardown makes the helper
+    // idempotent so a later teardown call is a no-op.
+    let teardownRetrieval: (() => void) | null = () => {
+      retrievalUnsubscribe?.();
+    };
+    const tearDownRetrieval = (): void => {
+      const fn = teardownRetrieval;
+      teardownRetrieval = null;
+      fn?.();
+    };
 
     const cleanupExplain = (): void => {
       popupUnsubscribe?.();
+      detachPopupCitationClicks?.();
+      detachPopupCitationClicks = null;
       popupUnmount?.();
       sidebarUnsubscribe?.();
+      detachSidebarCitationClicks?.();
+      detachSidebarCitationClicks = null;
       sidebarUnmount?.();
+      tearDownRetrieval();
     };
 
     const dismissPopup = (): void => {
@@ -519,12 +728,19 @@ export function createZoteroRuntime(deps: {
 
       sidebarUnmount = deps.ui.mountSidebar(view, {
         onDismiss: () => {
-          // The close button dismisses the wrapper; tear down the store
-          // subscription so we don't leak listeners on a removed DOM tree.
+          // The close button dismisses the wrapper; tear down EVERY
+          // subscription that this conversation owned. After the
+          // popup→sidebar transition the sidebar is the sole owner of
+          // the retrieval channel subscription, so we tear that down
+          // here too — `tearDownRetrieval` is idempotent if the popup
+          // dismissal path already ran it.
           sidebarUnsubscribe?.();
           sidebarUnsubscribe = null;
+          detachSidebarCitationClicks?.();
+          detachSidebarCitationClicks = null;
           sidebarUnmount = null; // adapter already removed the element
           sidebarMessages = null;
+          tearDownRetrieval();
         }
       });
       sidebarUnsubscribe = deps.store.subscribe(conversation.id, (updated) => {
@@ -535,9 +751,16 @@ export function createZoteroRuntime(deps: {
         // Skip system messages — see `renderMessage` in sidebar-view.ts.
         // The CSS bubble layout keys off `.__turn[data-role]`, so the row
         // classes here must stay in sync with the initial render.
+        //
+        // F3: each visible row reads its OWN lookup by the message's
+        // ORIGINAL index in `updated.messages`. The filtered render
+        // omits system messages, but the lookup is keyed against the
+        // unfiltered index — we track that separately so a system
+        // message in the middle doesn't shift later turns' keys.
         const rows = updated.messages
-          .filter((message) => message.role !== "system")
-          .map((message) => {
+          .map((message, originalIndex) => ({ message, originalIndex }))
+          .filter(({ message }) => message.role !== "system")
+          .map(({ message, originalIndex }) => {
             const row = list.ownerDocument.createElement("li");
             row.className = "zotero-ai-explain-sidebar__turn";
             row.dataset.role = message.role;
@@ -546,20 +769,43 @@ export function createZoteroRuntime(deps: {
             attribution.textContent = `${message.role}: `;
             const body = list.ownerDocument.createElement("div");
             body.className = "zotero-ai-explain-sidebar__body";
-            renderMarkdown(body, message.content);
+            // Sidebar gets the same citation linkification as the popup:
+            // when retrieval ran for THIS turn, citations are clickable;
+            // otherwise they're literal text.
+            const lookup = updated.citationLookups.get(originalIndex);
+            if (lookup !== undefined) {
+              renderMarkdownWithCitations(body, message.content, { lookup });
+            } else {
+              renderMarkdown(body, message.content);
+            }
             row.append(attribution, body);
             return row;
           });
         list.replaceChildren(...rows);
       });
+      // Delegated citation-click handler on the sidebar view root, same
+      // pattern as the popup. Re-attached per remount because the view
+      // element itself is new each time. The teardown reference lives
+      // in `detachSidebarCitationClicks` so `cleanupExplain` / the
+      // sidebar's `onDismiss` can unwind the listener symmetrically.
+      detachSidebarCitationClicks = attachCitationClickHandler(view, dispatchPopupCitation);
     };
 
     const continueButton = popup.querySelector<HTMLButtonElement>(
       '[data-action="continue-sidebar"]'
     );
     continueButton?.addEventListener("click", () => {
+      // Tear down popup-specific state but keep `teardownRetrieval`
+      // ALIVE — ownership of the retrieval subscription transfers to
+      // the sidebar, which calls `tearDownRetrieval` from its
+      // `onDismiss`. Without the click-handler detach here the popup
+      // root (about to be removed by the adapter) would briefly keep a
+      // listener attached; the explicit `detach` is symmetric with the
+      // popup's `onDismiss` teardown path.
       popupUnsubscribe?.();
       popupUnsubscribe = null;
+      detachPopupCitationClicks?.();
+      detachPopupCitationClicks = null;
       popupUnmount?.();
       popupUnmount = null;
       deps.popupController.continueInSidebar(conversation.id);
@@ -608,14 +854,25 @@ export function createZoteroRuntime(deps: {
       }
     });
 
+    // Delegated click handler — listens on the popup root so render
+    // passes that replace the body subtree don't unbind. Shared
+    // `attachCitationClickHandler` helper keeps the delegation shape
+    // single-sourced with `library-chat-view.ts` and the sidebar wiring.
+    detachPopupCitationClicks = attachCitationClickHandler(popup, dispatchPopupCitation);
     popupUnmount = deps.ui.mountPopup(popup, {
       anchor: selection.anchor,
       onDismiss: () => {
         // AC2: when the user dismisses (Escape, backdrop, close button),
         // tear down the subscription so we don't leak listeners.
+        // `tearDownRetrieval` is idempotent — when the user instead
+        // clicked "Continue in sidebar" the sidebar's `onDismiss` is
+        // the owner; this path runs only on direct popup dismissal.
         popupUnsubscribe?.();
         popupUnsubscribe = null;
         popupUnmount = null;
+        detachPopupCitationClicks?.();
+        detachPopupCitationClicks = null;
+        tearDownRetrieval();
       }
     });
     popupUnsubscribe = deps.store.subscribe(conversation.id, (updated) => {
@@ -657,6 +914,21 @@ export function createZoteroRuntime(deps: {
   function startAskQuestion(rawSelection: SelectionContext): void {
     const selection = withReaderScope(rawSelection);
     const conversation = deps.store.createFromSelection(selection, deps.profile());
+    // F3: per-assistant-message lookup, same pattern as startExplain.
+    // HIGH-1: filter by conversation id so publishes from other
+    // conversations don't contaminate this one's lookups (see the
+    // matching block above in startExplain for the rationale).
+    // MED-5+#6: pin only when last message is the user's question.
+    const retrievalUnsubscribe = deps.popupRetrievalChannel?.subscribe((event) => {
+      if (event.conversationId !== conversation.id) return;
+      const conv = deps.store.get(conversation.id);
+      if (conv === null) return;
+      const lastIdx = conv.messages.length - 1;
+      const last = conv.messages[lastIdx];
+      if (last?.role !== "user") return;
+      const idx = lastIdx + 1;
+      deps.store.attachCitationLookup(conversation.id, idx, buildCitationLookup(event.chunks));
+    });
     // Seed the sticky-quote system frame. It is `messages[0]` for the
     // conversation's lifetime, so it rides every provider request.
     deps.store.appendSystemMessage(conversation.id, quoteSystemFrame(selection.quote));
@@ -685,10 +957,27 @@ export function createZoteroRuntime(deps: {
 
     let popupUnmount: Unsubscribe | null = null;
     let popupUnsubscribe: Unsubscribe | null = null;
+    let detachPopupCitationClicks: (() => void) | null = null;
+    // Idempotent teardown for the retrieval subscription. Ask-question
+    // has no "Continue in sidebar" affordance today, so the popup is
+    // the sole owner — but mirror the explain helper anyway so a future
+    // change that adds sidebar transitions doesn't reintroduce the
+    // popup-correctness P5 efficiency leak.
+    let teardownAskRetrieval: (() => void) | null = () => {
+      retrievalUnsubscribe?.();
+    };
+    const tearDownAskRetrieval = (): void => {
+      const fn = teardownAskRetrieval;
+      teardownAskRetrieval = null;
+      fn?.();
+    };
 
     const cleanupAsk = (): void => {
       popupUnsubscribe?.();
+      detachPopupCitationClicks?.();
+      detachPopupCitationClicks = null;
       popupUnmount?.();
+      tearDownAskRetrieval();
     };
 
     // The first submitted question is framed with the quote; later turns
@@ -728,12 +1017,16 @@ export function createZoteroRuntime(deps: {
       }
     });
 
+    detachPopupCitationClicks = attachCitationClickHandler(popup, dispatchPopupCitation);
     popupUnmount = deps.ui.mountPopup(popup, {
       anchor: selection.anchor,
       onDismiss: () => {
         popupUnsubscribe?.();
         popupUnsubscribe = null;
         popupUnmount = null;
+        detachPopupCitationClicks?.();
+        detachPopupCitationClicks = null;
+        tearDownAskRetrieval();
       }
     });
     popupUnsubscribe = deps.store.subscribe(conversation.id, (updated) => {
@@ -995,6 +1288,7 @@ export function createZoteroRuntime(deps: {
     | { ok: false; field: "url" | "transport"; message: string }
   > {
     let url: URL;
+    let trimmedBase: string;
     try {
       // Preserve the path prefix of rawBaseUrl (e.g., `/codex` for the proxy
       // route) by appending `/api/tags` instead of using it as an absolute
@@ -1003,7 +1297,7 @@ export function createZoteroRuntime(deps: {
       // returns the wrong model list (the Ollama passthrough), letting
       // invalid combinations like URL=/codex + model=gemma slip past
       // validation.
-      const trimmedBase = rawBaseUrl.replace(/\/+$/u, "");
+      trimmedBase = rawBaseUrl.replace(/\/+$/u, "");
       url = new URL(`${trimmedBase}/api/tags`);
     } catch {
       return { ok: false, field: "url", message: "Not a valid URL." };
@@ -1013,7 +1307,17 @@ export function createZoteroRuntime(deps: {
       controller.abort();
     }, SETTINGS_VALIDATION_TIMEOUT_MS);
     try {
-      const response = await fetcher(url.toString(), { signal: controller.signal });
+      // Apply the bundled-proxy bearer when the URL targets the local
+      // proxy. The closure self-gates on hostname/port; for a real-
+      // Ollama-daemon URL it returns undefined and no Authorization is
+      // sent. Without this, clicking Save with a Codex/Claude Proxy URL
+      // surfaced "Server responded 401 for /api/tags".
+      const proxyAuth = deps.getProxyAuthHeader?.(trimmedBase);
+      const init: { signal: AbortSignal; headers?: Record<string, string> } = {
+        signal: controller.signal,
+        ...(proxyAuth !== undefined ? { headers: proxyAuth } : {})
+      };
+      const response = await fetcher(url.toString(), init);
       if (!response.ok) {
         return {
           ok: false,
@@ -1080,7 +1384,14 @@ export function createZoteroRuntime(deps: {
                   backend: ctx.backend,
                   url: ctx.url,
                   apiKey: ctx.apiKey,
-                  fetch: discoveryFetch
+                  fetch: discoveryFetch,
+                  // Thread the bundled-proxy bearer so listing models
+                  // against the proxy doesn't 401. The closure self-
+                  // gates on hostname/port; non-proxy URLs get no
+                  // Authorization header and behave unchanged.
+                  ...(deps.getProxyAuthHeader !== undefined
+                    ? { getProxyAuthHeader: deps.getProxyAuthHeader }
+                    : {})
                 })
             }
           }

@@ -1,6 +1,6 @@
 {
   "name": "zotero-ai-explain",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Zotero plugin for selected-text AI explanations and sidebar follow-up chat.",
   "type": "module",

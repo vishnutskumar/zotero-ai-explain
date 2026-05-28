@@ -36,7 +36,8 @@ export function createSidebarController(deps: {
           {
             selection: conversation.selection,
             messages: deps.store.get(conversationId)?.messages ?? conversation.messages,
-            profile: conversation.profile
+            profile: conversation.profile,
+            correlationId: conversationId
           },
           new AbortController().signal
         )) {

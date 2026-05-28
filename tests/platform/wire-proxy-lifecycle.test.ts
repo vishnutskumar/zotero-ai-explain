@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { SubprocessHandle, SubprocessLike } from "../../src/platform/proxy-lifecycle.js";
 import {
   DEFAULT_PROXY_PORT,
+  LLM_PROXY_AUTH_TOKEN_ENV,
   NODE_BINARY_CANDIDATES,
   PROXY_AUTOSTART_PREF,
   PROXY_CONFIG_READ_CONSENT_PREF,
@@ -481,10 +482,12 @@ describe("wireProxyLifecycle exit diagnostics (Bug C)", () => {
     await wired.start();
     // Simulate an immediate non-zero exit (e.g., EADDRINUSE).
     ctl.releaseExit(1);
-    // Let the wait()-handler and onStateChange propagate.
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    // Let the wait()-handler and onStateChange propagate. The lifecycle
+    // now awaits its stderr drainer race (Promise.race against a 500ms
+    // setTimeout) before snapshotting + emitting, so we must flush both
+    // a macrotask turn AND the trailing microtask hops.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    for (let i = 0; i < 5; i++) await Promise.resolve();
     const snap = wired.snapshot();
     expect(snap.running).toBe(false);
     expect(snap.lastError).toBeDefined();
@@ -551,12 +554,478 @@ describe("wireProxyLifecycle exit diagnostics (Bug C)", () => {
     });
     await wired.start();
     ctl.releaseExit(1);
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    // Lifecycle awaits its stderr drainer race before emitting the exit;
+    // flush a macrotask + microtask hops to settle the propagation.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    for (let i = 0; i < 5; i++) await Promise.resolve();
     expect(wired.snapshot().lastError).toBeDefined();
     // Now start again — wiring should clear lastError before the new spawn.
     await wired.start();
     expect(wired.snapshot().lastError).toBeUndefined();
+  });
+});
+
+/**
+ * Proxy-auth wiring (C1-C4): the bearer token MUST land in the spawned
+ * proxy's environment AND be readable via `getProxyAuthToken()` for the
+ * bootstrap-side Ollama adapter closure to attach `Authorization: Bearer
+ * <token>` to its requests. The token rotates per `start()` and clears
+ * on `stop()` so a restart cleanly invalidates the old credential.
+ */
+describe("wireProxyLifecycle proxy-auth wiring", () => {
+  const UUID_V4_SHAPE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+  it("C1: subprocess.call env carries LLM_PROXY_AUTH_TOKEN in UUID v4 shape", async () => {
+    const sub = fakeSubprocess();
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      // Disable auto-start so the only spawn captured is the one we
+      // explicitly trigger from this test (auto-start would race the
+      // explicit start() and double the call count).
+      autoStartOverride: false
+    });
+    await wired.start();
+    expect(sub.calls).toHaveLength(1);
+    const env = sub.calls[0]?.env ?? {};
+    // Asserted via the shared constant so a typo on either side
+    // (parent OR child) surfaces here — see the C5 round-trip test
+    // below for the cross-side guarantee.
+    expect(env).toHaveProperty(LLM_PROXY_AUTH_TOKEN_ENV);
+    expect(env[LLM_PROXY_AUTH_TOKEN_ENV]).toMatch(UUID_V4_SHAPE);
+  });
+
+  it("C2: getProxyAuthToken() returns the same UUID after start()", async () => {
+    const sub = fakeSubprocess();
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      autoStartOverride: false
+    });
+    // Before start, no token is minted — getProxyAuthToken reports null
+    // so the bootstrap closure attaches no Authorization header.
+    expect(wired.getProxyAuthToken()).toBeNull();
+    await wired.start();
+    const fromAccessor = wired.getProxyAuthToken();
+    const fromEnv = sub.calls[0]?.env?.[LLM_PROXY_AUTH_TOKEN_ENV];
+    expect(fromAccessor).not.toBeNull();
+    expect(fromAccessor).toBe(fromEnv);
+  });
+
+  it("C3: getProxyAuthToken() returns null after stop()", async () => {
+    const ctl = controllableSubprocess();
+    const wired = wireProxyLifecycle({
+      subprocess: ctl.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      autoStartOverride: false
+    });
+    await wired.start();
+    expect(wired.getProxyAuthToken()).not.toBeNull();
+    const stopPromise = wired.stop();
+    // Release the wait() promise so doTerminate() can complete its await.
+    ctl.releaseExit(0);
+    await stopPromise;
+    expect(wired.getProxyAuthToken()).toBeNull();
+  });
+
+  it("C4: a second start() after stop() rotates the token (new UUID, not reused)", async () => {
+    const ctl = controllableSubprocess();
+    const wired = wireProxyLifecycle({
+      subprocess: ctl.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      autoStartOverride: false
+    });
+    await wired.start();
+    const tokenA = wired.getProxyAuthToken();
+    expect(tokenA).not.toBeNull();
+    const stopPromise = wired.stop();
+    ctl.releaseExit(0);
+    await stopPromise;
+    await wired.start();
+    const tokenB = wired.getProxyAuthToken();
+    expect(tokenB).not.toBeNull();
+    expect(tokenB).not.toBe(tokenA);
+    // Both spawns saw their own token in env, no carry-over.
+    expect(ctl.calls).toHaveLength(2);
+    expect(ctl.calls[0]?.env?.[LLM_PROXY_AUTH_TOKEN_ENV]).toBe(tokenA);
+    expect(ctl.calls[1]?.env?.[LLM_PROXY_AUTH_TOKEN_ENV]).toBe(tokenB);
+  });
+
+  // -------------------------------------------------------------------
+  // C5 (round-trip): the SHARED `LLM_PROXY_AUTH_TOKEN_ENV` symbol the
+  // plugin imports MUST be the exact literal the proxy child reads from
+  // `process.env`. The constant lives in `scripts/llm-proxy/protocol-
+  // constants.mjs`; both sides (wire-proxy-lifecycle.ts AND the proxy
+  // server.mjs) import it. This test feeds the spawn-environment value
+  // BACK INTO `createProxyServer` via `process.env`, constructs a real
+  // server, and asserts the bearer gate accepts a Bearer header carrying
+  // the wired-side token. If either side drifts (typo on the
+  // wire-proxy-lifecycle import path, typo on the server.mjs read), the
+  // request 401s and this test fails — catching the kind of silent
+  // no-auth-mode downgrade that the canary alone cannot.
+  // -------------------------------------------------------------------
+  it("C5: parent and child use the same env-var symbol — round-trips through createProxyServer", async () => {
+    const sub = fakeSubprocess();
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      autoStartOverride: false
+    });
+    await wired.start();
+    // Read the env the plugin handed to the spawn — under the shared
+    // symbol. A child-side typo on `process.env.LLM_PROXY_AUTH_TOKEN`
+    // would still find the value if the parent kept the matching
+    // literal, but reading via the constant on BOTH sides guarantees
+    // they're locked together.
+    const wiredEnv = sub.calls[0]?.env ?? {};
+    const wiredToken = wiredEnv[LLM_PROXY_AUTH_TOKEN_ENV];
+    expect(wiredToken).toBeDefined();
+    // Construct a real proxy with the same env applied, then drive a
+    // request through it. The proxy reads `process.env[LLM_PROXY_AUTH_
+    // TOKEN_ENV]` at createProxyServer time — same constant.
+    const { createProxyServer } = await import("../../scripts/llm-proxy/server.mjs");
+    // Sanity guard: the value the parent set must equal the literal the
+    // child reads. If a future refactor split the constant into two
+    // copies that drifted, this assertion would fail along with the
+    // bearer round-trip below.
+    expect(LLM_PROXY_AUTH_TOKEN_ENV).toBe("LLM_PROXY_AUTH_TOKEN");
+    const original = process.env.LLM_PROXY_AUTH_TOKEN;
+    process.env.LLM_PROXY_AUTH_TOKEN = wiredToken;
+    try {
+      const proxy = createProxyServer();
+      const port = await proxy.listen(0);
+      try {
+        // Correct token (wired-side) — must be accepted.
+        const okResp = await fetch(`http://127.0.0.1:${String(port)}/api/tags`, {
+          headers: { authorization: `Bearer ${String(wiredToken)}` }
+        });
+        expect(okResp.status).toBe(200);
+        // No token — must be rejected. Confirms the gate is actually on.
+        const noAuthResp = await fetch(`http://127.0.0.1:${String(port)}/api/tags`);
+        expect(noAuthResp.status).toBe(401);
+      } finally {
+        await proxy.close();
+      }
+    } finally {
+      if (original === undefined) delete process.env.LLM_PROXY_AUTH_TOKEN;
+      else process.env.LLM_PROXY_AUTH_TOKEN = original;
+    }
+  });
+
+  // -------------------------------------------------------------------
+  // C6 (diagnostics auth header): after this patch `/api/diagnostics` is
+  // bearer-gated on the proxy side (it leaks codex/claude binary paths).
+  // The plugin's own diagnosticsFetch MUST therefore include the bearer
+  // header it minted at spawn time, or it would 401 against its own
+  // child. Asserted by capturing the init object the fetch was called
+  // with and inspecting the headers.
+  // -------------------------------------------------------------------
+  it("C6: diagnosticsFetch is called with the Authorization header when auth is enabled", async () => {
+    const sub = fakeSubprocess();
+    const diagnosticsCalls: {
+      url: string;
+      init: { headers?: Record<string, string> } | undefined;
+    }[] = [];
+    const diagnosticsFetch = vi.fn((url: string, init?: { headers?: Record<string, string> }) => {
+      diagnosticsCalls.push({ url, init });
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            binaries: {
+              codex: { path: "/usr/bin/codex" },
+              claude: { path: null, searchedCount: 0 }
+            },
+            path: { enrichment: null }
+          })
+      });
+    });
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      diagnosticsFetch,
+      autoStartOverride: false
+    });
+    await wired.start();
+    const token = wired.getProxyAuthToken();
+    expect(token).not.toBeNull();
+    expect(diagnosticsCalls.length).toBeGreaterThanOrEqual(1);
+    const firstCall = diagnosticsCalls[0];
+    expect(firstCall).toBeDefined();
+    expect(firstCall?.url).toMatch(/\/api\/diagnostics$/u);
+    const headers = firstCall?.init?.headers ?? {};
+    expect(headers.Authorization).toBe(`Bearer ${String(token)}`);
+  });
+});
+
+/**
+ * Orphan-takeover (OT-1..OT-4) — when start() detects an externally-
+ * managed listener on the port, the takeover path identifies whether
+ * the orphan is OUR proxy (a child surviving from a prior plugin
+ * generation whose bearer token died with its parent) via the
+ * bearer-exempt `GET /` route. Bearer-gated probes break this because
+ * the orphan rejects the current generation's token.
+ */
+describe("wireProxyLifecycle orphan takeover (cross-generation)", () => {
+  /**
+   * Build a stateful fake `fetch` (the `/api/tags` probe used by
+   * `lifecycle.start()` and by `tryTakeoverOrphan`'s release-poll) that
+   * reports the orphan present until `releasePort()` is called, then
+   * reports the port free thereafter so the takeover poll resolves and
+   * the rebuild spawn succeeds without re-tripping the external probe.
+   */
+  function statefulPortProbe(): {
+    readonly fetch: (
+      input: string,
+      init?: { readonly signal?: AbortSignal }
+    ) => Promise<{
+      readonly ok: boolean;
+      readonly status: number;
+    }>;
+    readonly releasePort: () => void;
+    readonly calls: { url: string }[];
+  } {
+    let occupied = true;
+    const calls: { url: string }[] = [];
+    return {
+      fetch: (input: string) => {
+        calls.push({ url: input });
+        return Promise.resolve(occupied ? { ok: true, status: 200 } : { ok: false, status: 0 });
+      },
+      releasePort: () => {
+        occupied = false;
+      },
+      calls
+    };
+  }
+
+  it("OT-1: takes over a prior-generation orphan via bearer-exempt GET / (never hits /api/diagnostics during ownership detection)", async () => {
+    // The orphan was minted with a DIFFERENT bearer token in a prior
+    // plugin session. /api/diagnostics is bearer-gated; calling it with
+    // the new generation's token returns 401. The fix routes the
+    // ownership probe through `GET /` instead — bearer-exempt — so the
+    // takeover succeeds. This test asserts the new behavior AND that
+    // the deprecated diagnostics-based probe is no longer used.
+    const sub = fakeSubprocess();
+    const port = statefulPortProbe();
+    const diagnosticsCalls: {
+      url: string;
+      init: { headers?: Record<string, string> } | undefined;
+    }[] = [];
+    const diagnosticsFetch = vi.fn(
+      (url: string, init?: { headers?: Record<string, string>; method?: string }) => {
+        diagnosticsCalls.push({ url, init });
+        if (url.endsWith("/")) {
+          // Bearer-exempt — the orphan answers with its identity.
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () =>
+              Promise.resolve({
+                name: "zotero-ai-llm-proxy",
+                routes: ["POST /api/shutdown", "GET /api/tags"]
+              })
+          });
+        }
+        if (url.endsWith("/api/diagnostics")) {
+          // The orphan's bearer token is gone — this would 401 a
+          // cross-generation probe. Resolve as 401 so a regression that
+          // re-introduces the diagnostics-based probe FAILS this test
+          // by leaving isOurs=false and never reaching the shutdown POST.
+          return Promise.resolve({
+            ok: false,
+            status: 401,
+            json: () => Promise.resolve({ error: "unauthorized" })
+          });
+        }
+        if (url.endsWith("/api/shutdown")) {
+          // Orphan accepts the shutdown POST + releases the port.
+          port.releasePort();
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () => Promise.resolve({ exiting: true })
+          });
+        }
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          json: () => Promise.resolve({ error: "not found" })
+        });
+      }
+    );
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      fetch: port.fetch,
+      diagnosticsFetch,
+      autoStartOverride: false
+    });
+    const result = await wired.start();
+    // After takeover, lifecycle rebuilds and spawns a fresh child.
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    expect(result).toMatchObject({ pid: expect.any(Number) });
+    // The ownership probe MUST have hit `/` and MUST NOT have hit
+    // `/api/diagnostics` (the previous bearer-gated route that broke
+    // the cross-generation case). We scope this assertion to the calls
+    // that happened BEFORE the shutdown POST — after takeover succeeds,
+    // the rebuilt own-generation lifecycle is allowed (and expected)
+    // to hit /api/diagnostics with its OWN token to populate the
+    // "Discovered binaries" snapshot.
+    const shutdownIdx = diagnosticsCalls.findIndex((c) => c.url.endsWith("/api/shutdown"));
+    expect(shutdownIdx).toBeGreaterThanOrEqual(0);
+    const beforeShutdown = diagnosticsCalls.slice(0, shutdownIdx);
+    const rootProbe = beforeShutdown.find((c) => c.url.endsWith("/"));
+    expect(rootProbe).toBeDefined();
+    const diagProbeBeforeShutdown = beforeShutdown.find((c) => c.url.endsWith("/api/diagnostics"));
+    expect(diagProbeBeforeShutdown).toBeUndefined();
+    // And the ownership probe MUST NOT have carried the new
+    // generation's Authorization header — the orphan's bearer token
+    // died with its parent, so a bearer-attached probe would 401.
+    expect(rootProbe?.init?.headers ?? {}).not.toHaveProperty("Authorization");
+    // After the takeover the rebuilt lifecycle spawned exactly one child.
+    expect(sub.calls).toHaveLength(1);
+  });
+
+  it("OT-2: leaves a foreign service alone (no /api/shutdown POST) when GET / does not identify as ours", async () => {
+    // A non-zotero service on the port: GET / returns SOME other JSON
+    // (or 404, or non-JSON). The takeover MUST NOT POST /api/shutdown
+    // against it — the foreign service stays alive.
+    const sub = fakeSubprocess();
+    const port = statefulPortProbe();
+    const diagnosticsCalls: { url: string; method: string | undefined }[] = [];
+    const diagnosticsFetch = vi.fn((url: string, init?: { method?: string }) => {
+      diagnosticsCalls.push({ url, method: init?.method });
+      if (url.endsWith("/")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ some: "other-service" })
+        });
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        json: () => Promise.resolve({})
+      });
+    });
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      fetch: port.fetch,
+      diagnosticsFetch,
+      autoStartOverride: false
+    });
+    const result = await wired.start();
+    expect(result).toEqual({ external: true });
+    // We never tried to shut the foreign service down.
+    const shutdownCall = diagnosticsCalls.find((c) => c.url.endsWith("/api/shutdown"));
+    expect(shutdownCall).toBeUndefined();
+    // No new child spawned — port stayed occupied by the foreign service.
+    expect(sub.calls).toHaveLength(0);
+  });
+
+  it("OT-3: defensive parse — `name` matches but `routes` is missing/non-array → not ours, no shutdown", async () => {
+    // Coincidentally-matching JSON shouldn't fool the probe. The
+    // ownership check requires BOTH the exact `name` AND a `routes`
+    // array; a payload with the right name but no routes (or a
+    // non-array routes value) MUST be classified as foreign.
+    const sub = fakeSubprocess();
+    const port = statefulPortProbe();
+    const diagnosticsCalls: { url: string }[] = [];
+    const diagnosticsFetch = vi.fn((url: string) => {
+      diagnosticsCalls.push({ url });
+      if (url.endsWith("/")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          // Name matches but routes is the wrong shape — defensive
+          // parse must reject this.
+          json: () => Promise.resolve({ name: "zotero-ai-llm-proxy", routes: "not-an-array" })
+        });
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        json: () => Promise.resolve({})
+      });
+    });
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      fetch: port.fetch,
+      diagnosticsFetch,
+      autoStartOverride: false
+    });
+    const result = await wired.start();
+    expect(result).toEqual({ external: true });
+    const shutdownCall = diagnosticsCalls.find((c) => c.url.endsWith("/api/shutdown"));
+    expect(shutdownCall).toBeUndefined();
+    expect(sub.calls).toHaveLength(0);
+  });
+
+  it("OT-4: takeover shutdown POST omits the Authorization header (cross-generation requirement)", async () => {
+    // The orphan's bearer token died with its parent process. The
+    // shutdown POST MUST go without any Authorization header so the
+    // proxy's bearer carve-out for /api/shutdown accepts it. Asserting
+    // on the actual init object the fetch was handed.
+    const sub = fakeSubprocess();
+    const port = statefulPortProbe();
+    let shutdownInit: { headers?: Record<string, string>; method?: string } | undefined;
+    const diagnosticsFetch = vi.fn(
+      (url: string, init?: { headers?: Record<string, string>; method?: string }) => {
+        if (url.endsWith("/")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () =>
+              Promise.resolve({
+                name: "zotero-ai-llm-proxy",
+                routes: ["POST /api/shutdown"]
+              })
+          });
+        }
+        if (url.endsWith("/api/shutdown")) {
+          shutdownInit = init;
+          port.releasePort();
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () => Promise.resolve({ exiting: true })
+          });
+        }
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          json: () => Promise.resolve({})
+        });
+      }
+    );
+    const wired = wireProxyLifecycle({
+      subprocess: sub.subprocess,
+      pathExists: () => false,
+      defaultServerScriptPath: "/abs/server.mjs",
+      fetch: port.fetch,
+      diagnosticsFetch,
+      autoStartOverride: false
+    });
+    await wired.start();
+    expect(shutdownInit).toBeDefined();
+    expect(shutdownInit?.method).toBe("POST");
+    // No Authorization header on the cross-generation shutdown POST.
+    const headers = shutdownInit?.headers ?? {};
+    expect(headers).not.toHaveProperty("Authorization");
+    expect(headers).not.toHaveProperty("authorization");
   });
 });
