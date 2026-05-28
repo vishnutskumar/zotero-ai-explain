@@ -216,6 +216,21 @@ function makeModelField(input: {
   error.setAttribute("style", ERROR_TEXT_STYLE);
   error.hidden = true;
 
+  // Non-fatal discovery warning surface (Ollama version-floor advisory).
+  // `triggerDiscovery` writes `result.warning` into this element's
+  // textContent and toggles `hidden`. Kept separate from the validation
+  // error element so an "old Ollama" hint stays visible alongside a
+  // successful model list and never blocks Save.
+  const warning = document.createElement("p");
+  warning.className = "zotero-ai-field__warning";
+  warning.dataset.warningFor = input.name;
+  warning.setAttribute("role", "status");
+  warning.setAttribute(
+    "style",
+    `margin: 4px 0 0 0; font-size: 11px; color: ${FG_MUTED}; line-height: 1.3; font-style: italic;`
+  );
+  warning.hidden = true;
+
   group.append(label, row, field);
   if (input.hint !== undefined && input.hint.length > 0) {
     const hintEl = document.createElement("p");
@@ -227,7 +242,7 @@ function makeModelField(input: {
     );
     group.append(hintEl);
   }
-  group.append(error);
+  group.append(warning, error);
   return group;
 }
 
@@ -1565,11 +1580,14 @@ export function wireSettingsView(input: {
     const ctx = discoveryContextFor(target);
     if (ctx === null) return;
     paintPicker(target, { kind: "loading" });
+    // Clear any stale warning from a prior probe before the new probe lands.
+    setDiscoveryWarning(target, undefined);
     void (async () => {
       try {
         const result = await discovery.discover(ctx);
         if (result.ok) {
           paintPicker(target, { kind: "models", models: result.models });
+          setDiscoveryWarning(target, result.warning);
         } else {
           paintPicker(target, { kind: "error", message: result.message });
         }
@@ -1578,6 +1596,28 @@ export function wireSettingsView(input: {
         paintPicker(target, { kind: "error", message });
       }
     })();
+  }
+
+  /**
+   * Toggle the per-field warning element. Called from the discovery
+   * pipeline with `result.warning` so the user sees a version-floor
+   * advisory (e.g. "Ollama 0.6.6 is older than 0.10.0…") near the
+   * model picker without blocking Save. Passing `undefined` clears any
+   * stale message.
+   */
+  function setDiscoveryWarning(
+    target: "chatModel" | "embeddingModel",
+    message: string | undefined
+  ): void {
+    const el = root.querySelector<HTMLParagraphElement>(`[data-warning-for="${target}"]`);
+    if (el === null) return;
+    if (message === undefined || message.length === 0) {
+      el.hidden = true;
+      el.textContent = "";
+      return;
+    }
+    el.textContent = message;
+    el.hidden = false;
   }
 
   function scheduleDiscovery(target: "chatModel" | "embeddingModel"): void {

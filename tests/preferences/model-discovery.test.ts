@@ -15,17 +15,40 @@ function jsonResponse(payload: unknown, status = 200) {
   });
 }
 
+/**
+ * Build a routing fetcher: returns `tagsPayload` for /api/tags and
+ * `versionPayload` for /api/version. Lets each test compose the two
+ * probes the Ollama discovery path now makes (model list + version
+ * floor) without re-implementing the routing in every block.
+ */
+function routingFetcher(
+  tagsPayload: { payload: unknown; status?: number },
+  versionPayload: { payload: unknown; status?: number } = {
+    payload: { version: "0.24.0" }
+  }
+) {
+  return vi.fn<DiscoveryFetch>((url: string) => {
+    if (url.endsWith("/api/tags")) {
+      return jsonResponse(tagsPayload.payload, tagsPayload.status ?? 200);
+    }
+    if (url.endsWith("/api/version")) {
+      return jsonResponse(versionPayload.payload, versionPayload.status ?? 200);
+    }
+    return jsonResponse({}, 404);
+  });
+}
+
 describe("discoverModels — Ollama", () => {
-  it("calls GET ${url}/api/tags and returns deduped + sorted model names", async () => {
-    const fetcher = vi.fn<DiscoveryFetch>(() =>
-      jsonResponse({
+  it("calls GET ${url}/api/tags then /api/version and returns deduped + sorted model names", async () => {
+    const fetcher = routingFetcher({
+      payload: {
         models: [
           { name: "gemma4:e4b" },
           { name: "embeddinggemma" },
           { name: "gemma4:e4b" } // duplicate
         ]
-      })
-    );
+      }
+    });
     const result = await discoverModels({
       backend: "ollama",
       url: "http://localhost:11434/",
@@ -34,8 +57,47 @@ describe("discoverModels — Ollama", () => {
     });
     if (!result.ok) throw new Error(`expected ok, got ${result.message}`);
     expect(result.models).toEqual(["embeddinggemma", "gemma4:e4b"]);
-    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(2);
     expect(fetcher.mock.calls[0]?.[0]).toBe("http://localhost:11434/api/tags");
+    expect(fetcher.mock.calls[1]?.[0]).toBe("http://localhost:11434/api/version");
+    // Version probe returned 0.24.0 (≥ MIN_OLLAMA_VERSION) → no warning.
+    expect(result.warning).toBeUndefined();
+  });
+
+  it("surfaces a warning when /api/version reports a daemon older than MIN_OLLAMA_VERSION", async () => {
+    const fetcher = routingFetcher(
+      { payload: { models: [{ name: "embeddinggemma" }] } },
+      { payload: { version: "0.6.6" } }
+    );
+    const result = await discoverModels({
+      backend: "ollama",
+      url: "http://localhost:11434",
+      fetch: fetcher,
+      timeoutMs: 0
+    });
+    if (!result.ok) throw new Error(`expected ok, got ${result.message}`);
+    expect(result.models).toEqual(["embeddinggemma"]);
+    expect(result.warning).toBeDefined();
+    expect(result.warning).toMatch(/0\.6\.6/u);
+    expect(result.warning).toMatch(/Upgrade Ollama/u);
+  });
+
+  it("returns the model list with no warning when the version probe errors (best-effort)", async () => {
+    const fetcher = routingFetcher(
+      { payload: { models: [{ name: "embeddinggemma" }] } },
+      { payload: {}, status: 500 }
+    );
+    const result = await discoverModels({
+      backend: "ollama",
+      url: "http://localhost:11434",
+      fetch: fetcher,
+      timeoutMs: 0
+    });
+    if (!result.ok) throw new Error(`expected ok, got ${result.message}`);
+    expect(result.models).toEqual(["embeddinggemma"]);
+    // 500 on /api/version → kind: "unreachable" — not surfaced as a UI warning
+    // because the model-list probe already succeeded (i.e. the daemon IS up).
+    expect(result.warning).toBeUndefined();
   });
 
   it("returns an error when the response is non-2xx", async () => {

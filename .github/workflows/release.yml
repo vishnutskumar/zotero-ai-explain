@@ -19,6 +19,32 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
+      - name: Verify tag is on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # GitHub's compare API reports the tagged commit's relationship
+          # to main HEAD. We accept the tag iff it is reachable from main
+          # (identical to main HEAD, or main is ahead of it). Tags created
+          # off a feature branch — even a green one — fail this gate so
+          # releases only ever ship code that landed in main.
+          status="$(gh api "repos/${REPO}/compare/main...${SHA}" --jq '.status')"
+          case "$status" in
+            identical|behind)
+              echo "Tag ${TAG} (${SHA:0:7}) is reachable from main (status: $status)"
+              ;;
+            ahead|diverged|*)
+              echo "::error::Tag ${TAG} points at ${SHA:0:7} which is NOT reachable from main (status: $status)."
+              echo "::error::Release tags must be created from commits that landed on main."
+              echo "::error::Merge the change into main first, then tag main."
+              exit 1
+              ;;
+          esac
+
       - name: Wait for required CI checks
         env:
           GH_TOKEN: ${{ github.token }}
@@ -89,7 +115,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v5
         with:
-          node-version: "22"
+          node-version: "22.22.3"
           cache: npm
 
       - name: Install dependencies

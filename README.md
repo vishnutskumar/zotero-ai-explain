@@ -115,6 +115,25 @@ Zotero **8.0 – 9.99.99** (the plugin manifest's `strict_min_version` / `strict
 
 ![Screenshot-style preview of the Zotero reader popup and sidebar](docs/assets/readme-sidebar-screenshot.svg)
 
+## Requirements
+
+The plugin itself only needs Zotero. Each chat/embedding backend has its own host requirement;
+install the ones that match the preset you intend to use.
+
+| Component           | Version            | When you need it                                                                                                                                                                              | How to install                                                                                                                                           |
+| ------------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Zotero**          | 8.0 – 9.x          | Always — host application.                                                                                                                                                                    | <https://www.zotero.org/download/>                                                                                                                       |
+| **Node.js**         | ≥ 22.22.3 (22 LTS) | When using **Codex Proxy** or **Claude Code Proxy** presets — the bundled local proxy runs under your system Node.                                                                            | <https://nodejs.org/> (or nvm / asdf / Homebrew / apt)                                                                                                   |
+| **Ollama**          | ≥ 0.10.0           | When using the **Local Ollama** preset (or any preset that embeds with Ollama). Older versions hit `/api/embed` reliability issues with modern embedding-only models (e.g. `embeddinggemma`). | <https://ollama.com/download> — pull at least one chat model (e.g. `ollama pull gemma3:1b`) and one embedding model (e.g. `ollama pull embeddinggemma`). |
+| **Codex CLI**       | Latest stable      | When using the **Codex Proxy** preset (drives your ChatGPT subscription through the bundled proxy).                                                                                           | `npm install -g @openai/codex` (or per the Codex CLI README); run `codex` once to sign in.                                                               |
+| **Claude Code CLI** | Latest stable      | When using the **Claude Code Proxy** preset (drives your Claude subscription through the bundled proxy).                                                                                      | `npm install -g @anthropic-ai/claude-code` (or per the Claude Code README); run `claude` once to authenticate.                                           |
+| **API key**         | Provider-issued    | When using **OpenAI**, **Anthropic**, or **Gemini** presets directly (no local proxy). The plugin stores secret-references, never plaintext.                                                  | Get a key from your provider's console and paste it into the settings dialog.                                                                            |
+
+CI pins **Node 22.22.3** and **Ollama 0.24.0** as the validated combination. The plugin's runtime
+floor is **Node 22.x LTS** (matches the bundle target) and **Ollama 0.10.0** (matches the
+`MIN_OLLAMA_VERSION` constant in `src/preferences/ollama-version.ts`); the settings dialog surfaces
+a warning when your Ollama daemon reports a version below the floor.
+
 ## Install
 
 ### Download the latest release (recommended)
@@ -123,13 +142,13 @@ Zotero **8.0 – 9.99.99** (the plugin manifest's `strict_min_version` / `strict
 2. Download the `zotero-ai-explain-v<version>.xpi` asset.
 3. In Zotero: **Tools → Plugins → gear menu → Install Plugin From File…** and pick the `.xpi`.
 4. Restart Zotero if prompted.
+5. Install the [Requirements](#requirements) that match the preset you plan to use (Zotero alone is
+   enough for OpenAI / Anthropic / Gemini API-key presets; Local Ollama / Codex Proxy / Claude Code
+   Proxy add their own host runtime).
 
 Future versions arrive automatically for Zotero installs with automatic-update enabled — the plugin
 manifest's `update_url` points at
 `https://github.com/vishnutskumar/zotero-ai-explain/releases/latest/download/updates.json`.
-
-If you intend to use the Codex or Claude backends, you also need **Node.js ≥ 22** installed on the
-machine — the bundled proxy runs under your system Node (see [Configuration](#configuration)).
 
 ### Build from source (contributors / unreleased changes)
 

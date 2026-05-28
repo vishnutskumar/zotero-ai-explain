@@ -40,11 +40,17 @@ concurrency:
 
 env:
   # Pin Ollama for cache stability — the model cache key includes this.
-  # 0.5.13 first added gemma3 family support; 0.6.6 is a stable point
-  # release (no prerelease/draft, published 2025-04-17) used to pull
-  # gemma3:1b on all three OSes. Bumping this value auto-invalidates the
-  # ollama-models-<os>-v<version>-... cache key below.
-  OLLAMA_VERSION: "0.6.6"
+  # 0.23.4 (2026-05-13) sits in the sweet spot: post-embeddinggemma
+  # support (the prior 0.6.6 pin intermittently rejected /api/embed
+  # with "this model does not support embeddings") AND pre-0.24.0's
+  # Metal regression on GitHub's macos-latest Apple Paravirtual GPU
+  # (0.24.0 crashed with `ggml-backend.cpp:844: pre-allocated tensor
+  # ... in a buffer (Metal) that cannot run the operation (NONE)`
+  # against gemma3:1b). Bumping this value auto-invalidates the
+  # ollama-models-<os>-v<version>-... cache key below. Stays above
+  # the plugin's MIN_OLLAMA_VERSION floor (0.10.0) in
+  # src/preferences/ollama-version.ts.
+  OLLAMA_VERSION: "0.23.4"
   # Tiny models keep CI fast and fit comfortably in actions/cache.
   OLLAMA_CHAT_MODEL: "gemma3:1b"
   OLLAMA_EMBED_MODEL: "embeddinggemma"
@@ -75,7 +81,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v5
         with:
-          node-version: "22"
+          node-version: "22.22.3"
           cache: npm
 
       - name: Install Node dependencies
@@ -218,11 +224,14 @@ jobs:
         run: |
           set -euxo pipefail
           # Pin via direct binary download — `install.sh` floats @latest.
-          BIN_URL="https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-amd64.tgz"
-          TGZ="$RUNNER_TEMP/ollama.tgz"
-          curl -fsSL "$BIN_URL" -o "$TGZ"
+          # Ollama 0.7+ ships Linux as zstd-compressed tar (.tar.zst), not
+          # gzip-compressed (.tgz). Ubuntu's tar supports --zstd natively
+          # (zstd binary is preinstalled on actions/runner ubuntu-latest).
+          BIN_URL="https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-amd64.tar.zst"
+          TARBALL="$RUNNER_TEMP/ollama.tar.zst"
+          curl -fsSL "$BIN_URL" -o "$TARBALL"
           sudo mkdir -p /usr/local/ollama
-          sudo tar -xzf "$TGZ" -C /usr/local/ollama
+          sudo tar --zstd -xf "$TARBALL" -C /usr/local/ollama
           sudo ln -sf /usr/local/ollama/bin/ollama /usr/local/bin/ollama
           ollama --version
 
