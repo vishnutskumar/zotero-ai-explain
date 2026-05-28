@@ -318,6 +318,14 @@ export function summarizeBinaryLookup(lookup) {
  */
 export function createProxyServer(deps = {}) {
   const pathEnrichmentSnapshot = deps.pathEnrichment ?? null;
+  // Optional shutdown hook invoked by the POST /api/shutdown handler after
+  // the server has been closed. Production wiring (the direct-entrypoint
+  // path below) supplies `() => setTimeout(() => process.exit(0), 250).unref()`
+  // so a wedged child doesn't hang on a stuck stream. Tests omit it so the
+  // route handler doesn't call process.exit() from inside a Vitest worker —
+  // on Windows that surfaces as "Error: process.exit unexpectedly called
+  // with '0'" when the timer fires after the test has moved on.
+  const shutdownHook = typeof deps.shutdownHook === "function" ? deps.shutdownHook : null;
   // AUTH_TOKEN lives on the closure (not module scope) so two server
   // instances in the same Vitest worker can each pick up their own
   // env-driven token without interfering with each other. Production
@@ -753,10 +761,15 @@ export function createProxyServer(deps = {}) {
             } catch {
               // ignore — server may already be tearing down
             }
-            // unref to let any pending requests finish their already-sent
-            // bytes, but cap with a hard exit so a wedged child doesn't
-            // hang waiting on a stuck stream.
-            setTimeout(() => process.exit(0), 250).unref();
+            // The hard-exit fallback ("wedged child doesn't hang waiting on
+            // a stuck stream") is delegated to the production entrypoint so
+            // tests can spin up a proxy + hit /api/shutdown without the
+            // route handler calling process.exit() from inside a Vitest
+            // worker. The shutdownHook is null in the no-hook path; the
+            // server.close() above is sufficient to free the port.
+            if (shutdownHook !== null) {
+              shutdownHook();
+            }
           });
           return;
         }
@@ -919,7 +932,15 @@ if (isDirect) {
           `zotero-ai-llm-proxy: enriched PATH (${enrichment.source}) with ${enrichment.added.length} entries`
         );
       }
-      const proxy = createProxyServer({ pathEnrichment: enrichment });
+      const proxy = createProxyServer({
+        pathEnrichment: enrichment,
+        // Production-only hard-exit fallback so a wedged child doesn't hang
+        // on a stuck stream after /api/shutdown closes the server. Omitted
+        // by tests — see the shutdownHook docstring on createProxyServer.
+        shutdownHook: () => {
+          setTimeout(() => process.exit(0), 250).unref();
+        }
+      });
       proxy.listen(port).then(
         (actual) => {
           console.log(`zotero-ai-llm-proxy listening on http://127.0.0.1:${String(actual)}`);
