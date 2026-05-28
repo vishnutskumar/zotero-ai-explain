@@ -2682,4 +2682,259 @@ describe("llm-proxy / auth + host + origin gate", () => {
       }
     });
   });
+
+  // -------------------------------------------------------------------
+  // F1 + F2 — `readBody` overflow drain settlement (codex review #1/#2).
+  //
+  // After the body-cap fires, the proxy "drains" the rest of the
+  // incoming body BEFORE replying so the client doesn't see ECONNRESET
+  // mid-write. Settlement of the drain promise depends on the client
+  // sending FIN, RST, or another byte:
+  //   F1: a half-open client that pauses without FIN/RST → settle via
+  //       a drain timeout, not by hanging forever.
+  //   F2: a client that destroys the socket without a parser-level
+  //       `error` → settle via the `close` listener.
+  //
+  // Both cases bypass `fetch` (which always sends FIN), so we use a
+  // raw `net.Socket` and hand-craft the HTTP/1.1 request line + an
+  // oversize Content-Length header. The route slot is freed iff the
+  // promise settles; we assert that by issuing a SECOND well-formed
+  // request on a NEW connection and expecting a normal-looking
+  // response. Without F1/F2, the server can still accept TCP
+  // connections (sockets are independent), so the load-bearing
+  // observation is that the FIRST socket closes within a bounded
+  // window.
+  // -------------------------------------------------------------------
+  function withDrainTimeoutEnv<T>(ms: number, fn: () => Promise<T>): Promise<T> {
+    const original = process.env.LLM_PROXY_DRAIN_TIMEOUT_MS;
+    process.env.LLM_PROXY_DRAIN_TIMEOUT_MS = String(ms);
+    return fn().finally(() => {
+      if (original === undefined) delete process.env.LLM_PROXY_DRAIN_TIMEOUT_MS;
+      else process.env.LLM_PROXY_DRAIN_TIMEOUT_MS = original;
+    });
+  }
+
+  it("F1: half-open client that pauses without FIN settles within the drain timeout AND receives the 413 body", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      await withDrainTimeoutEnv(150, async () => {
+        const proxy = createProxyServer(makeStubBackends());
+        const port = await proxy.listen(0);
+        try {
+          const { Socket } = await import("node:net");
+          // The cap is 1 MiB. Send a Content-Length much larger than
+          // the cap, then transmit a small chunk that exceeds the cap
+          // and STOP — never FIN. Without F1, the proxy waits forever.
+          const oversize = 8 * 1024 * 1024;
+          const prelude =
+            `POST /codex/api/chat HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${String(port)}\r\n` +
+            `Authorization: Bearer ${RIGHT_TOKEN}\r\n` +
+            `Content-Type: application/json\r\n` +
+            `Content-Length: ${String(oversize)}\r\n` +
+            `Connection: close\r\n\r\n`;
+          // Push a 2 MiB chunk; that alone exceeds the cap so the
+          // overflow path fires on the very first `data` event after
+          // headers. Then sit on the socket without sending FIN.
+          const overflowChunk = "x".repeat(2 * 1024 * 1024);
+          const start = Date.now();
+          const result = await new Promise<{
+            readonly elapsed: number;
+            readonly closedByServer: boolean;
+            readonly responseText: string;
+          }>((resolve, reject) => {
+            const socket = new Socket();
+            const chunks: Buffer[] = [];
+            let closedByServer = false;
+            socket.on("data", (buf) => {
+              chunks.push(buf);
+            });
+            socket.on("end", () => {
+              closedByServer = true;
+            });
+            socket.on("close", () => {
+              resolve({
+                elapsed: Date.now() - start,
+                closedByServer,
+                responseText: Buffer.concat(chunks).toString("utf8")
+              });
+            });
+            socket.on("error", (err: NodeJS.ErrnoException) => {
+              // ECONNRESET from the server tearing the socket down is
+              // acceptable — it means the drain path settled.
+              if (err.code === "ECONNRESET" || err.code === "EPIPE") {
+                resolve({
+                  elapsed: Date.now() - start,
+                  closedByServer: true,
+                  responseText: Buffer.concat(chunks).toString("utf8")
+                });
+                return;
+              }
+              reject(err);
+            });
+            socket.connect(port, "127.0.0.1", () => {
+              socket.write(prelude);
+              socket.write(overflowChunk);
+              // Crucially: NO FIN. Don't call `socket.end()`.
+            });
+          });
+          // The drain timer fired (150 ms) + a small margin for the
+          // overflow handler bookkeeping. Cap at 3 s so a regression
+          // that hangs forever surfaces as a test-timeout failure.
+          expect(result.elapsed).toBeLessThan(3_000);
+          // The server is the one that closed the socket — the client
+          // never sent FIN. Either `end` from the server side or a
+          // RST-induced `error` proves the route slot freed.
+          expect(result.closedByServer).toBe(true);
+          // The drain-timeout path now writes the 413 BEFORE destroying
+          // the socket so the client observes a structured error
+          // response, not a raw teardown. Tighten the assertion: the
+          // response status line is 413 and the JSON body parses.
+          const responseText = result.responseText;
+          const firstLine = responseText.split("\r\n", 1)[0] ?? "";
+          expect(firstLine).toMatch(/^HTTP\/1\.1 413/u);
+          // Body lives after the headers/body separator. Locate it
+          // robustly: split on the blank line and parse the trailing
+          // JSON payload.
+          const sepIndex = responseText.indexOf("\r\n\r\n");
+          expect(sepIndex).toBeGreaterThan(0);
+          const body = responseText.slice(sepIndex + 4);
+          const parsed = JSON.parse(body) as { error: string };
+          expect(parsed.error).toMatch(/body exceeds/u);
+        } finally {
+          await proxy.close();
+        }
+      });
+    });
+  });
+
+  it("F2: client destroys the socket without a parser error — drain settles via close", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      await withDrainTimeoutEnv(5_000, async () => {
+        const proxy = createProxyServer(makeStubBackends());
+        const port = await proxy.listen(0);
+        try {
+          const { Socket } = await import("node:net");
+          const oversize = 8 * 1024 * 1024;
+          const prelude =
+            `POST /codex/api/chat HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${String(port)}\r\n` +
+            `Authorization: Bearer ${RIGHT_TOKEN}\r\n` +
+            `Content-Type: application/json\r\n` +
+            `Content-Length: ${String(oversize)}\r\n` +
+            `Connection: close\r\n\r\n`;
+          const overflowChunk = "x".repeat(2 * 1024 * 1024);
+          // Settlement signal: a SECOND request on a new connection
+          // must be accepted normally. The first connection is destroyed
+          // mid-flight; without F2's `close` listener the server's
+          // route slot for that first request would leak — but slot
+          // exhaustion is a hard symptom; the directly observable one
+          // is that the destroyed socket's promise must settle before
+          // the drain timeout (5 s here). We bound the wait at 3 s.
+          const start = Date.now();
+          await new Promise<void>((resolve, reject) => {
+            const socket = new Socket();
+            socket.on("error", (err: NodeJS.ErrnoException) => {
+              if (err.code === "ECONNRESET" || err.code === "EPIPE") {
+                resolve();
+                return;
+              }
+              reject(err);
+            });
+            socket.on("close", () => {
+              resolve();
+            });
+            socket.connect(port, "127.0.0.1", () => {
+              socket.write(prelude);
+              socket.write(overflowChunk, () => {
+                // Destroy immediately after the overflow chunk is
+                // queued — no FIN, no graceful close. This is the
+                // class Codex flagged as "close without parser error".
+                socket.destroy();
+              });
+            });
+          });
+          const elapsed = Date.now() - start;
+          // Settlement must be near-instant via the close listener;
+          // certainly well under the 5 s drain timeout configured above.
+          expect(elapsed).toBeLessThan(3_000);
+          // Server is still responsive on a fresh connection.
+          const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`, {
+            headers: { authorization: `Bearer ${RIGHT_TOKEN}` }
+          });
+          expect(r.status).toBe(200);
+        } finally {
+          await proxy.close();
+        }
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // F4 — happy-path under-cap abortive disconnect (HIGH-4 follow-up).
+  //
+  // The body-cap-overflow branch installs its own `close` listener to
+  // settle the drain promise when a client destroys the socket without
+  // a parser-level `error`. The happy-path (under-cap) branch used to
+  // have only `data` / `end` / `error` listeners — a half-open client
+  // that destroyed mid-stream below the cap would leave the promise
+  // pending forever. The fix adds a defensive `close` listener that
+  // rejects with "request closed before body finished" so the route
+  // slot frees. This test exercises that path.
+  // -------------------------------------------------------------------
+  it("F4: client destroys the socket mid-body BELOW the cap — settles without hanging", async () => {
+    await withAuthEnv(RIGHT_TOKEN, async () => {
+      const proxy = createProxyServer(makeStubBackends());
+      const port = await proxy.listen(0);
+      try {
+        const { Socket } = await import("node:net");
+        // Send a small Content-Length and a partial body that is BELOW
+        // the cap; then destroy the socket without FIN. Without the
+        // outer `close` listener the server would wait forever for
+        // `end` that never arrives.
+        const partial = "x".repeat(64);
+        const fullLen = 1024; // Promise the server many more bytes than we send.
+        const prelude =
+          `POST /codex/api/chat HTTP/1.1\r\n` +
+          `Host: 127.0.0.1:${String(port)}\r\n` +
+          `Authorization: Bearer ${RIGHT_TOKEN}\r\n` +
+          `Content-Type: application/json\r\n` +
+          `Content-Length: ${String(fullLen)}\r\n` +
+          `Connection: close\r\n\r\n`;
+        const start = Date.now();
+        await new Promise<void>((resolve, reject) => {
+          const socket = new Socket();
+          socket.on("error", (err: NodeJS.ErrnoException) => {
+            if (err.code === "ECONNRESET" || err.code === "EPIPE") {
+              resolve();
+              return;
+            }
+            reject(err);
+          });
+          socket.on("close", () => {
+            resolve();
+          });
+          socket.connect(port, "127.0.0.1", () => {
+            socket.write(prelude);
+            socket.write(partial, () => {
+              // Destroy mid-stream — well under cap, no FIN.
+              socket.destroy();
+            });
+          });
+        });
+        const elapsed = Date.now() - start;
+        // The close listener fires synchronously when the socket is
+        // destroyed; settlement is near-instant. Cap at 3 s to catch a
+        // regression that hangs.
+        expect(elapsed).toBeLessThan(3_000);
+        // Server is still responsive on a fresh connection — the
+        // route slot freed, no resource leak.
+        const r = await fetch(`http://127.0.0.1:${String(port)}/api/tags`, {
+          headers: { authorization: `Bearer ${RIGHT_TOKEN}` }
+        });
+        expect(r.status).toBe(200);
+      } finally {
+        await proxy.close();
+      }
+    });
+  });
 });

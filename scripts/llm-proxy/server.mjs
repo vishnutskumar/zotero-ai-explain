@@ -79,56 +79,144 @@ function readEnvInt(name, fallback) {
  */
 const MAX_BODY_BYTES = readEnvInt(LLM_PROXY_MAX_BODY_BYTES_ENV, 1_048_576);
 
+/**
+ * Overflow drain timeout (F1). Default 5 s; override via the
+ * `LLM_PROXY_DRAIN_TIMEOUT_MS` env var. Used by the overflow path in
+ * `readBody` to bound the time the proxy will wait for a half-open
+ * client to send FIN/RST or another byte after the body-cap fires. Set
+ * smaller in tests to keep the suite fast.
+ */
+const DRAIN_TIMEOUT_MS_ENV = "LLM_PROXY_DRAIN_TIMEOUT_MS";
+
 function readBody(req, res) {
   return new Promise((resolve, reject) => {
     let size = 0;
     let aborted = false;
+    let finished = false;
     const chunks = [];
     const handleOverflow = () => {
       if (aborted) return;
       aborted = true;
-      // Drop the listeners so a late `end` / extra `data` chunk
-      // doesn't trigger a double-resolve or another writeHead.
+      // Drop the original listeners so accumulated chunks stop growing
+      // and the resolve/reject path runs at most once.
       req.removeAllListeners("data");
-      req.removeAllListeners("error");
       req.removeAllListeners("end");
-      // Write the 413 directly so the client gets a response without
-      // waiting for the upload to complete. The outer route try/catch
-      // sees the EBODYLIMIT rejection and skips the duplicate write
-      // because the response is already finished.
-      let responseWritten = false;
-      if (res !== undefined && !res.headersSent) {
-        try {
-          const payload = JSON.stringify({ error: `body exceeds ${String(MAX_BODY_BYTES)} bytes` });
-          res.writeHead(413, {
-            "content-type": "application/json",
-            "content-length": Buffer.byteLength(payload),
-            connection: "close"
-          });
-          res.end(payload);
-          responseWritten = true;
-        } catch {
-          // Response writing failed (socket closed?); fall through to
-          // the destroy + reject path so the route handler still
-          // unwinds cleanly.
-        }
-      }
-      // Destroy the request stream so a hostile or runaway client
-      // cannot keep streaming MiBs into a request we've already
-      // answered. We give the response a tick to flush its bytes
-      // BEFORE destroying so the client actually receives the 413.
-      const cleanup = () => {
-        try {
-          req.destroy();
-        } catch {
-          // destroy is best-effort
-        }
-      };
-      if (responseWritten) setImmediate(cleanup);
-      else cleanup();
+      req.removeAllListeners("error");
+      // `close` may have a default listener attached by the HTTP server;
+      // we don't remove all of those here — we only added our own below,
+      // and `cleanup()` removes that one specifically.
       const err = new Error(`body exceeds ${String(MAX_BODY_BYTES)} bytes`);
       err.code = "EBODYLIMIT";
-      reject(err);
+      // Silently drain the remaining body BEFORE responding. The cap on
+      // memory still holds (we discard each chunk), but letting the
+      // client finish its upload eliminates the ECONNRESET race that
+      // tearing the socket down mid-write produces — at the cost of
+      // continuing to read N more bytes off the local-bound socket.
+      // The proxy listens on 127.0.0.1 with bearer auth, so unbounded
+      // local upload is not a real attack surface.
+      const drain = () => {
+        try {
+          if (res !== undefined && !res.headersSent) {
+            const payload = JSON.stringify({
+              error: `body exceeds ${String(MAX_BODY_BYTES)} bytes`
+            });
+            res.writeHead(413, {
+              "content-type": "application/json",
+              "content-length": Buffer.byteLength(payload),
+              connection: "close"
+            });
+            res.end(payload);
+          }
+        } catch {
+          // Response writing failed (socket already closed); fall through.
+        }
+        reject(err);
+      };
+      // F1 + F2: track all four listeners (data, end, error, close) plus
+      // the drain timer so the FIRST settlement (clean `end`, drain
+      // timeout, `error`, or socket `close`) tears down the others. A
+      // half-open client that pauses mid-upload (F1) settles via the
+      // timer; a client that destroys the socket without a parser-level
+      // `error` (F2) settles via the `close` listener. Without this,
+      // the route's `readBody` promise hangs indefinitely and the slot
+      // never frees.
+      let drainTimer = null;
+      let settled = false;
+      const onData = () => {
+        // Discard any further data — already over cap.
+      };
+      const onEnd = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        drain();
+      };
+      const onError = (cause) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        // Preserve the underlying transport error as `cause` so logs
+        // surface what actually went wrong (ECONNRESET, parser error,
+        // etc.) rather than only the generic EBODYLIMIT rejection.
+        if (cause !== undefined) {
+          Object.assign(err, { cause });
+        }
+        reject(err);
+      };
+      const onClose = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        // Skip writing the 413 body here: the socket has already
+        // closed (that is exactly why `close` fired without a prior
+        // `end` or `error`), so any res.write/end would throw. The
+        // route's outer catch swallows the EBODYLIMIT rejection.
+        reject(err);
+      };
+      const onDrainTimeout = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        // The client is half-open: connection alive but no FIN/RST and
+        // no further bytes. We've waited DRAIN_TIMEOUT_MS for it to
+        // make up its mind; write the 413 body BEFORE tearing the
+        // socket down so the wire still carries the structured error
+        // response. Then force-close the socket so the route slot
+        // frees and the client observes a teardown instead of hanging
+        // on our side. Wrapped in try because either step may fail if
+        // the socket is already in an unwritable state.
+        try {
+          drain();
+        } catch {
+          // drain() itself defends with try/catch; this outer guard
+          // covers any future throws the helper might add.
+        }
+        try {
+          if (res !== undefined) {
+            res.socket?.destroy();
+          }
+        } catch {
+          // ignore — best-effort teardown
+        }
+        // drain() already called reject(err); calling again is a no-op
+        // because we hold the `settled` guard above.
+      };
+      const cleanup = () => {
+        req.removeListener("data", onData);
+        req.removeListener("end", onEnd);
+        req.removeListener("error", onError);
+        req.removeListener("close", onClose);
+        if (drainTimer !== null) {
+          clearTimeout(drainTimer);
+          drainTimer = null;
+        }
+      };
+      req.on("data", onData);
+      req.on("end", onEnd);
+      req.on("error", onError);
+      req.on("close", onClose);
+      const drainTimeoutMs = readEnvInt(DRAIN_TIMEOUT_MS_ENV, 5_000);
+      drainTimer = setTimeout(onDrainTimeout, drainTimeoutMs);
     };
     req.on("data", (c) => {
       if (aborted) return;
@@ -140,10 +228,30 @@ function readBody(req, res) {
       chunks.push(c);
     });
     req.on("error", (err) => {
-      if (!aborted) reject(err);
+      if (!aborted && !finished) {
+        finished = true;
+        reject(err);
+      }
     });
     req.on("end", () => {
-      if (!aborted) resolve(Buffer.concat(chunks).toString("utf8"));
+      if (!aborted && !finished) {
+        finished = true;
+        resolve(Buffer.concat(chunks).toString("utf8"));
+      }
+    });
+    // Under-cap abortive disconnect: if the client closes the socket
+    // before sending FIN AND without emitting a parser-level `error`,
+    // neither `end` nor `error` fires and the promise would hang
+    // forever. Defensive `close` listener mirrors the overflow path's
+    // pattern and frees the route slot. The `finished` guard prevents
+    // a spurious reject after a clean `end` (close always fires after
+    // end on a Connection: close response); the `aborted` check skips
+    // this path entirely once the overflow handler has taken over.
+    req.on("close", () => {
+      if (!aborted && !finished) {
+        finished = true;
+        reject(new Error("request closed before body finished"));
+      }
     });
   });
 }
