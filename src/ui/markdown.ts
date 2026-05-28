@@ -20,18 +20,10 @@
  * `<script>` and `<img onerror>` in model output render as literal text.
  */
 
-import { parseCitationToken, resolveCitation, type CitationLookup } from "./citation-lookup.js";
+import { emitTextWithCitations, type CitationLookup } from "./citation-lookup.js";
 import type { CitationClick } from "./library-chat-view.js";
 
 const ALLOWED_URL_SCHEMES = new Set<string>(["http:", "https:", "mailto:"]);
-
-/**
- * Citation token shape: `[ABCD1234]` (legacy) or `[ABCD1234#3]`
- * (chunk-scoped). The item key is exactly 8 uppercase-alphanumeric
- * chars — the shape Zotero assigns. Stays in sync with the regex used
- * by `appendWithCitations` in `library-chat-view.ts`.
- */
-const CITATION_PATTERN = /\[([A-Z0-9]{8})(?:#(\d+))?\]/gu;
 
 type Block =
   | { readonly kind: "heading"; readonly level: 1 | 2 | 3 | 4; readonly text: string }
@@ -244,8 +236,8 @@ type InlineToken =
  *
  * `emitText` is the leaf text-emitter. By default it appends a single
  * text node; `renderMarkdownWithCitations` swaps in a citation-aware
- * variant that splits each text token on `CITATION_PATTERN` and emits
- * `<a data-item-key>` anchors for matched tokens.
+ * variant that splits each text token on the citation pattern and
+ * emits `<a data-item-key>` anchors for matched tokens.
  */
 function renderInline(
   doc: Document,
@@ -470,67 +462,6 @@ export function renderMarkdownWithCitations(
   for (const block of blocks) {
     target.append(renderBlock(doc, block, emitText));
   }
-}
-
-/**
- * Walk `text`, split on `CITATION_PATTERN`, and emit either a text node
- * or a citation anchor for each piece. Exported only via
- * `renderMarkdownWithCitations`; not a public helper.
- */
-function emitTextWithCitations(host: HTMLElement, text: string, lookup: CitationLookup): void {
-  const doc = host.ownerDocument;
-  CITATION_PATTERN.lastIndex = 0;
-  let cursor = 0;
-  let match: RegExpExecArray | null;
-  while ((match = CITATION_PATTERN.exec(text)) !== null) {
-    if (match.index > cursor) {
-      host.append(doc.createTextNode(text.slice(cursor, match.index)));
-    }
-    // Round-trip through the canonical parser so the alphabet /
-    // chunk-index handling stays single-sourced in citation-lookup.ts.
-    const parsed = parseCitationToken(match[0]);
-    const entry = parsed !== null ? resolveCitation(parsed, lookup) : undefined;
-    if (entry === undefined || parsed === null) {
-      // Hallucinated key (or malformed token, which CITATION_PATTERN
-      // never matches but defended against here) — render the original
-      // token verbatim so the user sees what the model emitted.
-      host.append(doc.createTextNode(match[0]));
-    } else {
-      host.append(renderCitationAnchor(doc, parsed.itemKey, match[2], entry));
-    }
-    cursor = match.index + match[0].length;
-  }
-  if (cursor < text.length) {
-    host.append(doc.createTextNode(text.slice(cursor)));
-  }
-}
-
-function renderCitationAnchor(
-  doc: Document,
-  itemKey: string,
-  rawChunkIndex: string | undefined,
-  entry: { readonly attachmentKey?: string; readonly pageIndex?: number }
-): HTMLAnchorElement {
-  const link = doc.createElement("a");
-  link.dataset.itemKey = itemKey;
-  // Stamp the chunk-scoped data attributes only when the renderer
-  // actually had them. A legacy / fallback citation (no chunkIndex in
-  // the token, no per-page entry data) emits just `data-item-key`,
-  // matching `library-chat-view.ts`'s fallback shape.
-  if (rawChunkIndex !== undefined) {
-    link.dataset.chunkIndex = rawChunkIndex;
-  }
-  if (entry.attachmentKey !== undefined) {
-    link.dataset.attachmentKey = entry.attachmentKey;
-  }
-  if (typeof entry.pageIndex === "number") {
-    link.dataset.pageIndex = String(entry.pageIndex);
-  }
-  // `#` keeps the anchor from navigating; the wiring layer's click
-  // handler calls preventDefault and dispatches to `onCitationClick`.
-  link.setAttribute("href", "#");
-  link.textContent = `[${itemKey}${rawChunkIndex !== undefined ? `#${rawChunkIndex}` : ""}]`;
-  return link;
 }
 
 function safeHref(raw: string): string | null {

@@ -11,7 +11,7 @@ src/
   bootstrap.ts           # Plugin entrypoint; wires runtime, proxy lifecycle, onboarding
   project-info.ts        # Plugin name/version metadata baked into the bundle
   conversation/
-    conversation-store.ts            # Per-selection popup conversation
+    conversation-store.ts            # Per-selection popup conversation; `attachCitationLookup(id, messageIndex, lookup)` mutator keys citation tables per assistant message so two reader windows never share a mutable lookup
     library-conversation-store.ts    # Singleton library-chat conversation
     conversation-types.ts
   indexing/
@@ -56,7 +56,7 @@ src/
     popup-controller.ts
     sidebar-view.ts, sidebar-controller.ts
     library-chat-view.ts         # NotebookLM-style "Ask your library" dialog
-    citation-lookup.ts           # Parses [itemKey#chunkIndex] tokens; per-turn lookup table; `resolveCitation` handles full-key hits and bare-key fallback
+    citation-lookup.ts           # Parses [itemKey#chunkIndex] tokens; per-turn lookup table; `resolveCitation` handles full-key hits and bare-key fallback; exports the shared `emitTextWithCitations` + `renderCitationAnchor` helpers used by popup, sidebar, and library-chat surfaces (citation regex is constructed per-call so a shared `lastIndex` cannot leak across surfaces)
     citation-click.ts            # Shared delegated click handler (`attachCitationClickHandler`) for popup, sidebar, and library-chat citation anchors
     index-controls-view.ts       # Settings dialog's Library Index controls
     settings-view.ts             # Preset dropdown + provider selectors + proxy controls

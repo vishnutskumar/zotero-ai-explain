@@ -36,7 +36,7 @@ import {
   type CitationClick
 } from "../ui/library-chat-view.js";
 import { attachCitationClickHandler } from "../ui/citation-click.js";
-import { buildCitationLookup, type CitationLookup } from "../ui/citation-lookup.js";
+import { buildCitationLookup } from "../ui/citation-lookup.js";
 import { renderMarkdown, renderMarkdownWithCitations } from "../ui/markdown.js";
 import type { RetrievedChunk } from "../indexing/index-search.js";
 import { openCitationInReader, type CitationReaderZotero } from "./citation-open.js";
@@ -195,16 +195,30 @@ export type LibraryChatDeps = {
  * UI and tearing it down properly (see Fix 1 in this patch) closes
  * the only concrete bug it shipped with.
  */
+/**
+ * Payload published on the retrieval channel. `conversationId` is
+ * stamped by `rag-augmented-provider.ts`'s `onRetrieved` sink from
+ * the originating `ChatRequest.correlationId` — popup/sidebar
+ * controllers fill it in with the conversation id. Subscribers ignore
+ * publishes whose `conversationId` does not match their own,
+ * eliminating the cross-conversation contamination that the old
+ * single-global subscriber set leaked.
+ */
+export type PopupRetrievalEvent = {
+  readonly conversationId?: string;
+  readonly chunks: readonly RetrievedChunk[];
+};
+
 export type PopupRetrievalChannel = {
-  /** Publish the chunks retrieved for the most recent popup/sidebar
+  /** Publish a retrieval event for the most recent popup/sidebar
    * request. Called by bootstrap's wiring to the rag provider's
-   * `onRetrieved`. Idempotent — the latest call wins. */
-  publish(chunks: readonly RetrievedChunk[]): void;
+   * `onRetrieved`. Subscribers filter by `conversationId`. */
+  publish(event: PopupRetrievalEvent): void;
   /** Subscribe to retrieval publications. The returned function
    * detaches the subscriber. Subscribers are invoked synchronously
    * inside `publish`, matching the rag provider's "must complete
    * synchronously" contract. */
-  subscribe(handler: (chunks: readonly RetrievedChunk[]) => void): Unsubscribe;
+  subscribe(handler: (event: PopupRetrievalEvent) => void): Unsubscribe;
 };
 
 /**
@@ -214,12 +228,12 @@ export type PopupRetrievalChannel = {
  * without depending on the runtime construction.
  */
 export function createPopupRetrievalChannel(): PopupRetrievalChannel {
-  const subscribers = new Set<(chunks: readonly RetrievedChunk[]) => void>();
+  const subscribers = new Set<(event: PopupRetrievalEvent) => void>();
   return {
-    publish(chunks) {
+    publish(event) {
       for (const handler of subscribers) {
         try {
-          handler(chunks);
+          handler(event);
         } catch {
           // A subscriber throw must not poison the publish loop or break
           // the rag provider's streaming contract. Swallow defensively.
@@ -473,13 +487,13 @@ export function createZoteroRuntime(deps: {
    * turn into the body, follow-up turns into the turns container, and
    * manage the loading + error affordances identically.
    *
-   * `citationLookup` (optional) is the per-conversation lookup table
-   * built from the RAG retrieval. When present, citations in assistant
-   * text linkify to clickable `<a data-item-key>` anchors via
-   * `renderMarkdownWithCitations`; when absent (no RAG retrieval ran
-   * for this conversation, or the runtime was constructed without a
-   * `popupRetrievalChannel`), citations render as literal `[itemKey]`
-   * text via `renderMarkdown`. Either way the result is XSS-safe — no
+   * Citation rendering: each assistant turn reads its OWN lookup table
+   * from `updated.citationLookups.get(messageIndex)` (F3). When the
+   * entry is absent (no retrieval ran for that specific turn) the text
+   * renders through plain `renderMarkdown` — citation tokens land as
+   * literal `[itemKey]` text. When present the text routes through
+   * `renderMarkdownWithCitations` so chunk-scoped tokens linkify to
+   * clickable `<a data-item-key>` anchors. Either path is XSS-safe — no
    * `innerHTML` interpolation.
    */
   function renderPopupConversation(
@@ -490,10 +504,10 @@ export function createZoteroRuntime(deps: {
       readonly errorBlock: HTMLElement | null;
       readonly errorMessageEl: HTMLElement | null;
       readonly turnsContainer: HTMLElement | null;
-    },
-    citationLookup?: CitationLookup
+    }
   ): void {
     const firstAssistant = firstAssistantMessage(updated);
+    const firstAssistantIndex = updated.messages.findIndex((m) => m.role === "assistant");
     const followTurns = followUpTurns(updated);
     // Loading indicator visibility: shown whenever the stream is running
     // AND the currently-streaming turn has not yet produced text.
@@ -520,23 +534,36 @@ export function createZoteroRuntime(deps: {
         refs.errorMessageEl.textContent = "";
       }
     }
-    // The error block owns the failure UX — keep the body free of an
+    // F3: per-assistant-turn render. Each message reads its own lookup
+    // from `updated.citationLookups`, keyed by the message's index. The
+    // error block owns the failure UX — keep the body free of an
     // "Error:" prefix so a retry leaves a clean tree behind.
-    const renderText = (host: HTMLElement, text: string): void => {
-      if (citationLookup !== undefined) {
-        renderMarkdownWithCitations(host, text, { lookup: citationLookup });
+    const renderTextForIndex = (host: HTMLElement, text: string, messageIndex: number): void => {
+      const lookup = updated.citationLookups.get(messageIndex);
+      if (lookup !== undefined) {
+        renderMarkdownWithCitations(host, text, { lookup });
       } else {
         renderMarkdown(host, text);
       }
     };
     if (firstAssistant !== undefined && firstAssistant.content.length > 0) {
-      renderText(refs.body, firstAssistant.content);
+      renderTextForIndex(refs.body, firstAssistant.content, firstAssistantIndex);
     } else {
-      renderText(refs.body, "");
+      // Empty body: route through renderTextForIndex anyway so the
+      // per-turn-lookup gate symmetry is preserved. Today the empty
+      // string has no citation tokens, so the lookup is a no-op; if
+      // the rendering pipeline ever changes (e.g. placeholder text
+      // with embedded citations) this branch stays consistent with
+      // the populated path.
+      renderTextForIndex(refs.body, "", firstAssistantIndex);
     }
     const turnsContainer = refs.turnsContainer;
     if (turnsContainer !== null) {
-      const fragments = followTurns.map((message) => {
+      const fragments = followTurns.map((message, offset) => {
+        // followTurns starts at firstAssistantIndex + 1; the offset
+        // within followTurns plus that base recovers the message's
+        // index in the full `messages` array, which is the F3 lookup key.
+        const messageIndex = firstAssistantIndex + 1 + offset;
         const article = turnsContainer.ownerDocument.createElement("article");
         article.className = `zotero-ai-explain-popup__turn`;
         article.dataset.role = message.role;
@@ -552,7 +579,7 @@ export function createZoteroRuntime(deps: {
         // Assistant follow-ups can also carry citations; user turns
         // render through the same path (their text contains no citations
         // and falls through both renderers unchanged).
-        renderText(turnBody, message.content);
+        renderTextForIndex(turnBody, message.content, messageIndex);
         article.append(attribution, turnBody);
         return article;
       });
@@ -578,13 +605,40 @@ export function createZoteroRuntime(deps: {
   function startExplain(rawSelection: SelectionContext): void {
     const selection = withReaderScope(rawSelection);
     const conversation = deps.store.createFromSelection(selection, deps.profile());
-    // Per-conversation citation lookup. Populated by the rag-augmented
-    // provider's `onRetrieved` callback (plumbed through bootstrap +
-    // popupRetrievalChannel) the moment the first retrieval lands.
-    // Mutable so render passes after retrieval pick up the live table.
-    const lookupRef: { current: CitationLookup | undefined } = { current: undefined };
-    const retrievalUnsubscribe = deps.popupRetrievalChannel?.subscribe((chunks) => {
-      lookupRef.current = buildCitationLookup(chunks);
+    // F3: each retrieval pins its lookup to the SPECIFIC assistant turn
+    // that will consume it, so a follow-up retrieval cannot leak its
+    // chunks into the prior turn's anchors. The retrieval callback
+    // fires inside `rag-augmented-provider.ts` BEFORE the streaming
+    // delta lands, so the assistant message may not yet exist at
+    // subscription time — we compute the index the next
+    // `appendAssistantDelta` will land at.
+    const retrievalUnsubscribe = deps.popupRetrievalChannel?.subscribe((event) => {
+      // HIGH-1: cross-conversation isolation. The channel is a single
+      // global publisher; without a correlation-id filter, conversation
+      // A's retrieval would also land in conversation B's lookups when
+      // both have an active subscriber. Publishes that don't carry a
+      // matching `conversationId` are ignored. A publish with no id
+      // (legacy / library-chat path) also doesn't match — drop those
+      // here too.
+      if (event.conversationId !== conversation.id) return;
+      const conv = deps.store.get(conversation.id);
+      if (conv === null) return;
+      // MED-5+#6: only pin when the conversation is in a state where
+      // the next message will be an assistant turn — i.e. the latest
+      // message is the user's question. Anything else is a race we
+      // shouldn't pin against:
+      //   - empty messages: no user turn yet
+      //   - last === "system": a system message just landed; the user
+      //     message comes next (would have pinned to the user's slot)
+      //   - last === "assistant" (in-flight stream): we'd overwrite the
+      //     streaming turn's lookup mid-delta — exactly the race
+      //     observed when a follow-up retrieval fires before the prior
+      //     delta finished
+      const lastIdx = conv.messages.length - 1;
+      const last = conv.messages[lastIdx];
+      if (last?.role !== "user") return;
+      const idx = lastIdx + 1;
+      deps.store.attachCitationLookup(conversation.id, idx, buildCitationLookup(event.chunks));
     });
     // AC-2: seed the PDF-identity prompt frame as a leading system
     // message so the model sees the document title + page reference +
@@ -697,9 +751,16 @@ export function createZoteroRuntime(deps: {
         // Skip system messages — see `renderMessage` in sidebar-view.ts.
         // The CSS bubble layout keys off `.__turn[data-role]`, so the row
         // classes here must stay in sync with the initial render.
+        //
+        // F3: each visible row reads its OWN lookup by the message's
+        // ORIGINAL index in `updated.messages`. The filtered render
+        // omits system messages, but the lookup is keyed against the
+        // unfiltered index — we track that separately so a system
+        // message in the middle doesn't shift later turns' keys.
         const rows = updated.messages
-          .filter((message) => message.role !== "system")
-          .map((message) => {
+          .map((message, originalIndex) => ({ message, originalIndex }))
+          .filter(({ message }) => message.role !== "system")
+          .map(({ message, originalIndex }) => {
             const row = list.ownerDocument.createElement("li");
             row.className = "zotero-ai-explain-sidebar__turn";
             row.dataset.role = message.role;
@@ -709,13 +770,11 @@ export function createZoteroRuntime(deps: {
             const body = list.ownerDocument.createElement("div");
             body.className = "zotero-ai-explain-sidebar__body";
             // Sidebar gets the same citation linkification as the popup:
-            // when retrieval ran for this conversation, citations are
-            // clickable; otherwise they're literal text. `lookupRef.current`
-            // is the same shared ref the popup reads.
-            if (lookupRef.current !== undefined) {
-              renderMarkdownWithCitations(body, message.content, {
-                lookup: lookupRef.current
-              });
+            // when retrieval ran for THIS turn, citations are clickable;
+            // otherwise they're literal text.
+            const lookup = updated.citationLookups.get(originalIndex);
+            if (lookup !== undefined) {
+              renderMarkdownWithCitations(body, message.content, { lookup });
             } else {
               renderMarkdown(body, message.content);
             }
@@ -820,17 +879,13 @@ export function createZoteroRuntime(deps: {
       if (body === null) {
         return;
       }
-      renderPopupConversation(
-        updated,
-        {
-          body,
-          loading,
-          errorBlock,
-          errorMessageEl,
-          turnsContainer
-        },
-        lookupRef.current
-      );
+      renderPopupConversation(updated, {
+        body,
+        loading,
+        errorBlock,
+        errorMessageEl,
+        turnsContainer
+      });
     });
 
     cleanup.push(cleanupExplain);
@@ -859,10 +914,20 @@ export function createZoteroRuntime(deps: {
   function startAskQuestion(rawSelection: SelectionContext): void {
     const selection = withReaderScope(rawSelection);
     const conversation = deps.store.createFromSelection(selection, deps.profile());
-    // Per-conversation citation lookup, same pattern as startExplain.
-    const lookupRef: { current: CitationLookup | undefined } = { current: undefined };
-    const retrievalUnsubscribe = deps.popupRetrievalChannel?.subscribe((chunks) => {
-      lookupRef.current = buildCitationLookup(chunks);
+    // F3: per-assistant-message lookup, same pattern as startExplain.
+    // HIGH-1: filter by conversation id so publishes from other
+    // conversations don't contaminate this one's lookups (see the
+    // matching block above in startExplain for the rationale).
+    // MED-5+#6: pin only when last message is the user's question.
+    const retrievalUnsubscribe = deps.popupRetrievalChannel?.subscribe((event) => {
+      if (event.conversationId !== conversation.id) return;
+      const conv = deps.store.get(conversation.id);
+      if (conv === null) return;
+      const lastIdx = conv.messages.length - 1;
+      const last = conv.messages[lastIdx];
+      if (last?.role !== "user") return;
+      const idx = lastIdx + 1;
+      deps.store.attachCitationLookup(conversation.id, idx, buildCitationLookup(event.chunks));
     });
     // Seed the sticky-quote system frame. It is `messages[0]` for the
     // conversation's lifetime, so it rides every provider request.
@@ -968,17 +1033,13 @@ export function createZoteroRuntime(deps: {
       if (body === null) {
         return;
       }
-      renderPopupConversation(
-        updated,
-        {
-          body,
-          loading,
-          errorBlock,
-          errorMessageEl,
-          turnsContainer
-        },
-        lookupRef.current
-      );
+      renderPopupConversation(updated, {
+        body,
+        loading,
+        errorBlock,
+        errorMessageEl,
+        turnsContainer
+      });
     });
 
     cleanup.push(cleanupAsk);

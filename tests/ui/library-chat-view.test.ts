@@ -7,6 +7,19 @@ import {
   renderLibraryChatView,
   wireLibraryChatView
 } from "../../src/ui/library-chat-view.js";
+import { buildCitationLookup } from "../../src/ui/citation-lookup.js";
+import type { RetrievedChunk } from "../../src/indexing/index-search.js";
+
+function chunk(over: Partial<RetrievedChunk> = {}): RetrievedChunk {
+  return {
+    itemKey: "ABCD1234",
+    title: "Title",
+    text: "excerpt",
+    score: 0.9,
+    chunkIndex: 0,
+    ...over
+  };
+}
 
 describe("renderLibraryChatView", () => {
   it("renders the empty state when no messages have been exchanged", () => {
@@ -49,20 +62,44 @@ describe("renderLibraryChatView", () => {
     expect(view.textContent).toContain("X is Y");
   });
 
-  it("renders [itemKey] in assistant output as a clickable link with data-item-key", () => {
-    // AC-6: the citation token alphabet is exactly `[A-Z0-9]{8}` — Zotero's
-    // item-key shape. Both keys below are 8-char so they linkify.
+  it("renders [itemKey] in assistant output as a clickable link with data-item-key when the lookup contains a matching chunk", () => {
+    // AC-6 / HIGH-3: the citation token alphabet is exactly `[A-Z0-9]{8}`
+    // — Zotero's item-key shape. A bare-key token now routes through
+    // `resolveCitation`'s legacy fallback, so it only linkifies when ANY
+    // chunk in the lookup shares this itemKey. Without a lookup the
+    // token renders as inert text (a separate test below).
+    const lookup = buildCitationLookup([
+      chunk({ itemKey: "ABCD1234", chunkIndex: 0 }),
+      chunk({ itemKey: "XYZW5678", chunkIndex: 0 })
+    ]);
     const view = renderLibraryChatView({
       messages: [{ role: "assistant", content: "Claim one [ABCD1234] and claim two [XYZW5678]." }],
       status: "completed",
       errorMessage: null,
-      hasIndex: true
+      hasIndex: true,
+      citationLookups: new Map([[0, lookup]])
     });
     const links = view.querySelectorAll<HTMLAnchorElement>("a[data-item-key]");
     expect(links.length).toBe(2);
     expect(links[0]?.dataset.itemKey).toBe("ABCD1234");
-    expect(links[0]?.textContent).toBe("ABCD1234");
+    // HIGH-3 visible text: bracketed, not bare.
+    expect(links[0]?.textContent).toBe("[ABCD1234]");
     expect(links[1]?.dataset.itemKey).toBe("XYZW5678");
+    expect(links[1]?.textContent).toBe("[XYZW5678]");
+  });
+
+  it("renders [itemKey] as inert text when no lookup is supplied (HIGH-3 contract)", () => {
+    // HIGH-3: without a lookup, `resolveCitation`'s legacy fallback
+    // returns undefined and the token degrades to inert text — matches
+    // the popup/sidebar.
+    const view = renderLibraryChatView({
+      messages: [{ role: "assistant", content: "Claim one [ABCD1234]." }],
+      status: "completed",
+      errorMessage: null,
+      hasIndex: true
+    });
+    expect(view.querySelector("a")).toBeNull();
+    expect(view.textContent).toContain("[ABCD1234]");
   });
 
   it("escapes citation keys safely (no innerHTML / no markup injection)", () => {
@@ -101,6 +138,39 @@ describe("renderLibraryChatView", () => {
       hasIndex: true
     });
     expect(view.textContent).toContain("Embedding dimension mismatch.");
+  });
+
+  it("citation anchors render with a visible underline + accent color affordance (HIGH-2)", () => {
+    // HIGH-2 follow-up: the shared `renderCitationAnchor` does NOT stamp
+    // an inline style; popup/sidebar inherit styling via MARKDOWN_CSS.
+    // Library-chat has no MARKDOWN_CSS owner, so the embedded `<style>`
+    // tag must carry an `a {}` rule scoped to the assistant body that
+    // ships an underline + accent color so anchors look clickable.
+    const lookup = buildCitationLookup([chunk({ itemKey: "ABCD1234", chunkIndex: 0 })]);
+    const view = renderLibraryChatView({
+      messages: [{ role: "assistant", content: "Claim [ABCD1234]." }],
+      status: "completed",
+      errorMessage: null,
+      hasIndex: true,
+      citationLookups: new Map([[0, lookup]])
+    });
+    // jsdom doesn't evaluate the live cascaded computed style for
+    // CSS-from-`<style>`-tag rules consistently across all selectors,
+    // so we assert against the rule's source text in the embedded
+    // <style> tag. The selector must scope to `.zotero-ai-library-chat__body a`
+    // and the declaration block must include both `text-decoration: underline`
+    // and a color affordance.
+    const styleTag = view.querySelector("style");
+    const styleText = styleTag?.textContent ?? "";
+    expect(styleText).toMatch(/\.zotero-ai-library-chat__body a/u);
+    expect(styleText).toMatch(/text-decoration:\s*underline/u);
+    // Color affordance: either the literal ACCENT token or a generic
+    // color rule. The current implementation interpolates the ACCENT
+    // var; the regex tolerates whitespace differences.
+    expect(styleText).toMatch(/color:\s*var\(--accent-blue/u);
+    // And the anchor itself rendered so the rule has a target.
+    const anchor = view.querySelector<HTMLAnchorElement>("a[data-item-key]");
+    expect(anchor).not.toBeNull();
   });
 });
 
@@ -159,14 +229,18 @@ describe("wireLibraryChatView", () => {
   });
 
   it("invokes onCitationClick with the resolved citation when a citation link is clicked", () => {
-    // AC-6: `onCitationClick` receives a `{ itemKey, ... }` citation object
-    // (widened from a bare string). A legacy `[itemKey]` token with no
-    // lookup table emits just the itemKey — no page / attachment.
+    // AC-6 / HIGH-3: `onCitationClick` receives a `{ itemKey, ... }`
+    // citation object (widened from a bare string). A bare-key token
+    // linkifies only when the lookup contains a matching chunk —
+    // `resolveCitation`'s legacy fallback synthesises an entry with
+    // just the itemKey, no page / attachment.
+    const lookup = buildCitationLookup([chunk({ itemKey: "KEYABC42", chunkIndex: 0 })]);
     const view = renderLibraryChatView({
       messages: [{ role: "assistant", content: "Claim [KEYABC42]." }],
       status: "completed",
       errorMessage: null,
-      hasIndex: true
+      hasIndex: true,
+      citationLookups: new Map([[0, lookup]])
     });
     document.body.append(view);
     const onCitationClick = vi.fn();

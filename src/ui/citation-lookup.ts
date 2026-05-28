@@ -157,3 +157,100 @@ export function buildCitationLookup(chunks: readonly RetrievedChunk[]): Citation
   }
   return lookup;
 }
+
+// The module-level `export const CITATION_PATTERN = /.../gu;` was removed:
+// a global `/g`-flag RegExp carries a mutable `lastIndex` that any
+// concurrent caller (re-entrant render, two assistant turns rendered in
+// the same tick) could leak across. `emitTextWithCitations` now builds
+// a fresh regex per call below. No external module imported the symbol
+// (audited via grep on src/ + tests/ at the time of the LOW-9 fix).
+
+/**
+ * Render a resolved citation as an `<a>` element. Public so every
+ * citation renderer (popup, sidebar, library-chat) stamps the same
+ * data-attribute shape — `data-item-key` always; `data-chunk-index`,
+ * `data-attachment-key`, `data-page-index` only when present on the
+ * resolved entry.
+ *
+ * The anchor's textContent is the bracketed token (e.g. `[ABCD1234#3]`,
+ * or `[ABCD1234]` for the legacy / fallback shape) so the user sees the
+ * exact string the model emitted, not just the bare item key.
+ */
+export function renderCitationAnchor(
+  doc: Document,
+  itemKey: string,
+  rawChunkIndex: string | undefined,
+  entry: { readonly attachmentKey?: string; readonly pageIndex?: number }
+): HTMLAnchorElement {
+  const link = doc.createElement("a");
+  link.dataset.itemKey = itemKey;
+  // Stamp the chunk-scoped data attributes only when the renderer
+  // actually had them. A legacy / fallback citation (no chunkIndex in
+  // the token, no per-page entry data) emits just `data-item-key`,
+  // matching the README contract that bare keys open the attachment at
+  // page 1.
+  if (rawChunkIndex !== undefined) {
+    link.dataset.chunkIndex = rawChunkIndex;
+  }
+  if (entry.attachmentKey !== undefined) {
+    link.dataset.attachmentKey = entry.attachmentKey;
+  }
+  if (typeof entry.pageIndex === "number") {
+    link.dataset.pageIndex = String(entry.pageIndex);
+  }
+  // `#` keeps the anchor from navigating; the wiring layer's click
+  // handler calls preventDefault and dispatches to `onCitationClick`.
+  link.setAttribute("href", "#");
+  link.textContent = `[${itemKey}${rawChunkIndex !== undefined ? `#${rawChunkIndex}` : ""}]`;
+  return link;
+}
+
+/**
+ * Walk `text`, split on the citation token pattern, and emit either a
+ * text node or a citation anchor for each piece. Resolved citations
+ * become anchors (`renderCitationAnchor`); hallucinated keys and
+ * malformed tokens land as INERT TEXT — the README-documented contract.
+ *
+ * Shared by the popup/sidebar markdown renderer and the library-chat
+ * plain-text renderer so a hallucinated `[ABCD1234#99]` always renders
+ * the same way no matter which surface the assistant turn lands on.
+ *
+ * The regex is constructed per call (not a module-level constant) so a
+ * stateful `/g` `lastIndex` cannot leak across concurrent iterations.
+ */
+export function emitTextWithCitations(
+  host: HTMLElement,
+  text: string,
+  lookup: CitationLookup
+): void {
+  const doc = host.ownerDocument;
+  // Per-call regex avoids the re-entrancy footgun of a module-level
+  // `/g` RegExp's shared `lastIndex`. Two simultaneous render passes
+  // (e.g. a follow-up turn rendering while the prior turn is still in
+  // a microtask queue) cannot now interfere with each other's iteration.
+  const pattern = /\[([A-Z0-9]{8})(?:#(\d+))?\]/gu;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > cursor) {
+      host.append(doc.createTextNode(text.slice(cursor, match.index)));
+    }
+    // Round-trip through the canonical parser so the alphabet /
+    // chunk-index handling stays single-sourced in this module.
+    const parsed = parseCitationToken(match[0]);
+    const entry = parsed !== null ? resolveCitation(parsed, lookup) : undefined;
+    if (entry === undefined || parsed === null) {
+      // Hallucinated key (or malformed token, which the per-call
+      // `pattern` regex never matches but defended against here) —
+      // render the original token verbatim so the user sees what the
+      // model emitted.
+      host.append(doc.createTextNode(match[0]));
+    } else {
+      host.append(renderCitationAnchor(doc, parsed.itemKey, match[2], entry));
+    }
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < text.length) {
+    host.append(doc.createTextNode(text.slice(cursor)));
+  }
+}

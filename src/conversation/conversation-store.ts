@@ -1,6 +1,7 @@
 import type { Conversation } from "./conversation-types.js";
 import type { ChatMessage, ProviderProfile } from "../providers/provider-types.js";
 import type { SelectionContext } from "../selection/selection-context.js";
+import type { CitationLookup } from "../ui/citation-lookup.js";
 
 export type ConversationListener = (conversation: Conversation) => void;
 
@@ -20,6 +21,24 @@ export type ConversationStore = {
   fail(id: string, message: string): void;
   cancel(id: string): void;
   moveToSidebar(id: string): void;
+  /**
+   * Pin a citation lookup table to a specific assistant message index
+   * (F3). A later attach for a DIFFERENT index does NOT overwrite an
+   * earlier turn's table — each turn keeps its own. Copy-on-write so
+   * the prior `Conversation` object stays immutable for any subscriber
+   * that captured it.
+   *
+   * **Triggers subscriber notification** (unlike the legacy
+   * `lookupRef.current` side-channel, which was silently mutated
+   * outside the store). Each call fires every registered listener
+   * with the new conversation snapshot, which in practice means the
+   * popup/sidebar re-render their entire message tree. Future
+   * subscribers that need to debounce or short-circuit on no-content-
+   * change should track the previous `messages` reference themselves
+   * — this method intentionally cannot tell whether the lookup
+   * changed any visible anchor.
+   */
+  attachCitationLookup(id: string, messageIndex: number, lookup: CitationLookup): void;
   subscribe(id: string, listener: ConversationListener): () => void;
 };
 
@@ -60,7 +79,8 @@ export function createConversationStore(): ConversationStore {
         messages: [],
         status: "idle",
         visibleSurface: "popup",
-        errorMessage: null
+        errorMessage: null,
+        citationLookups: new Map()
       };
       nextId += 1;
       conversations.set(conversation.id, conversation);
@@ -108,6 +128,17 @@ export function createConversationStore(): ConversationStore {
     },
     moveToSidebar(id) {
       update(id, (conversation) => ({ ...conversation, visibleSurface: "sidebar" }));
+    },
+    attachCitationLookup(id, messageIndex, lookup) {
+      update(id, (conversation) => {
+        // Copy-on-write: a new entry is added at this index; earlier
+        // turns' tables are carried over untouched so an in-flight
+        // re-render of an older turn keeps its own lookup. Mirrors the
+        // shape in `library-conversation-store.ts`.
+        const next = new Map(conversation.citationLookups);
+        next.set(messageIndex, lookup);
+        return { ...conversation, citationLookups: next };
+      });
     },
     subscribe(id, listener) {
       let subscribers = listeners.get(id);

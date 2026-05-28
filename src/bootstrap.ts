@@ -1397,8 +1397,17 @@ export async function startup(context: ZoteroBootstrapContext): Promise<void> {
     debug: (msg) => {
       context.Zotero.debug(`Zotero AI Explain: ${msg}`);
     },
-    onRetrieved: (chunks) => {
-      popupRetrievalChannel.publish(chunks);
+    onRetrieved: (chunks, context) => {
+      // HIGH-1 follow-up: forward the correlation id (when the caller
+      // stamped one — popup/sidebar controllers do, library-chat
+      // doesn't) so per-conversation subscribers can filter by
+      // conversation id and avoid cross-contaminating each other's
+      // citation lookups.
+      popupRetrievalChannel.publish(
+        context.correlationId !== undefined
+          ? { conversationId: context.correlationId, chunks }
+          : { chunks }
+      );
     }
   });
   const popupController = createPopupController({ store, provider: ragProvider });
