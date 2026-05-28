@@ -40,11 +40,14 @@ concurrency:
 
 env:
   # Pin Ollama for cache stability — the model cache key includes this.
-  # 0.5.13 first added gemma3 family support; 0.6.6 is a stable point
-  # release (no prerelease/draft, published 2025-04-17) used to pull
-  # gemma3:1b on all three OSes. Bumping this value auto-invalidates the
-  # ollama-models-<os>-v<version>-... cache key below.
-  OLLAMA_VERSION: "0.6.6"
+  # 0.24.0 (2026-05-14) is the current stable. The prior pin (0.6.6) had
+  # an intermittent "this model does not support embeddings" failure on
+  # /api/embed with embeddinggemma — the model loaded but the embed path
+  # rejected it, causing a real-Ollama-E2E flake on macOS 8.0.4. 0.24.0
+  # is a clean cut and matches the plugin's MIN_OLLAMA_VERSION floor
+  # (src/preferences/ollama-version.ts). Bumping this value auto-
+  # invalidates the ollama-models-<os>-v<version>-... cache key below.
+  OLLAMA_VERSION: "0.24.0"
   # Tiny models keep CI fast and fit comfortably in actions/cache.
   OLLAMA_CHAT_MODEL: "gemma3:1b"
   OLLAMA_EMBED_MODEL: "embeddinggemma"
@@ -75,7 +78,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v5
         with:
-          node-version: "22"
+          node-version: "22.22.3"
           cache: npm
 
       - name: Install Node dependencies

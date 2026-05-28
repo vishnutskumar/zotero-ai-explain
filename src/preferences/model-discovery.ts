@@ -1,3 +1,5 @@
+import { checkOllamaVersion } from "./ollama-version.js";
+
 /**
  * Model discovery — fetch the model list a backend exposes so the
  * settings dialog can render a dropdown of installed/available models
@@ -57,7 +59,18 @@ export type DiscoveryRequest = {
 };
 
 export type DiscoveryResult =
-  | { readonly ok: true; readonly models: readonly string[] }
+  | {
+      readonly ok: true;
+      readonly models: readonly string[];
+      /**
+       * Non-fatal advisory surfaced to the user near the model dropdown.
+       * Set when the daemon's reported version is below
+       * `MIN_OLLAMA_VERSION` (ollama backend only) so the user knows to
+       * upgrade for reliable embeddings. The model list is still
+       * usable — the warning is purely informational.
+       */
+      readonly warning?: string;
+    }
   | { readonly ok: false; readonly message: string };
 
 const DEFAULT_TIMEOUT_MS = 1500;
@@ -205,7 +218,25 @@ export async function discoverModels(request: DiscoveryRequest): Promise<Discove
     // Deduplicate + sort for stable rendering. Ollama's `/api/tags`
     // returns models in insertion order; sorting is purely a UX choice.
     const dedup = Array.from(new Set(models)).sort((a, b) => a.localeCompare(b));
-    return { ok: true, models: dedup };
+    // Version probe: real Ollama daemon only (the bundled proxy serves
+    // codex/claude/ollama backends with its own version surface and
+    // doesn't expose /api/version). The probe is non-blocking — even
+    // if it errors, we still return the model list. A `below-min`
+    // result flows into the optional `warning` field that the settings
+    // view renders near the dropdown.
+    let warning: string | undefined;
+    if (request.backend === "ollama") {
+      const versionResult = await checkOllamaVersion(url, request.fetch, {
+        signal: controller.signal,
+        ...(headers !== undefined ? { headers } : {})
+      });
+      if (versionResult.kind === "below-min" || versionResult.kind === "unknown") {
+        warning = versionResult.message;
+      }
+    }
+    return warning !== undefined
+      ? { ok: true, models: dedup, warning }
+      : { ok: true, models: dedup };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, message: `Cannot reach ${request.url}: ${message}` };
