@@ -40,14 +40,17 @@ concurrency:
 
 env:
   # Pin Ollama for cache stability — the model cache key includes this.
-  # 0.24.0 (2026-05-14) is the current stable. The prior pin (0.6.6) had
-  # an intermittent "this model does not support embeddings" failure on
-  # /api/embed with embeddinggemma — the model loaded but the embed path
-  # rejected it, causing a real-Ollama-E2E flake on macOS 8.0.4. 0.24.0
-  # is a clean cut and matches the plugin's MIN_OLLAMA_VERSION floor
-  # (src/preferences/ollama-version.ts). Bumping this value auto-
-  # invalidates the ollama-models-<os>-v<version>-... cache key below.
-  OLLAMA_VERSION: "0.24.0"
+  # 0.23.4 (2026-05-13) sits in the sweet spot: post-embeddinggemma
+  # support (the prior 0.6.6 pin intermittently rejected /api/embed
+  # with "this model does not support embeddings") AND pre-0.24.0's
+  # Metal regression on GitHub's macos-latest Apple Paravirtual GPU
+  # (0.24.0 crashed with `ggml-backend.cpp:844: pre-allocated tensor
+  # ... in a buffer (Metal) that cannot run the operation (NONE)`
+  # against gemma3:1b). Bumping this value auto-invalidates the
+  # ollama-models-<os>-v<version>-... cache key below. Stays above
+  # the plugin's MIN_OLLAMA_VERSION floor (0.10.0) in
+  # src/preferences/ollama-version.ts.
+  OLLAMA_VERSION: "0.23.4"
   # Tiny models keep CI fast and fit comfortably in actions/cache.
   OLLAMA_CHAT_MODEL: "gemma3:1b"
   OLLAMA_EMBED_MODEL: "embeddinggemma"
